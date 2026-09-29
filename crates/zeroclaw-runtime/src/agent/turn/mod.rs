@@ -1405,6 +1405,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         observer,
         silent,
         approval,
+        security,
         multimodal_config,
         config,
         max_tool_iterations,
@@ -1428,6 +1429,20 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     turn_state.sync_pending();
 
     let ingress_policy_cfg = IngressPolicy::default();
+
+    // Stamp the initiating internal principal into the turn trace, keyed by
+    // the same trace id every other turn event carries. The principal is
+    // runtime-resolved at the dispatch surface and immutable for the turn;
+    // this record is the trace half of that contract (run records carry it
+    // separately). External turns have none and stay unstamped.
+    if let Some(principal) = &ingress.internal_principal {
+        ::zeroclaw_log::record!(
+            INFO,
+            internal_principal_event(turn_id, ingress.origin, principal, agent_alias),
+            "turn_internal_principal"
+        );
+    }
+
     let p1_text = turn_state
         .history
         .iter()
@@ -1655,6 +1670,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         turn_state.canonical.as_deref_mut(),
                         config,
                         multimodal_config,
+                        security,
                         hooks,
                         summary_image_cache,
                         summary_provider_image_state,
@@ -1727,7 +1743,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             provider_name,
             model,
             dispatch_model,
-        )?;
+            security,
+        )
+        .await?;
 
         let (
             active_model_provider,
@@ -3001,6 +3019,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 observer,
                 silent,
                 approval,
+                security,
                 multimodal_config,
                 config,
                 max_tool_iterations,
@@ -3070,6 +3089,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_state.canonical.as_deref_mut(),
         config,
         multimodal_config,
+        security,
         hooks,
         summary_image_cache,
         summary_provider_image_state,
@@ -3256,6 +3276,11 @@ pub(crate) struct OwnedAgentExecution {
     /// system prompt reports the same dialect the step will execute under.
     /// `None` for a shell-less runtime.
     shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
+    /// The step agent's own filesystem policy, built by
+    /// `assemble_owned_execution` the same way a fresh agent turn builds it.
+    /// Carried so the nested sub-loop's no-vision image-marker gate applies
+    /// the step agent's read ledger, never the parent's.
+    security: Arc<crate::security::SecurityPolicy>,
 }
 
 /// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
@@ -3420,6 +3445,9 @@ pub(crate) async fn assemble_owned_execution(
         // Captured from the same adapter this step's tools were built with, so
         // the prompt names the shell the step will actually run under.
         shell_profile,
+        // The same policy the step's tools were built with, carried for the
+        // nested sub-loop's no-vision image-marker gate.
+        security,
     })
 }
 
@@ -3486,6 +3514,11 @@ async fn drive_live_sop_actions(
     observer: &dyn crate::observability::Observer,
     silent: bool,
     approval: Option<&crate::approval::ApprovalManager>,
+    // The enclosing agent's filesystem policy, threaded from the turn loop's
+    // execution context. Same-agent nested SOP steps run under it; a
+    // cross-agent step uses its own re-assembled policy (see
+    // `OwnedAgentExecution::security`).
+    security: Option<&crate::security::SecurityPolicy>,
     multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
     // Full config so the live-SOP sub-turn's vision route resolves the configured
     // `vision_model_provider`'s alias options, exactly as the enclosing turn does.
@@ -3825,6 +3858,14 @@ async fn drive_live_sop_actions(
                                             observer,
                                             silent,
                                             approval: eff_approval,
+                                            // Same-agent steps run under the
+                                            // enclosing agent's policy; a
+                                            // cross-agent step runs under its
+                                            // own re-assembled one.
+                                            security: match owned {
+                                                Some(o) => Some(o.security.as_ref()),
+                                                None => security,
+                                            },
                                             multimodal_config,
                                             config,
                                             hooks,
@@ -5862,6 +5903,7 @@ vision_model_provider = "custom.vision"
                     activated_tools: None,
                     model_switch_callback: None,
                     receipt_generator: None,
+                    security: None,
                 },
                 ResolvedRuntimeKnobs {
                     max_tool_iterations: 3,
@@ -5968,6 +6010,26 @@ mod shared_iteration_budget_tests {
     }
 }
 
+/// The trace stamp for an internally initiated turn: initiating principal
+/// and executing agent side by side, correlated by the turn's trace id.
+/// Attributes carry runtime-resolved identity only, never message text.
+pub(crate) fn internal_principal_event(
+    turn_id: &str,
+    origin: zeroclaw_api::ingress::TurnOrigin,
+    principal: &zeroclaw_api::ingress::InternalPrincipal,
+    executing_agent: Option<&str>,
+) -> ::zeroclaw_log::Event {
+    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+        .with_category(::zeroclaw_log::EventCategory::Agent)
+        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+        .with_attrs(::serde_json::json!({
+            "trace_id": turn_id,
+            "origin": origin,
+            "internal_principal": principal,
+            "executing_agent": executing_agent,
+        }))
+}
+
 /// Live SOP nested-step re-assembly gate, isolation, and fail-closed regressions.
 ///
 /// Privilege-scope properties of the live driver:
@@ -5987,6 +6049,39 @@ mod shared_iteration_budget_tests {
 /// - **Fail-closed.** A cross-agent step with no re-assembly handle, or whose
 ///   agent context cannot be assembled, FAILS rather than running with the
 ///   parent agent's broader context.
+#[cfg(test)]
+mod internal_principal_event_tests {
+    use super::*;
+
+    #[test]
+    fn trace_stamp_carries_both_identities_keyed_by_trace_id() {
+        let principal = zeroclaw_api::ingress::InternalPrincipal::Cron {
+            job_id: "job-1".to_string(),
+            job_name: Some("nightly".to_string()),
+        };
+        let event = internal_principal_event(
+            "trace-1",
+            zeroclaw_api::ingress::TurnOrigin::Cron,
+            &principal,
+            Some("assistant"),
+        );
+        assert_eq!(event.outcome, ::zeroclaw_log::EventOutcome::Unknown);
+        let attrs = event.attrs.expect("event carries attributes");
+        assert_eq!(attrs["trace_id"], "trace-1");
+        assert_eq!(attrs["origin"], "cron");
+        assert_eq!(
+            attrs["internal_principal"],
+            serde_json::json!({"cron": {"job_id": "job-1", "job_name": "nightly"}})
+        );
+        assert_eq!(attrs["executing_agent"], "assistant");
+        assert_eq!(
+            attrs.as_object().map(serde_json::Map::len),
+            Some(4),
+            "identity attributes only — never message text"
+        );
+    }
+}
+
 #[cfg(test)]
 mod sop_step_reassembly_tests {
     use super::*;
@@ -6663,6 +6758,7 @@ mod sop_step_reassembly_tests {
         budget: ExecutionTreeBudget,
         cancellation_token: CancellationToken,
         max_tool_iterations: usize,
+        security: Option<&crate::security::SecurityPolicy>,
         hooks: Option<&crate::hooks::HookRunner>,
         image_cache: Option<ToolLoopImageState<'_>>,
     ) -> Result<String> {
@@ -6693,6 +6789,7 @@ mod sop_step_reassembly_tests {
                     observer: &observer,
                     silent: true,
                     approval: None,
+                    security,
                     multimodal_config: &multimodal,
                     config: None,
                     hooks,
@@ -6852,6 +6949,10 @@ mod sop_step_reassembly_tests {
             .into_iter()
             .next()
             .expect("prepared summary request must contain an image");
+        let security = crate::security::SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
         let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
         for (cancel, change_model) in [(false, false), (false, true), (true, true)] {
             let calls = Arc::new(AtomicUsize::new(0));
@@ -6889,6 +6990,7 @@ mod sop_step_reassembly_tests {
                 budget.clone(),
                 CancellationToken::new(),
                 10,
+                None,
                 Some(&hooks),
                 Some(image_state),
             )
@@ -6917,13 +7019,15 @@ mod sop_step_reassembly_tests {
             );
         }
         let mut history = vec![ChatMessage::user(prompt)];
-        let result = run_budgeted_test_loop(
+        let result = run_budgeted_test_loop_with_hooks(
             &TextProvider,
             &mut history,
             &tools,
             ExecutionTreeBudget::root(1),
             CancellationToken::new(),
             10,
+            Some(&security),
+            None,
         )
         .await;
         assert!(
@@ -7097,6 +7201,10 @@ mod sop_step_reassembly_tests {
             mcp_tool_names,
             mcp_prompt_section: String::new(),
             shell_profile: None,
+            // Test fixture: no config-backed policy, so the default (its
+            // `workspace_dir` is ".") stands in and the marker gate fails
+            // closed under it.
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         }
     }
 
@@ -7207,6 +7315,8 @@ mod sop_step_reassembly_tests {
             parent_tools,
             observer,
             true,
+            None,
+            // security: no policy on the test path
             None,
             &zeroclaw_config::schema::MultimodalConfig::default(),
             None,
@@ -7954,6 +8064,8 @@ mod sop_step_reassembly_tests {
                 mcp_tool_names: std::collections::HashSet::new(),
                 mcp_prompt_section: String::new(),
                 shell_profile: None,
+                // Test fixture: see the helper above.
+                security: Arc::new(crate::security::SecurityPolicy::default()),
             },
         );
 
@@ -8459,6 +8571,7 @@ mod tool_lifecycle_abandonment_tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history,
             history_has_trim_breadcrumb: &mut crumb_present,

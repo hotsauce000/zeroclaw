@@ -79,6 +79,7 @@ pub(crate) async fn finish_after_max_iterations(
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     config: Option<&Config>,
     multimodal_config: &MultimodalConfig,
+    security: Option<&crate::security::SecurityPolicy>,
     hooks: Option<&crate::hooks::HookRunner>,
     mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
     provider_image_state: Option<&mut super::ProviderImageState>,
@@ -143,7 +144,9 @@ pub(crate) async fn finish_after_max_iterations(
         provider_name,
         model,
         dispatch_model,
-    )?;
+        security,
+    )
+    .await?;
     let (model_provider, provider_name, model, dispatch_model) = match vision_provider.as_ref() {
         Some(route) => (
             route.provider.as_ref(),
@@ -917,6 +920,7 @@ mod graceful_summary_metering_tests {
                 None,
                 None,
                 &MultimodalConfig::default(),
+                None,
                 Some(&hooks),
                 None,
                 None,
