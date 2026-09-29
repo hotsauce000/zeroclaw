@@ -21737,6 +21737,14 @@ mod tests {
         let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
+        let request = next_rpc_request(&mut rx, "session should refresh thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-new");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "overrides": {}}),
+        );
 
         let chat = task.await.unwrap();
         assert_eq!(chat.current_session_id(), Some("sess-new"));
@@ -21828,6 +21836,14 @@ mod tests {
         let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
+        let request = next_rpc_request(&mut rx, "session should refresh thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-new");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "overrides": {}}),
+        );
 
         // The demoted identity is retried as a background resume, carrying its
         // own stable id — proof it was preserved rather than consumed by the
@@ -22395,6 +22411,14 @@ mod tests {
         let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
+        let request = next_rpc_request(&mut rx, "session should refresh thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-new");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "overrides": {}}),
+        );
 
         let chat = tokio::time::timeout(Duration::from_secs(5), task)
             .await
@@ -22447,6 +22471,14 @@ mod tests {
         let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
+        let request = next_rpc_request(&mut rx, "session should refresh thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-new");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "overrides": {}}),
+        );
 
         // The demoted identity is retried separately, carrying its own stable
         // id — proof it was preserved rather than consumed by the pick.
@@ -22573,6 +22605,14 @@ mod tests {
         let request = next_rpc_request(&mut rx, "new session refreshes identity").await;
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
+        let request = next_rpc_request(&mut rx, "session should refresh thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-fresh");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-fresh", "overrides": {}}),
+        );
 
         let chat = tokio::time::timeout(Duration::from_secs(2), start)
             .await
@@ -22614,6 +22654,14 @@ mod tests {
         let request = next_rpc_request(&mut rx, "new session refreshes identity").await;
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
+        let request = next_rpc_request(&mut rx, "session should refresh thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-selected");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-selected", "overrides": {}}),
+        );
 
         let chat = tokio::time::timeout(Duration::from_secs(2), task)
             .await
@@ -22656,6 +22704,14 @@ mod tests {
         let request = next_rpc_request(&mut rx, "resume refreshes identity").await;
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
+        let request = next_rpc_request(&mut rx, "session should refresh thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-saved");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-saved", "overrides": {}}),
+        );
 
         let request = next_rpc_request(&mut rx, "resume replays the retained transcript").await;
         assert_eq!(request["method"], method::SESSION_MESSAGES);
@@ -28172,6 +28228,14 @@ mod tests {
             next_rpc_request(&mut rx, "fresh Chat session should refresh model identity").await;
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
+        let request = next_rpc_request(&mut rx, "session should refresh thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-chat");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-chat", "overrides": {}}),
+        );
 
         let chat = tokio::time::timeout(Duration::from_secs(2), init)
             .await
