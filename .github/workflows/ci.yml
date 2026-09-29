@@ -497,7 +497,7 @@ jobs:
 
   interactive-ctrlc-changes:
     name: Detect interactive Ctrl+C changes
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
