@@ -4709,6 +4709,13 @@ impl Chat {
             .await;
         match outcome {
             Ok(result) => {
+                if !request.acknowledged_by(&result) {
+                    state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
+                        "zc-thinking-not-acknowledged",
+                    )));
+                    state.mark_dirty_full();
+                    return;
+                }
                 // A model or provider change can change what thinking the
                 // session offers, and a thinking change moves the value in
                 // force: take the options the daemon echoed and re-read only
@@ -4788,10 +4795,18 @@ impl Chat {
                 Self::remember_thinking_override(&state.agent_alias, &request);
             }
             Err(error) => {
-                state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
-                    request.failed_key(),
-                    &[("error", &daemon_error_text(&error))],
-                )));
+                let unsupported = request.thinking_control().is_some()
+                    && crate::client::DaemonRpcError::from_anyhow(&error)
+                        .is_some_and(crate::client::DaemonRpcError::is_method_not_found);
+                let text = if unsupported {
+                    crate::i18n::t("zc-thinking-not-acknowledged")
+                } else {
+                    crate::i18n::t_args(
+                        request.failed_key(),
+                        &[("error", &daemon_error_text(&error))],
+                    )
+                };
+                state.info_message = Some(crate::widgets::InfoMessage::error(text));
             }
         }
         state.mark_dirty_full();
@@ -9312,6 +9327,44 @@ impl SessionOverride {
                 Some(crate::client::ThinkingControl::Display)
             }
             Self::Model(_) | Self::ModelProvider(_) => None,
+        }
+    }
+
+    /// Explicit thinking changes require a coherent application echo. An old
+    /// daemon can accept configure while silently ignoring the new fields.
+    /// Ordinary model/provider changes retain their legacy compatibility.
+    fn acknowledged_by(&self, result: &crate::client::SessionConfigureResult) -> bool {
+        use crate::client::{ThinkingControl, ThinkingSource};
+        let Some(control) = self.thinking_control() else {
+            return true;
+        };
+        let Some(options) = &result.thinking_options else {
+            return false;
+        };
+        let (offered, current, source) = options.control(control);
+        let stored = match control {
+            ThinkingControl::Level => result.overrides.thinking_level.as_deref(),
+            ThinkingControl::Display => result.overrides.thinking_display.as_deref(),
+        };
+        match self {
+            Self::ThinkingLevel(requested) | Self::ThinkingDisplay(requested) => {
+                stored == Some(requested.as_str())
+                    && current == Some(requested.as_str())
+                    && source == ThinkingSource::Session
+                    && offered.contains(requested)
+            }
+            Self::ResetThinkingLevel | Self::ResetThinkingDisplay => {
+                stored.is_none()
+                    && source != ThinkingSource::Session
+                    && match current {
+                        Some(value) => {
+                            source != ThinkingSource::Unknown
+                                && offered.iter().any(|option| option == value)
+                        }
+                        None => offered.is_empty(),
+                    }
+            }
+            Self::Model(_) | Self::ModelProvider(_) => true,
         }
     }
 
@@ -23728,8 +23781,18 @@ mod tests {
         rx: &mut mpsc::Receiver<String>,
         state: ChatState,
         request: SessionOverride,
-        options: serde_json::Value,
+        mut options: serde_json::Value,
     ) -> ChatState {
+        let overrides = request.overrides();
+        if let Some(control) = request.thinking_control()
+            && !request.reset().is_empty()
+        {
+            let source = match control {
+                crate::client::ThinkingControl::Level => "level_source",
+                crate::client::ThinkingControl::Display => "display_source",
+            };
+            options[source] = serde_json::json!("profile");
+        }
         let task = {
             let client = Arc::clone(client);
             tokio::spawn(async move {
@@ -23745,7 +23808,7 @@ mod tests {
             &request,
             serde_json::json!({
                 "session_id": "sess-1",
-                "overrides": {},
+                "overrides": overrides,
                 "thinking_options": options
             }),
         );
@@ -23827,13 +23890,13 @@ mod tests {
         );
 
         // Model changes are not part of the memory.
-        let _state = apply_accepted(
+        let state = apply_accepted(
             &client,
             &rpc,
             &mut rx,
             state,
             SessionOverride::Model("gpt-5".into()),
-            options,
+            options.clone(),
         )
         .await;
         assert_eq!(
@@ -23842,6 +23905,20 @@ mod tests {
                 level: None,
                 display: Some("updates".into()),
             }
+        );
+        let _state = apply_accepted(
+            &client,
+            &rpc,
+            &mut rx,
+            state,
+            SessionOverride::ResetThinkingDisplay,
+            options,
+        )
+        .await;
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "myagent").unwrap(),
+            AgentThinkingMemory::default(),
+            "an acknowledged display reset forgets it"
         );
         assert_eq!(
             remembered_agent_thinking(dir.path(), "other").unwrap(),
@@ -31550,6 +31627,17 @@ mod tests {
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
 
+        let request = next_rpc_request(&mut rx, "restart should refresh thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-fresh");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-fresh", "overrides": {}, "thinking_options": {}
+            }),
+        );
+
         let (state, phase) = tokio::time::timeout(Duration::from_secs(2), restart)
             .await
             .expect("restart should finish")
@@ -31557,5 +31645,147 @@ mod tests {
         assert!(phase.is_none());
         // The replacement session adopts the daemon-selected workspace.
         assert_eq!(state.cwd.as_deref(), Some("/agents/alpha/workspace"));
+    }
+
+    #[tokio::test]
+    async fn explicit_thinking_set_and_reset_require_acknowledgement_before_preferences() {
+        use crate::config::{AgentThinkingKey, persist_agent_thinking};
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        persist_agent_thinking(dir.path(), "myagent", AgentThinkingKey::Level, Some("low"))
+            .unwrap();
+        persist_agent_thinking(
+            dir.path(),
+            "myagent",
+            AgentThinkingKey::Display,
+            Some("omitted"),
+        )
+        .unwrap();
+        let config_path = dir.path().join("zerocode-config.toml");
+        let before = std::fs::read(&config_path).unwrap();
+        for request in [
+            SessionOverride::ThinkingLevel("high".into()),
+            SessionOverride::ThinkingDisplay("summarized".into()),
+            SessionOverride::ResetThinkingLevel,
+            SessionOverride::ResetThinkingDisplay,
+        ] {
+            for response in ["legacy", "missing-method", "mismatch"] {
+                let (tx, mut rx) = mpsc::channel::<String>(16);
+                let rpc = Arc::new(RpcOutbound::new(tx));
+                let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+                if response == "legacy" {
+                    let reader = Arc::clone(&client);
+                    let options =
+                        tokio::spawn(
+                            async move { reader.session_thinking_options("sess-1").await },
+                        );
+                    let wire = next_rpc_request(&mut rx, "legacy options probe").await;
+                    assert_eq!(wire["method"], method::SESSION_THINKING_OPTIONS);
+                    respond_err(
+                        &rpc,
+                        &wire,
+                        crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                        "method not found",
+                    );
+                    assert!(options.await.unwrap().is_err());
+                }
+                let mut state = state();
+                state.set_thinking_identity(offered_thinking());
+                let thinking_before = state.thinking.clone();
+                let request = request.clone();
+                let task = tokio::spawn(async move {
+                    Chat::apply_session_override(&client, &mut state, request).await;
+                    state
+                });
+                let wire = next_rpc_request(&mut rx, "explicit thinking configure").await;
+                assert_eq!(wire["method"], method::SESSION_CONFIGURE);
+                if response == "missing-method" {
+                    respond_err(
+                        &rpc,
+                        &wire,
+                        crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                        "old daemon does not support thinking controls",
+                    );
+                } else if response == "legacy" {
+                    // Older configure accepts unknown keys and returns success
+                    // without a thinking acknowledgement. Its options method
+                    // would also be missing; success must not be inferred.
+                    respond_ok(&rpc, &wire, serde_json::json!({"overrides": {}}));
+                } else {
+                    // The override echo alone is insufficient: these fitted
+                    // values do not represent the requested set/reset.
+                    respond_ok(
+                        &rpc,
+                        &wire,
+                        serde_json::json!({
+                            "overrides": wire["params"]["overrides"],
+                            "thinking_options": {"levels":["low","high"],
+                              "displays":["omitted","summarized"],
+                              "current_level":"low", "level_source":"session",
+                              "current_display":"omitted", "display_source":"session"}
+                        }),
+                    );
+                }
+                let state = tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(state.thinking, thinking_before, "{response}");
+                assert_eq!(std::fs::read(&config_path).unwrap(), before, "{response}");
+                let text = info_text(&state).unwrap();
+                assert_eq!(text, crate::i18n::t("zc-thinking-not-acknowledged"));
+                assert!(text.contains("daemon"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_provider_switch_succeeds_without_thinking_support() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut state = state();
+        state.set_thinking_identity(offered_thinking());
+        let task = tokio::spawn(async move {
+            Chat::apply_session_override(
+                &client,
+                &mut state,
+                SessionOverride::ModelProvider("openai.legacy".into()),
+            )
+            .await;
+            state
+        });
+        let configure = next_rpc_request(&mut rx, "provider configure").await;
+        assert_eq!(configure["method"], method::SESSION_CONFIGURE);
+        respond_ok(
+            &rpc,
+            &configure,
+            serde_json::json!({"overrides": {
+                "model_provider":"openai.legacy", "model":"gpt-5"
+            }}),
+        );
+        let options = next_rpc_request(&mut rx, "legacy options read").await;
+        assert_eq!(options["method"], method::SESSION_THINKING_OPTIONS);
+        respond_err(
+            &rpc,
+            &options,
+            crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+            "method not found",
+        );
+        let state = task.await.unwrap();
+        assert_eq!(state.model_provider_ref.as_deref(), Some("openai.legacy"));
+        assert_eq!(state.model.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            state.thinking,
+            crate::client::ThinkingOptionsResult::default()
+        );
+        assert_eq!(
+            info_text(&state),
+            Some(crate::i18n::t_args(
+                "zc-model-switch-provider-ok",
+                &[("provider", "openai.legacy"), ("model", "gpt-5")]
+            ))
+        );
     }
 }

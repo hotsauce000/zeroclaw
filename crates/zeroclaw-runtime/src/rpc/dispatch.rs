@@ -379,6 +379,7 @@ impl Method {
             | M::SessionListAcp
             | M::SessionMessages
             | M::SessionState
+            | M::SessionThinkingOptions
             | M::SessionGitBranch => (Resource::Sessions, Verb::Read),
             M::SessionClose | M::SessionCancel => (Resource::Sessions, Verb::Update),
             M::SessionDelete | M::SessionKill => (Resource::Sessions, Verb::Delete),
@@ -6621,6 +6622,8 @@ impl RpcDispatcher {
     /// never waits on a turn that holds the agent.
     async fn handle_session_thinking_options(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        self.authorize_session_owner(&req.session_id, Method::SessionThinkingOptions)
+            .await?;
         let agent_alias = self
             .ctx
             .sessions
@@ -18831,6 +18834,7 @@ mod tests {
             (2, "session/state"),
             (3, "session/delete"),
             (4, "session/close"),
+            (6, "session/thinking-options"),
         ] {
             let response = rpc(
                 &mut bob,
@@ -19414,6 +19418,7 @@ mod tests {
             ("config/reload", Resource::Config, Verb::Update),
             ("session/prompt", Resource::Sessions, Verb::Execute),
             ("session/new", Resource::Sessions, Verb::Create),
+            ("session/thinking-options", Resource::Sessions, Verb::Read),
             ("memory/delete", Resource::Memory, Verb::Delete),
             ("sops/run", Resource::Sops, Verb::Execute),
             ("sops/run-detail", Resource::Sops, Verb::Read),

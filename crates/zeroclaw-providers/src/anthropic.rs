@@ -10425,6 +10425,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                     budget_tokens: Some(1024),
                     effort: Some(zeroclaw_api::model_provider::ThinkingEffort::High),
                     display: None,
+                    profile_display: None,
                 }),
             };
             let stream =
@@ -10473,6 +10474,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 budget_tokens: Some(1024),
                 effort: Some(zeroclaw_api::model_provider::ThinkingEffort::High),
                 display: None,
+                profile_display: None,
             }),
         };
         let _ = provider.chat(request, "claude-sonnet-4-6", None).await;
@@ -10769,12 +10771,20 @@ data: {\"type\":\"message_stop\"}\n\n";
             tools: None,
             thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
                 budget_tokens: Some(10_000),
-                effort: Some(zeroclaw_api::model_provider::ThinkingEffort::High),
+                effort: None,
                 display: None,
+                profile_display: None,
             }),
         };
+        // Only a fixed-budget model uses the non-streaming preservation
+        // branch now; adaptive refusal is covered by the SSE regression.
+        assert!(
+            provider
+                .resolve_thinking(request.thinking, None, "claude-sonnet-4-5")
+                .uses_fixed_budget()
+        );
         let stream =
-            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+            provider.stream_chat(request, "claude-sonnet-4-5", None, StreamOptions::new(true));
         let events: Vec<StreamResult<StreamEvent>> = stream.collect().await;
         server.abort();
 

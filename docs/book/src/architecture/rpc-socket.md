@@ -199,6 +199,13 @@ time and rebuild no provider; the daemon resolves the turn's depth as the
 inline prefix, then the session override, then the profile default, and
 applies native request parameters only.
 
+Zerocode reports an explicit thinking set/reset as successful, and updates its
+saved preference, only when the configure response confirms both the resulting
+override and effective thinking options. An older daemon that ignores these
+fields, or a response that does not match the request, leaves the saved
+preference unchanged and asks the operator to update or restart the daemon.
+Ordinary model/provider changes retain compatibility with older daemons.
+
 ### ACP durable lifecycle
 
 Native RPC keeps the original visible transcript separate from the retained provider context. Automatic trimming does not delete or renumber original transcript rows. A trim notification is sent only after its retained-context snapshot and covered checkpoint boundary have committed together; a failed write suppresses that notification. The snapshot excludes runtime system prompts, recalled-memory injection, and hidden reasoning. On interruption, recovery appends visible checkpoint progress once while restoring the model from the latest retained snapshot plus later checkpoint events. An explicitly empty retained snapshot remains authoritative. Sessions without a snapshot keep the legacy provider-safe replay path.

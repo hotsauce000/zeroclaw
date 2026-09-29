@@ -4118,13 +4118,21 @@ mod tests {
 
     #[test]
     fn thinking_command_autocomplete_appends_space() {
-        let mut bar = input_bar_with_shared_commands();
-        bar.apply_autocomplete_choice("/effort");
-        assert_eq!(bar.input(), "/effort ");
-        bar.apply_autocomplete_choice("/display");
-        assert_eq!(bar.input(), "/display ");
-        bar.apply_autocomplete_choice("/toggle-thinking");
-        assert_eq!(bar.input(), "/toggle-thinking");
+        for (choice, expected) in [
+            ("/effort", "/effort "),
+            ("/display", "/display "),
+            ("/toggle-thinking", "/toggle-thinking"),
+        ] {
+            // Each starts in a command popup. Completing an argument-taking
+            // command legitimately switches the next popup to its arguments.
+            let mut bar = input_bar_with_shared_commands();
+            bar.apply_autocomplete_choice(choice);
+            assert_eq!(bar.input(), expected);
+            bar.undo();
+            assert_eq!(bar.input(), "");
+            bar.redo();
+            assert_eq!(bar.input(), expected);
+        }
     }
 
     #[test]

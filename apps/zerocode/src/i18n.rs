@@ -899,4 +899,24 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn thinking_acknowledgement_guidance_uses_catalogue_fallback() {
+        let english = build_ftl_bundle(EN_FTL, "en");
+        for (locale, source) in [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ] {
+            let bundle = build_ftl_bundle(source, locale);
+            let text = format_ftl_message(&bundle, "zc-thinking-not-acknowledged", &[])
+                .or_else(|| format_ftl_message(&english, "zc-thinking-not-acknowledged", &[]))
+                .expect("thinking guidance must render");
+            assert!(!text.contains("{zc-thinking-not-acknowledged}"));
+            assert!(text.contains("daemon"));
+            assert!(text.contains("saved preference"));
+        }
+    }
 }
