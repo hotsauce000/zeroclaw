@@ -650,6 +650,17 @@ pub enum MigrateCommands {
     },
 }
 
+/// A `[users.<name>]` entry name for `gateway get-paircode --user`, trimmed.
+/// A blank name is refused here instead of being sent: the operator asked for
+/// a bound code and must never get an unbound one by mistake.
+fn parse_roster_user_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("--user must name a [users.<name>] entry".to_string());
+    }
+    Ok(name.to_string())
+}
+
 /// Reject a `--to` value that is shaped like a flag.
 ///
 /// `--to` opts into `allow_hyphen_values` so hyphen-led recipients parse, which
@@ -662,17 +673,6 @@ pub enum MigrateCommands {
 /// whichever syntax supplied it, so `--to=--thread` is rejected identically and
 /// the message must not offer that as a workaround. No supported channel has a
 /// recipient beginning with `--`.
-/// A `[users.<name>]` entry name for `gateway get-paircode --user`, trimmed.
-/// A blank name is refused here instead of being sent: the operator asked for
-/// a bound code and must never get an unbound one by mistake.
-fn parse_roster_user_name(raw: &str) -> Result<String, String> {
-    let name = raw.trim();
-    if name.is_empty() {
-        return Err("--user must name a [users.<name>] entry".to_string());
-    }
-    Ok(name.to_string())
-}
-
 fn parse_delivery_recipient(raw: &str) -> Result<String, String> {
     if raw.starts_with("--") {
         return Err(format!(

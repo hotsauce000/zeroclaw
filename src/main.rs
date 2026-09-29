@@ -11045,6 +11045,36 @@ fn paircode_no_code_message(
                 Some(&format!("--new --user {user}")),
             ));
         }
+        // The gateway explained why it issued no replacement, typically
+        // because it could not honor the device's roster binding. A plain
+        // `--new` would give the device the operator's authority, so it is
+        // offered last and only for a device that should have it.
+        PaircodeAction::RotateDevice(_)
+            if gateway_message.is_some_and(|message| !message.trim().is_empty()) =>
+        {
+            lines.push(t(
+                "cli-pairing-rotate-device-no-code",
+                "No replacement code was issued. To re-pair the device as a roster user, run:",
+            ));
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--new --user <name>"),
+            ));
+            lines.push(t(
+                "cli-pairing-rotate-device-unbound",
+                "Mint an unbound code only for a device that should have the operator's full access:",
+            ));
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--new"),
+            ));
+        }
         PaircodeAction::RotateAll | PaircodeAction::RotateDevice(_) => {
             lines.push(t(
                 "cli-pairing-rotate-no-code",
@@ -15415,6 +15445,44 @@ mod tests {
             ),
             Ok(PaircodeResult::Code { .. })
         ));
+    }
+
+    /// When the gateway withholds a device's replacement code (for example
+    /// because its roster user is gone), the CLI must not steer the operator
+    /// straight to an unbound code for that device.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_after_a_withheld_rotation_leads_with_a_bound_code() {
+        let default = config::GatewayConfig::default();
+        let msg = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::RotateDevice("phone".into()),
+            true,
+            Some(
+                "Revoked the bearer token for device 'phone'. It was bound to user:alice, which no longer has a [users] entry, so no replacement code was issued.",
+            ),
+        );
+        assert!(msg.contains("which no longer has a [users] entry"));
+        let bound = msg
+            .find("zeroclaw gateway get-paircode --new --user <name>")
+            .expect("the bound remedy is offered");
+        let unbound = msg
+            .find(&t(
+                "cli-pairing-rotate-device-unbound",
+                "Mint an unbound code only for a device that should have the operator's full access:",
+            ))
+            .expect("an unbound code is offered only with its caveat");
+        assert!(bound < unbound, "the bound remedy comes first: {msg}");
+        assert!(
+            !msg.contains(&t(
+                "cli-pairing-check-enabled",
+                "Check whether pairing is enabled, then request a new device code:",
+            )),
+            "the generic rotation hint must not follow a withheld replacement: {msg}"
+        );
     }
 
     #[test]
