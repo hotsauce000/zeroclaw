@@ -715,19 +715,20 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
             // Resolve the model once for the receipt label; the closure builds a
             // fresh provider per case (isolation) and must be `'static`, so it owns
             // a config clone.
-            let (_, _provider_type, resolved_model) =
+            let (_, _provider_type, resolved_model, _) =
                 build_session_model_provider(config, &provider_ref, None)?;
             let receipt_ref = format!("{provider_ref}:{resolved_model}");
             let cfg = config.clone();
             Ok(RunDeps {
                 mode,
                 provider: Box::new(move |_trace: &LlmTrace| {
-                    let (provider, provider_type, resolved_model) =
+                    let (provider, provider_type, resolved_model, model_route_resolver) =
                         build_session_model_provider(&cfg, &provider_ref, None)?;
                     Ok(CaseProvider {
                         provider,
                         provider_name: Some(provider_type),
                         model_name: Some(resolved_model),
+                        model_route_resolver: Some(model_route_resolver),
                         finish_turn: None,
                     })
                 }),
@@ -1629,6 +1630,32 @@ mod tests {
     }
 
     #[test]
+    fn live_provider_factory_retains_the_configured_route_resolver() {
+        let mut config = http_live_config();
+        insert_http_profile(&mut config, "routed", &[]);
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "code".to_string(),
+            model_provider: "custom.routed".to_string(),
+            model: "routed-model".to_string(),
+            ..ModelRouteConfig::default()
+        }];
+        let deps = build_run_deps(&config, Mode::Live).unwrap();
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{"model_name":"route-metadata","turns":[{"user_input":"hello"}]}"#,
+        )
+        .unwrap();
+        let provider = (deps.provider)(&trace).unwrap();
+        let resolver = provider
+            .model_route_resolver
+            .expect("factory route resolver");
+        let route = resolver.resolve("hint:code");
+        assert_eq!(route.provider_name, "custom.routed");
+        assert_eq!(route.model, "routed-model");
+        assert_eq!(provider.provider_name.as_deref(), Some("custom.mock"));
+        assert_eq!(provider.model_name.as_deref(), Some("mock-echo"));
+    }
+
+    #[test]
     fn live_rejects_a_directly_selected_cli_backed_provider() {
         let mut config = http_live_config();
         insert_cli_profile(&mut config, "default");
@@ -1722,6 +1749,7 @@ mod tests {
         config.model_routes = vec![ModelRouteConfig {
             hint: "code".to_string(),
             model_provider: "custom.routed".to_string(),
+            model: "routed-model".to_string(),
             ..ModelRouteConfig::default()
         }];
 
