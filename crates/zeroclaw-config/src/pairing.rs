@@ -537,8 +537,16 @@ impl PairingGuard {
             if !is_token_hash(key) || !crate::schema::is_valid_auth_section_name(principal_id) {
                 skipped += 1;
                 // Every form under which `paired_tokens` could hold the same
-                // token: as written, as a normalized hash, or hashed plaintext.
-                rejected.extend([key.clone(), hash, hash_token(key)]);
+                // token: as written, as a normalized hash (also once stray
+                // whitespace is stripped), or hashed plaintext.
+                let trimmed = key.trim();
+                rejected.extend([
+                    key.clone(),
+                    hash,
+                    trimmed.to_ascii_lowercase(),
+                    hash_token(key),
+                    hash_token(trimmed),
+                ]);
                 continue;
             }
             if bound
@@ -2482,6 +2490,19 @@ mod tests {
             &[("zc_plain", "alice")],
         ));
         assert!(!guard.token_is_paired("zc_plain"));
+
+        // A binding key damaged only by stray whitespace or case.
+        for padded in [
+            format!(" {hash}"),
+            format!("{} ", hash.to_ascii_uppercase()),
+        ] {
+            let guard =
+                PairingGuard::from_gateway_config(&gateway_with(&[&hash], &[(&padded, "alice")]));
+            assert!(
+                !guard.token_is_paired("zc_both"),
+                "key {padded:?}: the token must not stay loaded as the shared operator"
+            );
+        }
     }
 
     /// Two spellings of one hash naming different principals leave no way to
