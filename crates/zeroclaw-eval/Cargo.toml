@@ -7,12 +7,17 @@ description = "Agent evaluation harness for ZeroClaw — Phase 0: deterministic 
 repository.workspace = true
 homepage.workspace = true
 publish = true
+# The suite gate replays the workspace fixture corpus at evals/regression, which
+# lives outside this package, so keep it repository-only rather than shipping a
+# test that cannot run for a consumer.
+exclude = ["tests/regression_suite.rs"]
 
 [dependencies]
 zeroclaw-api.workspace = true
 zeroclaw-runtime.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-memory.workspace = true
+zeroclaw-providers.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
