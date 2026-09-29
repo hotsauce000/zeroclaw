@@ -117,3 +117,7 @@ filter it to the effective allowlist; `shell` remains unavailable.
   remains the extension point).
 - `runner` — builds an isolated agent per case, drives it, grades it.
 - `report` — pass/fail aggregation, table + JSON rendering.
+
+## Test boundary
+
+`tests/regression_suite.rs` is the repository gate, not a shipped test. It replays the workspace corpus at `evals/regression` and holds every fixture to the idle-run check, so it needs files outside this package; `cargo package` therefore excludes the target (see `exclude` in `Cargo.toml`). The published crate carries the library and the fixture format, not the suite. From a repository checkout run `cargo test -p zeroclaw-eval --test regression_suite`; the same corpus is what `zeroclaw eval run` replays by default.

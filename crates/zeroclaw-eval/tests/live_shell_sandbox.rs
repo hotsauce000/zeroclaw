@@ -40,7 +40,7 @@ use zeroclaw_eval::{CaseProvider, LlmTrace, Mode, RunDeps};
 /// `shell` is excluded from `effective` (and therefore from
 /// `risk.auto_approve`), a scripted `shell` call is auto-denied *before*
 /// tool dispatch: it never reaches `execute_one_tool`, so it never shows up
-/// in `RunRecord::tools_called`/`all_tools_succeeded` at all (see
+/// in `RunRecord::tool_calls` at all (see
 /// `gate_tool_approval`'s `Deny` path, which returns straight back to
 /// `prepare_tool_calls` without touching the observer). This denial in the
 /// conversation history - not tool-call bookkeeping - is the real proof the

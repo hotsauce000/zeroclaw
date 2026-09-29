@@ -1,4 +1,7 @@
 //! The CI gate: every fixture in evals/regression must replay green.
+//!
+//! Repository-only. The corpus lives outside this package, so `cargo package`
+//! excludes this target from the published crate archive.
 
 use std::path::PathBuf;
 use zeroclaw_config::scattered_types::EvalHarnessConfig;
@@ -45,29 +48,22 @@ async fn missing_argument_fixture_fails_when_the_dispatch_is_silently_repaired()
     let observed = run_case(&trace, &RunDeps::replay())
         .await
         .expect("the fixture must replay");
-    let graded = evaluate_expects(&trace.expects, &observed.record);
+    let observed = observed.record;
+    let graded = evaluate_expects(&trace.expects, &observed);
     assert!(
         graded.iter().all(|grade| grade.passed),
         "the fixture must pass on the run it actually produces: {graded:?}"
     );
 
-    let completed = observed
-        .record
-        .completion
-        .clone()
-        .expect("a replayed run reaches completion");
-    let repaired = RunRecord {
-        provenance: observed.record.provenance.clone(),
-        completion: Some(RunCompletion {
-            tool_calls: vec![RecordedCall {
-                name: "echo".to_string(),
-                arguments: r#"{"message":"hello"}"#.to_string(),
-                result: "hello".to_string(),
-                success: true,
-            }],
-            ..completed
-        }),
-    };
+    let mut repaired = observed.clone();
+    let completion = repaired.completion.as_mut().expect("fixture completed");
+    completion.history.clear();
+    completion.tool_calls = vec![RecordedCall {
+        name: "echo".to_string(),
+        arguments: r#"{"message":"hello"}"#.to_string(),
+        result: "hello".to_string(),
+        success: true,
+    }];
     let failures: Vec<String> = evaluate_expects(&trace.expects, &repaired)
         .into_iter()
         .filter(|grade| !grade.passed)

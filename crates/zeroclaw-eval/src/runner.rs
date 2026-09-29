@@ -38,6 +38,9 @@ pub struct CaseProvider {
     /// Sets `Agent::builder().model_name(..)` when present; this is the value
     /// passed to every `provider.chat` call for the built agent.
     pub model_name: Option<String>,
+    /// The factory-owned resolver shared with the provider. Forward the same
+    /// handle to the agent so route metadata comes from its dispatch owner.
+    pub model_route_resolver: Option<Arc<zeroclaw_providers::router::ModelRouteResolver>>,
     /// Replay-only per-turn exhaustion boundary; `None` for live.
     pub finish_turn: Option<FinishTurnFn>,
 }
@@ -49,6 +52,7 @@ impl CaseProvider {
             provider,
             provider_name: None,
             model_name: None,
+            model_route_resolver: None,
             finish_turn: None,
         }
     }
@@ -101,6 +105,7 @@ impl RunDeps {
                     provider: Box::new(provider),
                     provider_name: None,
                     model_name: None,
+                    model_route_resolver: None,
                     finish_turn: Some(Box::new(move |turn_index| handle.finish_turn(turn_index))),
                 })
             }),
@@ -732,7 +737,13 @@ pub(crate) mod tests {
                 .final_response
                 .contains("Hello")
         );
-        assert!(outcome.record.completion_or_default().tool_calls.is_empty());
+        assert!(
+            outcome
+                .record
+                .completion_or_default()
+                .tool_names()
+                .is_empty()
+        );
         assert!(
             outcome.grades.iter().all(|g| g.passed),
             "grades: {:?}",
@@ -746,7 +757,7 @@ pub(crate) mod tests {
         let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
         assert_eq!(
             outcome.record.completion_or_default().tool_names(),
-            ["echo"]
+            vec!["echo".to_string()]
         );
         assert!(outcome.record.completion_or_default().all_tools_succeeded());
         assert!(
@@ -773,15 +784,14 @@ pub(crate) mod tests {
             "expects": {}
         }"#;
         let trace: LlmTrace = serde_json::from_str(UNICODE).unwrap();
-        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
-        let completion = outcome.record.completion_or_default();
-        assert_eq!(
-            completion.tool_calls.len(),
-            1,
-            "calls: {:?}",
-            completion.tool_calls
-        );
-        let call = &completion.tool_calls[0];
+        let record = run_case(&trace, &RunDeps::replay())
+            .await
+            .unwrap()
+            .record
+            .completion
+            .unwrap();
+        assert_eq!(record.tool_calls.len(), 1, "calls: {:?}", record.tool_calls);
+        let call = &record.tool_calls[0];
         assert_eq!(call.name, "echo");
         assert!(
             call.arguments.contains("naïve café 日本語 ✓"),
@@ -794,7 +804,12 @@ pub(crate) mod tests {
         );
         // The final response is scripted text and deliberately does NOT contain the
         // Unicode string, so this assertion can only be satisfied by the boundary.
-        assert_eq!(completion.final_response, "done");
+        assert_eq!(record.final_response, "done");
+        let receipt = serde_json::to_value(&record).unwrap();
+        assert_eq!(receipt["tools_called"], serde_json::json!(["echo"]));
+        assert_eq!(receipt["all_tools_succeeded"], true);
+        assert_eq!(receipt["tool_calls"][0]["result"], "naïve café 日本語 ✓");
+        assert_eq!(receipt["tool_calls"][0]["arguments"], call.arguments);
     }
 
     #[tokio::test]
@@ -816,16 +831,15 @@ pub(crate) mod tests {
             "expects": {}
         }"#;
         let trace: LlmTrace = serde_json::from_str(MALFORMED).unwrap();
-        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
-        let completion = outcome.record.completion_or_default();
+        let record = run_case(&trace, &RunDeps::replay())
+            .await
+            .unwrap()
+            .record
+            .completion
+            .unwrap();
 
-        assert_eq!(
-            completion.tool_calls.len(),
-            1,
-            "calls: {:?}",
-            completion.tool_calls
-        );
-        let call = &completion.tool_calls[0];
+        assert_eq!(record.tool_calls.len(), 1, "calls: {:?}", record.tool_calls);
+        let call = &record.tool_calls[0];
         assert_eq!(call.name, "echo");
         assert!(
             call.arguments.contains("wrong_key"),
@@ -840,7 +854,7 @@ pub(crate) mod tests {
         assert!(call.success, "the dispatch itself must not be an error");
         // The loop continued past the tool call to the turn's second scripted step.
         assert_eq!(
-            completion.final_response,
+            record.final_response,
             "The echo tool received no usable message."
         );
     }

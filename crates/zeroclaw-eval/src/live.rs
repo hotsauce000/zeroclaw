@@ -189,6 +189,7 @@ pub fn live_shell_sandbox(workspace: &Path) -> anyhow::Result<Arc<dyn Sandbox>> 
             enabled: Some(true),
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         },
         RuntimeKind::Native,
         Some(workspace),
@@ -308,6 +309,7 @@ pub(crate) async fn run_live_case_with_graders_recording_provenance(
         provider,
         provider_name,
         model_name,
+        model_route_resolver,
         finish_turn: _,
     } = (deps.provider)(trace)?;
     // Resolve the dispatcher from the provider's capabilities so XML-dialect
@@ -339,6 +341,9 @@ pub(crate) async fn run_live_case_with_graders_recording_provenance(
     }
     if let Some(ptype) = provider_name {
         builder = builder.model_provider_name(ptype);
+    }
+    if let Some(resolver) = model_route_resolver {
+        builder = builder.model_route_resolver(resolver);
     }
     let mut agent = builder.build()?;
 
@@ -465,7 +470,7 @@ mod tests {
         // resolves its requirement to `Prompt` and auto-denies it - no
         // interactive/channel backchannel is wired here - *before* the call
         // ever reaches tool dispatch. That means it never shows up in
-        // `tools_called`/`all_tools_succeeded` at all (see
+        // `tool_calls` at all (see
         // `crate::agent::turn::approval_gate::gate_tool_approval`'s `Deny`
         // path, which returns straight to `prepare_tool_calls` without
         // touching the observer). The real proof the call never ran is in
@@ -596,6 +601,10 @@ mod tests {
         let completion = outcome.record.completion_or_default();
         assert_eq!(completion.tool_names(), vec!["echo"]);
         assert!(completion.all_tools_succeeded());
+        let call = &completion.tool_calls[0];
+        assert!(call.arguments.contains("hello"));
+        assert_eq!(call.result, "hello");
+        assert_eq!(completion.final_response, "done");
     }
 
     #[test]
@@ -1011,6 +1020,7 @@ mod tests {
                     }),
                     provider_name: Some("testprov".to_string()),
                     model_name: Some("model-under-test".to_string()),
+                    model_route_resolver: None,
                     finish_turn: None,
                 })
             }),
