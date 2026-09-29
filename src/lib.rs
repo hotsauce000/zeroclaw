@@ -165,6 +165,12 @@ With --new, generates a fresh pairing code even if the gateway \
 was previously paired (useful for adding additional clients). This \
 does NOT revoke existing tokens.
 
+With --new --user NAME, the code is bound to the [users.NAME] roster \
+entry: the device that redeems it authenticates as that user, with \
+that user's permission profiles, instead of as the shared operator. \
+Only surfaces that resolve principals (the RPC connection zerocode \
+uses, and the gateway's config routes) accept such a token.
+
 With --rotate, revokes ALL paired bearer tokens, clears the device \
 registry, and issues a fresh code. Use this after a suspected token \
 leak when you do not know which token was compromised; every client \
@@ -176,6 +182,7 @@ and issues a fresh code for re-pairing that one device.
 Examples:
   zeroclaw gateway get-paircode               # show current pairing code
   zeroclaw gateway get-paircode --new         # add another client (no revocation)
+  zeroclaw gateway get-paircode --new --user alice  # code that pairs as roster user alice
   zeroclaw gateway get-paircode --rotate      # revoke ALL tokens, then issue a code
   zeroclaw gateway get-paircode --rotate-device dash-1  # revoke one device's token
   zeroclaw gateway get-paircode --new --port 3001 # target alternate-port gateway")]
@@ -191,6 +198,16 @@ Examples:
         /// Revoke a single device's bearer token by id, then issue a new code
         #[arg(long, value_name = "DEVICE_ID", conflicts_with_all = ["new", "rotate"])]
         rotate_device: Option<String>,
+
+        /// With --new: bind the code to this [users.<name>] roster entry, so
+        /// the device that redeems it authenticates as that user
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "new",
+            conflicts_with_all = ["rotate", "rotate_device"]
+        )]
+        user: Option<String>,
 
         /// Port of the running gateway to query; defaults to config gateway.port
         #[arg(short, long)]
