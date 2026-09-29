@@ -763,8 +763,8 @@ mod tests {
 
         let outcome = run_live_case(&trace, &deps).await.unwrap();
 
-        assert_eq!(outcome.record.tools_called, ["memory_recall"]);
-        assert!(outcome.record.all_tools_succeeded);
+        assert_eq!(outcome.record.tool_names(), ["memory_recall"]);
+        assert!(outcome.record.all_tools_succeeded());
         assert!(outcome.grades.iter().all(|grade| grade.passed));
         assert!(outcome.record.history.iter().any(|message| {
             matches!(
@@ -817,7 +817,7 @@ mod tests {
 
         let outcome = run_live_case(&trace, &deps).await.unwrap();
 
-        assert!(outcome.record.all_tools_succeeded);
+        assert!(outcome.record.all_tools_succeeded());
         let memory_grade = outcome
             .grades
             .iter()
@@ -873,8 +873,8 @@ mod tests {
         );
 
         let first = run_live_case(&first_trace, &first_deps).await.unwrap();
-        assert_eq!(first.record.tools_called, ["memory_store", "memory_recall"]);
-        assert!(first.record.all_tools_succeeded);
+        assert_eq!(first.record.tool_names(), ["memory_store", "memory_recall"]);
+        assert!(first.record.all_tools_succeeded());
         assert!(first.record.history.iter().any(|message| {
             matches!(
                 message,
@@ -916,8 +916,8 @@ mod tests {
         );
 
         let second = run_live_case(&second_trace, &second_deps).await.unwrap();
-        assert_eq!(second.record.tools_called, ["memory_recall"]);
-        assert!(second.record.all_tools_succeeded);
+        assert_eq!(second.record.tool_names(), ["memory_recall"]);
+        assert!(second.record.all_tools_succeeded());
         assert!(
             second
                 .record
@@ -981,7 +981,7 @@ mod tests {
 
         let outcome = run_live_case(&trace, &deps).await.unwrap();
 
-        assert!(outcome.record.tools_called.is_empty());
+        assert!(outcome.record.tool_names().is_empty());
     }
 
     #[tokio::test]
