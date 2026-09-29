@@ -816,6 +816,7 @@ zc-plugins-detail-capabilities = Capabilities: { $list }
 zc-plugins-detail-permissions = Requested permissions: { $list }
 zc-plugins-detail-install-identity = Package identity: { $identity }
 zc-plugins-detail-none = none
+zc-plugins-detail-more = +{ $count } more
 zc-plugins-detail-not-installed = Not installed
 zc-plugins-detail-not-in-registry = Not in the cached registry
 zc-plugins-detail-installed-unknown = Unknown: installed packages could not be read (see daemon log).

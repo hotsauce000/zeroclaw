@@ -30,6 +30,13 @@ use crate::wire::{
 /// Longest daemon-provided string kept for display, in characters.
 const MAX_DISPLAY_CHARS: usize = 512;
 
+/// Most raw characters [`display_safe`] reads from one string.
+const MAX_SCANNED_CHARS: usize = 4 * MAX_DISPLAY_CHARS;
+
+/// Most items shown from one capability or permission list; the rest are
+/// counted rather than listed.
+const MAX_LIST_ITEMS: usize = 32;
+
 /// Width of the left filter and host column, matching the zeroclaw split.
 const LEFT_COLUMN_WIDTH: u16 = 30;
 
@@ -50,11 +57,14 @@ const DETAIL_SCROLL_LINES: u16 = 3;
 /// That includes emoji presentation selectors in descriptions, the same way
 /// the zero-width joiner is treated. Other whitespace becomes a space, runs of
 /// whitespace collapse to one, the ends are trimmed, and the result is capped
-/// at [`MAX_DISPLAY_CHARS`] characters ending in an ellipsis.
+/// at [`MAX_DISPLAY_CHARS`] characters ending in an ellipsis. At most
+/// [`MAX_SCANNED_CHARS`] raw characters are read, so a value padded with long
+/// whitespace runs still costs a bounded scan on every draw.
 fn display_safe(raw: &str) -> String {
     let mut kept: Vec<char> = Vec::new();
     let mut pending_space = false;
-    for c in raw.chars() {
+    let mut chars = raw.chars();
+    for c in chars.by_ref().take(MAX_SCANNED_CHARS) {
         let c = match c {
             '\n' | '\r' | '\t' => ' ',
             c if is_hidden(c) => '\u{FFFD}',
@@ -74,7 +84,7 @@ fn display_safe(raw: &str) -> String {
             break;
         }
     }
-    if kept.len() > MAX_DISPLAY_CHARS {
+    if kept.len() > MAX_DISPLAY_CHARS || chars.next().is_some() {
         kept.truncate(MAX_DISPLAY_CHARS - 1);
         while kept.last() == Some(&' ') {
             kept.pop();
@@ -90,12 +100,12 @@ fn is_hidden(c: char) -> bool {
     c.is_control() || crate::osc_status::is_format_control(c) || is_invisible_filler(c)
 }
 
-/// Default-ignorable characters outside the format-control denylist that
-/// render as nothing (or as blank space) and so could make two different
-/// names look the same: the combining grapheme joiner, Hangul fillers, Khmer
-/// inherent vowels, Mongolian variation selectors, the blank braille pattern,
-/// variation selectors, reserved default-ignorables and the tag and
-/// supplementary selector plane.
+/// Characters outside the format-control denylist that render as nothing or
+/// as blank space, and so could make two different names look the same: the
+/// default-ignorable combining grapheme joiner, Hangul fillers, Khmer
+/// inherent vowels, Mongolian variation selectors, variation selectors,
+/// reserved code points and the tag and supplementary selector plane, plus
+/// the blank braille pattern, a symbol that draws as an empty cell.
 fn is_invisible_filler(c: char) -> bool {
     matches!(
         c as u32,
@@ -302,7 +312,19 @@ struct RegistryView {
 }
 
 fn safe_list(items: &[String]) -> Vec<String> {
-    items.iter().map(|item| display_safe(item)).collect()
+    let mut shown: Vec<String> = items
+        .iter()
+        .take(MAX_LIST_ITEMS)
+        .map(|item| display_safe(item))
+        .collect();
+    if items.len() > MAX_LIST_ITEMS {
+        let rest = (items.len() - MAX_LIST_ITEMS).to_string();
+        shown.push(t_args(
+            "zc-plugins-detail-more",
+            &[("count", rest.as_str())],
+        ));
+    }
+    shown
 }
 
 /// A description that is empty once sanitized reads as "none provided".
@@ -314,16 +336,20 @@ fn safe_description(description: Option<&str>) -> Option<String> {
 
 /// Quote an untrusted name or version with every character [`display_safe`]
 /// would change escaped: newline, carriage return and tab as `\n`, `\r` and
-/// `\t`, every other whitespace character (the plain space included) and
-/// every hidden one as `\u{..}`, and the backslash and quote themselves. The
-/// escaping is one-to-one and leaves only printable, non-space characters, so
-/// it needs no second sanitizing pass that could collapse two strings into one.
+/// `\t`, every other whitespace character (the plain space included), every
+/// hidden one, and every character Rust's debug escaping would not print
+/// as is (unassigned, private-use and combining code points) as `\u{..}`, and
+/// the backslash and quotes themselves. The escaping is one-to-one and leaves
+/// only printable, non-space characters, so it needs no second sanitizing
+/// pass that could collapse two strings into one.
 fn escape_untrusted(raw: &str) -> Vec<char> {
     let mut out = vec!['"'];
     for c in raw.chars() {
         match c {
-            '\n' | '\r' | '\t' | '\\' | '"' => out.extend(c.escape_debug()),
-            c if c.is_whitespace() || is_hidden(c) => out.extend(c.escape_unicode()),
+            '\n' | '\r' | '\t' | '\\' | '"' | '\'' => out.extend(c.escape_debug()),
+            c if c.is_whitespace() || is_hidden(c) || c.escape_debug().len() > 1 => {
+                out.extend(c.escape_unicode());
+            }
             c => out.push(c),
         }
     }
@@ -1632,6 +1658,86 @@ mod tests {
     }
 
     #[test]
+    fn scans_and_lists_are_bounded() {
+        let padded = " ".repeat(100_000);
+        assert_eq!(display_safe(&format!("{padded}x")), "\u{2026}");
+        assert_eq!(display_safe(&format!("a{padded}x")), "a\u{2026}");
+        assert_eq!(display_safe(&format!("a{}", " ".repeat(10))), "a");
+
+        let many: Vec<String> = (0..100).map(|i| format!("cap{i}")).collect();
+        let shown = safe_list(&many);
+        assert_eq!(shown.len(), MAX_LIST_ITEMS + 1);
+        assert_eq!(shown[MAX_LIST_ITEMS - 1], "cap31");
+        assert_eq!(shown[MAX_LIST_ITEMS], "+68 more");
+        assert_eq!(safe_list(&many[..MAX_LIST_ITEMS]), many[..MAX_LIST_ITEMS]);
+    }
+
+    #[test]
+    fn quoted_values_escape_what_would_not_print() {
+        assert_eq!(display_name("a\u{301}b"), r#""a\u{301}b""#);
+        assert_eq!(display_name("x\u{e000}"), r#""x\u{e000}""#);
+        assert_eq!(display_name("x\u{378}"), r#""x\u{378}""#);
+        assert_eq!(display_name("it's"), r#""it\'s""#);
+        // Printable non-ASCII stays readable inside the quotes.
+        assert_eq!(display_name("\u{65e5}\u{672c}"), "\"\u{65e5}\u{672c}\"");
+    }
+
+    /// Every place a version or install identity reaches the screen goes
+    /// through the token allowlist, not just one of them.
+    #[test]
+    fn every_version_and_identity_slot_quotes_a_non_token() {
+        let spaced = r#""1\u{20}x""#;
+        assert_eq!(
+            versions_text(&entry("a", Some(("1 x", &[])), Some(("1 x", &[])))),
+            format!("v{spaced} installed, in registry")
+        );
+        assert_eq!(
+            versions_text(&entry("b", Some(("1 x", &[])), Some(("0.2.0", &[])))),
+            format!("v{spaced} installed, registry v0.2.0")
+        );
+        assert_eq!(
+            versions_text(&entry("c", Some(("1 x", &[])), None)),
+            format!("v{spaced} installed")
+        );
+        let detail = project_detail(
+            &entry("d", Some(("1 x", &[])), Some(("1 x", &[]))),
+            Unreadable::default(),
+        );
+        assert_eq!(detail.installed.unwrap().version, spaced);
+        assert_eq!(detail.registry.unwrap().version, spaced);
+
+        let lookalike = entry(" calendar", None, Some(("1.0.0", &[])));
+        assert_eq!(
+            project_detail(&lookalike, Unreadable::default())
+                .registry
+                .unwrap()
+                .install_source,
+            r#""\u{20}calendar@1.0.0""#
+        );
+
+        // And through the real draw path: the row shows the registry version
+        // quoted, so it cannot repeat the row's own wording.
+        let mut data = catalog();
+        data.plugins = vec![entry(
+            "cal",
+            Some(("0.1.0", &[])),
+            Some(("9.9.9 installed, registry v9.9.9", &[])),
+        )];
+        let rows = render_rows(&mut loaded_pane(data), 120, 8);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(r#"registry v"9.9.9\u{20}installed,"#)),
+            "{rows:#?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("registry v9.9.9 installed")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
     fn oversized_names_and_versions_are_capped_in_quoted_form() {
         let huge = "\u{200b}".repeat(100_000);
         for shown in [display_name(&huge), display_token(&huge)] {
@@ -1908,15 +2014,18 @@ mod tests {
         );
 
         // The wording follows the daemon's raw strings, so versions that only
-        // look alike once sanitized are still described as two versions.
-        for registry in ["1.0.0 ", "1.0.0\n", "1.0.0\u{fe0f}"] {
+        // look alike once sanitized are still described as two versions, and
+        // the lookalike is shown quoted rather than as the installed version.
+        for (registry, shown) in [
+            ("1.0.0 ", r#""1.0.0\u{20}""#),
+            ("1.0.0\n", r#""1.0.0\n""#),
+            ("1.0.0\u{fe0f}", r#""1.0.0\u{fe0f}""#),
+        ] {
             let lookalike = entry("f", Some(("1.0.0", &[])), Some((registry, &[])));
-            let text = versions_text(&lookalike);
-            assert!(
-                text.starts_with("v1.0.0 installed, registry v"),
-                "{registry:?}: {text}"
+            assert_eq!(
+                versions_text(&lookalike),
+                format!("v1.0.0 installed, registry v{shown}")
             );
-            assert!(text.chars().all(|c| !is_hidden(c)), "{registry:?}: {text}");
         }
 
         assert!(project_row(&same, Unreadable::default()).has_installed);
