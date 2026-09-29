@@ -401,8 +401,12 @@ pub async fn submit_pairing_enhanced(
             .into_response();
     }
 
-    match state.pairing.try_pair(code, &client_id).await {
-        Ok(Some(token)) => {
+    match state.pairing.reserve_pair(code, &client_id).await {
+        Ok(Some(reservation)) => {
+            // The subject comes from the code the operator minted; the
+            // client redeeming it cannot choose or drop it.
+            let principal_id = super::paired_principal_id(reservation.subject());
+            let token = reservation.commit();
             let token_hash = {
                 use sha2::{Digest, Sha256};
                 let hash = Sha256::digest(token.as_bytes());
@@ -472,6 +476,7 @@ pub async fn submit_pairing_enhanced(
                 "paired": true,
                 "persisted": true,
                 "token": token,
+                "principal_id": principal_id,
                 "message": "Pairing successful"
             }))
             .into_response()
@@ -672,7 +677,7 @@ pub async fn rotate_token(
         }
     };
 
-    state.pairing.revoke_token_hash(&token_hash);
+    let revoked = state.pairing.revoke_token_hash_subject(&token_hash);
 
     // Same persist-fail caveat as `revoke_device`: device row + in-memory
     // token are already gone; surfacing the persist error tells the caller
@@ -691,14 +696,34 @@ pub async fn rotate_token(
             .into_response();
     }
 
+    // The replacement pairs as the revoked token did, or not at all: an
+    // unbound code would hand a roster user's device operator authority.
+    let replacement = super::rotation_replacement_subject(&state.config.read().users, revoked);
+    let subject = match replacement {
+        Ok(subject) => subject,
+        Err(withheld) => {
+            return Json(serde_json::json!({
+                "device_id": device_id,
+                "pairing_code": null,
+                "message": format!("Old token revoked. {}", withheld.message()),
+            }))
+            .into_response();
+        }
+    };
+    let principal_id = super::paired_principal_id(&subject);
+
     // Issue the new pairing code atomically against the slot. If another
     // flow holds the slot, the revoke still stands — return 200 with
     // `pairing_code: null` and a message that tells the operator what
     // happened so they do not assume rotation failed.
-    match state.pairing.generate_pairing_code_if_vacant(crate::live_pairing_code_policy(&state)) {
+    match state
+        .pairing
+        .generate_pairing_code_if_vacant_as(crate::live_pairing_code_policy(&state), subject)
+    {
         Ok(code) => Json(serde_json::json!({
             "device_id": device_id,
             "pairing_code": code,
+            "principal_id": principal_id,
             "message": "Old token revoked. Use this code to re-pair the device.",
         }))
         .into_response(),

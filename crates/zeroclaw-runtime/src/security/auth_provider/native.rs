@@ -23,10 +23,11 @@ use zeroclaw_api::principal::{
 };
 use zeroclaw_config::pairing::{PairedTokenSubject, PairingGuard};
 
-/// The identity a paired token attests. The provider and connection
-/// revalidation both derive native identities here, so a revalidated
-/// connection always compares against the identity the handshake produced.
-pub(crate) fn identity_for_subject(subject: PairedTokenSubject) -> AuthenticatedIdentity {
+/// The identity a paired token attests. The provider, connection
+/// revalidation and the gateway's pairing responses all derive native
+/// identities here, so none of them can disagree with the handshake.
+#[must_use]
+pub fn identity_for_subject(subject: PairedTokenSubject) -> AuthenticatedIdentity {
     match subject {
         PairedTokenSubject::SharedOperator => {
             AuthenticatedIdentity::shared_operator(AuthMethod::Native)
