@@ -1,18 +1,22 @@
-//! Channel infrastructure: session backends, debouncing, and stall watchdog.
+//! Channel infrastructure: session backends, debouncing, stall watchdog, and
+//! the plugin webhook ingress.
 //! These are cross-cutting utilities used by multiple channel implementations.
 
 pub mod acp_session_store;
 pub mod debounce;
 pub mod net_guard;
+pub mod plugin_webhook;
 pub mod session_backend;
 pub mod session_queue;
 pub mod session_sqlite;
 pub mod session_store;
 pub mod stall_watchdog;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::session_backend::SessionBackend;
 
@@ -30,6 +34,87 @@ pub fn parse_gateway_bind_socket_addr(
 
 pub fn fallback_gateway_bind_socket_addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// Fallback for `gateway.idempotency_max_keys = 0`, shared by the gateway's
+/// replay store and the plugin webhook ingress.
+pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
+
+/// A configured key bound where zero selects `fallback`; never below one.
+#[must_use]
+pub fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
+    if configured == 0 {
+        fallback.max(1)
+    } else {
+        configured
+    }
+}
+
+/// `gateway.idempotency_ttl_secs`, never below one second.
+#[must_use]
+pub fn effective_idempotency_ttl(ttl_secs: u64) -> Duration {
+    Duration::from_secs(ttl_secs.max(1))
+}
+
+/// Idempotency keys already acted on, each kept for a TTL and bounded in
+/// number. A full set evicts its oldest key to admit a new one.
+#[derive(Debug)]
+pub struct CommittedKeys {
+    ttl: Duration,
+    max_keys: usize,
+    seen: HashMap<String, Instant>,
+}
+
+impl CommittedKeys {
+    /// `max_keys` below one is raised to one.
+    #[must_use]
+    pub fn new(ttl: Duration, max_keys: usize) -> Self {
+        Self {
+            ttl,
+            max_keys: max_keys.max(1),
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Whether `key` was inserted less than the TTL before `now`. Keys that
+    /// have reached the TTL are forgotten first.
+    pub fn contains(&mut self, key: &str, now: Instant) -> bool {
+        self.forget_expired(now);
+        self.seen.contains_key(key)
+    }
+
+    /// Record `key` as seen at `now`, after forgetting expired keys and, if
+    /// the set is still full, the oldest one.
+    pub fn insert(&mut self, key: String, now: Instant) {
+        self.forget_expired(now);
+        if self.seen.len() >= self.max_keys {
+            let oldest = self
+                .seen
+                .iter()
+                .min_by_key(|(_, seen_at)| *seen_at)
+                .map(|(oldest, _)| oldest.clone());
+            if let Some(oldest) = oldest {
+                self.seen.remove(&oldest);
+            }
+        }
+        self.seen.insert(key, now);
+    }
+
+    /// Keys held, counting expired ones no call has forgotten yet.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
+    fn forget_expired(&mut self, now: Instant) {
+        self.seen
+            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+    }
 }
 
 pub fn make_session_backend(
@@ -87,6 +172,94 @@ mod tests {
 
     fn user_msg(content: &str) -> ChatMessage {
         ChatMessage::user(content)
+    }
+
+    #[test]
+    fn normalize_max_keys_uses_fallback_for_zero() {
+        assert_eq!(normalize_max_keys(0, 10_000), 10_000);
+        assert_eq!(normalize_max_keys(0, 0), 1);
+    }
+
+    #[test]
+    fn normalize_max_keys_preserves_nonzero_values() {
+        assert_eq!(normalize_max_keys(2_048, 10_000), 2_048);
+        assert_eq!(normalize_max_keys(1, 10_000), 1);
+    }
+
+    #[test]
+    fn effective_idempotency_limits_apply_the_documented_floors() {
+        assert_eq!(effective_idempotency_ttl(0), Duration::from_secs(1));
+        assert_eq!(effective_idempotency_ttl(7), Duration::from_secs(7));
+        assert_eq!(
+            normalize_max_keys(0, IDEMPOTENCY_MAX_KEYS_DEFAULT),
+            IDEMPOTENCY_MAX_KEYS_DEFAULT
+        );
+    }
+
+    #[test]
+    fn committed_keys_contain_exactly_the_inserted_keys() {
+        let now = Instant::now();
+        let mut keys = CommittedKeys::new(Duration::from_secs(60), 8);
+        assert!(keys.is_empty());
+        assert!(!keys.contains("a", now));
+
+        keys.insert("a".to_owned(), now);
+        assert!(keys.contains("a", now));
+        assert!(!keys.contains("b", now));
+        assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn committed_keys_forget_a_key_once_its_ttl_elapses() {
+        let ttl = Duration::from_secs(60);
+        let start = Instant::now();
+        let mut keys = CommittedKeys::new(ttl, 8);
+        keys.insert("a".to_owned(), start);
+
+        assert!(keys.contains("a", start + ttl - Duration::from_millis(1)));
+        assert!(!keys.contains("a", start + ttl));
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn committed_keys_at_capacity_evict_the_oldest_key() {
+        let start = Instant::now();
+        let later = |millis| start + Duration::from_millis(millis);
+        let mut keys = CommittedKeys::new(Duration::from_secs(60), 2);
+        keys.insert("k2".to_owned(), later(2));
+        keys.insert("k1".to_owned(), later(1));
+        keys.insert("k3".to_owned(), later(3));
+
+        assert_eq!(keys.len(), 2);
+        assert!(!keys.contains("k1", later(3)));
+        assert!(keys.contains("k2", later(3)));
+        assert!(keys.contains("k3", later(3)));
+    }
+
+    #[test]
+    fn committed_keys_forget_expired_keys_before_evicting_a_live_one() {
+        let ttl = Duration::from_secs(60);
+        let start = Instant::now();
+        let mut keys = CommittedKeys::new(ttl, 2);
+        keys.insert("expired".to_owned(), start);
+        keys.insert("live".to_owned(), start + Duration::from_secs(30));
+        keys.insert("new".to_owned(), start + ttl);
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains("live", start + ttl));
+        assert!(keys.contains("new", start + ttl));
+    }
+
+    #[test]
+    fn committed_keys_hold_at_least_one_key() {
+        let now = Instant::now();
+        let mut keys = CommittedKeys::new(Duration::from_secs(60), 0);
+        keys.insert("a".to_owned(), now);
+        assert!(keys.contains("a", now));
+
+        keys.insert("b".to_owned(), now);
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains("b", now));
     }
 
     #[test]

@@ -24,8 +24,11 @@
 # webhook golden frames that pin its public HTTP contract. The paths are the
 # handler and its tests, the router that mounts it, the manifest that defines
 # the feature, the golden harness and fixtures, the shared webhook types in
-# zeroclaw-api, and the plugin webhook ingress in zeroclaw-infra. Other gateway
-# paths stay out: the default-feature Test job covers them.
+# zeroclaw-api, and the plugin webhook ingress in zeroclaw-infra. The infra
+# crate root and manifest are listed too: the root holds the dedup limit
+# helpers and the committed-key set the ingress stores its delivered message
+# keys in, and the manifest defines the ingress's dependencies. Other gateway
+# and infra paths stay out: the default-feature Test job covers them.
 # Prints "false" otherwise. Always exits 0; the workflow step forwards the
 # printed value to GITHUB_OUTPUT.
 
@@ -46,6 +49,8 @@ while IFS= read -r path; do
         crates/zeroclaw-gateway/tests/golden*|\
         crates/zeroclaw-api/src/webhook.rs|\
         crates/zeroclaw-infra/src/plugin_webhook*|\
+        crates/zeroclaw-infra/src/lib.rs|\
+        crates/zeroclaw-infra/Cargo.toml|\
         src/plugins/*|src/plugin_registry.rs|src/main.rs|\
         wit/*|\
         Cargo.toml|Cargo.lock|\

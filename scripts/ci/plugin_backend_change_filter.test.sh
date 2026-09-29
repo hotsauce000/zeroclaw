@@ -73,6 +73,10 @@ expect "infra plugin webhook ingress" "true" \
     "crates/zeroclaw-infra/src/plugin_webhook.rs"
 expect "infra plugin webhook ingress submodule" "true" \
     "crates/zeroclaw-infra/src/plugin_webhook/tests.rs"
+# The infra crate root holds the ingress's dedup limits and committed-key set,
+# and the infra manifest defines its dependencies.
+expect "infra crate root" "true" "crates/zeroclaw-infra/src/lib.rs"
+expect "infra manifest" "true" "crates/zeroclaw-infra/Cargo.toml"
 expect "mixed unrelated then plugin webhook" "true" \
     "web/src/pages/AgentChat.tsx" \
     "crates/zeroclaw-gateway/src/plugin_webhook.rs"
