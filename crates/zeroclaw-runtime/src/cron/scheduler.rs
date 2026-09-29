@@ -85,6 +85,38 @@ tokio::task_local! {
 #[cfg(test)]
 tokio::task_local! {
     static TEST_PERSIST_BLOCK: Duration;
+    static TEST_PERSIST_BARRIER: Arc<TestPersistenceGate>;
+    static TEST_PERSIST_OWNER_READY: Arc<tokio::sync::Notify>;
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestPersistenceGate {
+    entered: tokio::sync::Notify,
+    released: Mutex<bool>,
+    release: std::sync::Condvar,
+}
+#[cfg(test)]
+impl TestPersistenceGate {
+    fn block(&self) {
+        self.entered.notify_one();
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.release.wait(released).unwrap();
+        }
+    }
+    fn unblock(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+}
+#[cfg(test)]
+struct TestGateRelease(Arc<TestPersistenceGate>);
+#[cfg(test)]
+impl Drop for TestGateRelease {
+    fn drop(&mut self) {
+        self.0.unblock();
+    }
 }
 
 // Test-only seam: simulates the synchronous, pre-await work that a real
@@ -473,11 +505,13 @@ where
     let _cancel_on_drop = CancelOwnedWorkerOnDrop(cancellation.clone());
     let worker_cancellation = cancellation.clone();
     let active_worker = tracker.register();
+    let claim_owner = super::store::claim_scope::current();
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("cron-owned".into())
         .spawn(move || {
             let _active_worker = active_worker;
+            let _claim_owner = claim_owner;
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -669,20 +703,80 @@ pub struct ManualCronRunResult {
     pub finished_at: DateTime<Utc>,
 }
 
+/// How the configured delivery attempt for a run resolved — the delivery
+/// axis of the separated run-outcome triple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryDisposition {
+    /// The job configures no delivery; nothing was attempted.
+    NotRequired,
+    /// The announcement was handed to the channel delivery function.
+    Delivered,
+    /// The delivery attempt failed.
+    Failed,
+    /// Delivery was configured but deliberately withheld (NO_REPLY sentinel).
+    Skipped,
+}
+
+impl DeliveryDisposition {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
 pub struct CronDeliveryOutcome {
     pub success: bool,
     pub status: String,
     pub output: String,
+    /// Execution axis of the run-outcome triple: `ok | error`. The turn's
+    /// own result, independent of what delivery then did.
+    pub execution: &'static str,
+    /// Delivery axis of the run-outcome triple.
+    pub delivery: DeliveryDisposition,
+}
+
+/// The single derivation boundary for the rollup `status`: computed from
+/// the outcome triple's execution and delivery axes plus the job's
+/// best-effort delivery policy, never written independently. Vocabulary is
+/// unchanged: `ok | degraded | error` (`skipped` is written only by the
+/// missed-run path, which records no outcome triple).
+pub(crate) fn rollup_status(
+    execution: &str,
+    delivery: DeliveryDisposition,
+    best_effort: bool,
+) -> &'static str {
+    if execution != "ok" {
+        return "error";
+    }
+    match delivery {
+        DeliveryDisposition::Failed => {
+            if best_effort {
+                "degraded"
+            } else {
+                "error"
+            }
+        }
+        DeliveryDisposition::NotRequired
+        | DeliveryDisposition::Delivered
+        | DeliveryDisposition::Skipped => "ok",
+    }
 }
 
 pub async fn deliver_and_classify_run_result(
     config: &Config,
     job: &CronJob,
-    mut success: bool,
+    success: bool,
     mut output: String,
     context: CronDeliveryContext,
 ) -> CronDeliveryOutcome {
-    let mut status = if success { "ok" } else { "error" }.to_string();
+    // The execution axis is fixed before delivery runs: a later delivery
+    // failure can downgrade the rollup `status`, never the execution fact.
+    let execution = if success { "ok" } else { "error" };
 
     // Bound delivery: this future is awaited while the scheduler still holds
     // the job's in-flight claim (see `CRON_DELIVERY_TIMEOUT`). It goes through
@@ -725,16 +819,17 @@ pub async fn deliver_and_classify_run_result(
         deliver_if_configured(config, job, &output).await
     };
 
-    if let Err(e) = delivery_result {
-        // Cron add-time accepts dangling delivery refs (the job's channel
-        // may not be provisioned yet); the loudly-logged warn here is
-        // the scheduler-side half of that contract. Manual trigger paths
-        // share this classifier so status history cannot drift again.
-        let channel = job.delivery.channel.as_deref().unwrap_or("");
-        let target = job.delivery.to.as_deref().unwrap_or("");
-        let delivery_error = e.to_string();
+    let delivery = match delivery_result {
+        Ok(disposition) => disposition,
+        Err(e) => {
+            // Cron add-time accepts dangling delivery refs (the job's channel
+            // may not be provisioned yet); the loudly-logged warn here is
+            // the scheduler-side half of that contract. Manual trigger paths
+            // share this classifier so status history cannot drift again.
+            let channel = job.delivery.channel.as_deref().unwrap_or("");
+            let target = job.delivery.to.as_deref().unwrap_or("");
+            let delivery_error = e.to_string();
 
-        if job.delivery.best_effort {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -746,41 +841,31 @@ pub async fn deliver_and_classify_run_result(
                         "target": target,
                         "error": delivery_error
                     })),
-                context.failure_message(true)
+                context.failure_message(job.delivery.best_effort)
             );
-            if success {
-                status = "degraded".to_string();
+
+            if output.trim().is_empty() {
+                output = format!("delivery failed: {delivery_error}");
+            } else {
+                output.push_str("\n\ndelivery failed: ");
+                output.push_str(&delivery_error);
             }
-        } else {
-            success = false;
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "job_id": job.id,
-                        "agent_alias": job.agent_alias,
-                        "channel": channel,
-                        "target": target,
-                        "error": delivery_error
-                    })),
-                context.failure_message(false)
-            );
-            status = "error".to_string();
+            DeliveryDisposition::Failed
         }
+    };
 
-        if output.trim().is_empty() {
-            output = format!("delivery failed: {delivery_error}");
-        } else {
-            output.push_str("\n\ndelivery failed: ");
-            output.push_str(&delivery_error);
-        }
-    }
+    // Both the rollup and the merged success flag are DERIVED from the
+    // triple plus the delivery policy — nothing writes them independently.
+    let status = rollup_status(execution, delivery, job.delivery.best_effort).to_string();
+    let success =
+        execution == "ok" && (delivery != DeliveryDisposition::Failed || job.delivery.best_effort);
 
     CronDeliveryOutcome {
         success,
         status,
         output,
+        execution,
+        delivery,
     }
 }
 
@@ -813,17 +898,82 @@ async fn run_manual_job_inner(
     approved: bool,
 ) -> ManualCronRunResult {
     let started_at = Utc::now();
+    // Resolve the executing identity exactly as execution will (a migrated
+    // row's empty `agent_alias` falls back to config ownership); the record
+    // must report that identity, or honest absence when none resolves.
+    let executing_agent = resolve_owning_agent(config, job).map(str::to_string);
+    // A job with no single owner is refused before anything runs, exactly as
+    // the scheduled path refuses it: nothing is delivered under no identity,
+    // and no run row is written (an owner-less row under a live job is the
+    // state reserved for quarantined history whose job is gone). The job's
+    // last-run summary still records the refusal so operators can see it.
+    if executing_agent.is_none() {
+        let finished_at = Utc::now();
+        let output = format!("cron job {id:?}: {NO_OWNER_MESSAGE}", id = job.id);
+        if let Err(e) = super::store::record_last_run_with_status(
+            config,
+            &job.id,
+            finished_at,
+            "error",
+            &output,
+        ) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+                "manual cron trigger: failed to record refusal"
+            );
+        }
+        if let Some(tx) = event_tx {
+            let _ = tx.send(serde_json::json!({
+                "type": "cron_result",
+                "job_id": job.id,
+                "success": false,
+                "output": &output,
+                "manual": true,
+                "timestamp": finished_at.to_rfc3339(),
+            }));
+        }
+        return ManualCronRunResult {
+            job_id: job.id.clone(),
+            success: false,
+            status: "error".to_string(),
+            output,
+            duration_ms: (finished_at - started_at).num_milliseconds(),
+            started_at,
+            finished_at,
+        };
+    }
     let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
 
+    let run_principal = zeroclaw_api::ingress::InternalPrincipal::Cron {
+        job_id: job.id.clone(),
+        job_name: job.name.clone(),
+    };
     if let Err(e) = persist_manual_run_result(
         config,
         job,
         started_at,
         finished_at,
         &outcome.status,
+        crate::cron::store::RunOutcomes {
+            execution: outcome.execution,
+            delivery: outcome.delivery.as_str(),
+            // No conversation binding exists yet; every run records the
+            // explicit absence rather than an empty guess.
+            persistence: "not_bound",
+        },
+        // Immutable provenance from the same job snapshot the run was
+        // dispatched with: what a later rename can no longer rewrite.
+        crate::cron::store::RunProvenance {
+            principal: Some(&run_principal),
+            executing_agent: executing_agent.as_deref(),
+            job_source: Some(&job.source),
+        },
         Some(&outcome.output),
         duration_ms,
     ) {
@@ -1001,17 +1151,7 @@ pub async fn run(
     }
 }
 
-fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str> {
-    if !job.agent_alias.is_empty()
-        && let Some((alias, _)) = config
-            .agents
-            .iter()
-            .find(|(alias, _)| alias.as_str() == job.agent_alias)
-    {
-        return Some(alias.as_str());
-    }
-    config.agent_for_cron_job(&job.id)
-}
+use super::store::{NO_OWNER_MESSAGE, resolve_owning_agent};
 
 /// Fetch **all** overdue jobs (ignoring `max_tasks`) and execute them.
 /// Called once at scheduler startup so that jobs missed during downtime
@@ -1152,10 +1292,7 @@ async fn execute_job_now_with_runtime(
     let Some(agent_alias) = resolve_owning_agent(config, job) else {
         return (
             false,
-            format!(
-                "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
-                id = job.id
-            ),
+            format!("cron job {id:?}: {NO_OWNER_MESSAGE}", id = job.id),
         );
     };
     let agent_alias = agent_alias.to_string();
@@ -1308,7 +1445,7 @@ async fn process_claimed_jobs(
     let mut in_flight = stream::iter(jobs.into_iter().filter_map(|claimed| {
         let ClaimedJob { job, claim } = claimed;
         let Some(agent_alias) = resolve_owning_agent(config, &job) else {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(super::store::ownership_refusal_attrs(config, &job)), NO_OWNER_MESSAGE);
             let _ = release_claim(config, &job.id, &claim);
             return None;
         };
@@ -1386,34 +1523,38 @@ async fn execute_and_persist_claimed_job(
     claim: &CronClaimToken,
     component: &str,
 ) -> (String, bool, String) {
-    crate::health::mark_component_ok(component);
-    warn_if_high_frequency_agent_job(job);
+    super::store::claim_scope::scope(claim.clone(), async {
+        crate::health::mark_component_ok(component);
+        warn_if_high_frequency_agent_job(job);
 
-    let started_at = Utc::now();
-    let span = zeroclaw_log::attribution_span!(job);
-    let (success, output) = Box::pin(execute_job_with_retry(
-        config,
-        security,
-        agent_alias,
-        job,
-        None,
-        false,
-    ))
-    .instrument(span)
-    .await;
-    let finished_at = Utc::now();
-    let result = Box::pin(persist_claimed_job_result(
-        config,
-        job,
-        success,
-        &output,
-        started_at,
-        finished_at,
-        claim,
-    ))
-    .await;
+        let started_at = Utc::now();
+        let span = zeroclaw_log::attribution_span!(job);
+        let (success, output) = Box::pin(execute_job_with_retry(
+            config,
+            security,
+            agent_alias,
+            job,
+            None,
+            false,
+        ))
+        .instrument(span)
+        .await;
+        let finished_at = Utc::now();
+        let result = Box::pin(persist_claimed_job_result(
+            config,
+            job,
+            agent_alias,
+            success,
+            &output,
+            started_at,
+            finished_at,
+            claim,
+        ))
+        .await;
 
-    (job.id.clone(), result.success, result.output)
+        (job.id.clone(), result.success, result.output)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1571,6 +1712,11 @@ async fn purge_isolated_session(
     }
 }
 
+fn agent_job_error_message(error: &anyhow::Error) -> String {
+    crate::agent::terminal_completion_error_message(error, None)
+        .unwrap_or_else(|| crate::i18n::get_required_cli_string("cron-agent-job-failed"))
+}
+
 async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
@@ -1651,6 +1797,15 @@ async fn run_agent_job_with_timeout(
         // `agent::run` is the correct choice. The daemon heartbeat
         // worker is the only `mcp_registry` supplier.
         mcp_registry: None,
+        // Initiating principal, resolved from the job's stored config at
+        // dispatch and immutable for the turn's lifetime.
+        internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+            job_id: job.id.clone(),
+            job_name: job.name.clone(),
+        }),
+        // A `[[cron]]` job runs a prompt, not a SOP step. SOP cron triggers
+        // are a separate surface driven by the SOP maintenance tick.
+        sop_step_scope: None,
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -1782,8 +1937,29 @@ async fn run_agent_job_with_timeout(
             },
         ),
         Err(e) => {
+            let mut error_attributes = ::serde_json::json!({
+                "job_id": job.id,
+                "agent_alias": agent_alias,
+            });
+            if let Some(exceeded) = crate::agent::context_window_exceeded_from_error(&e) {
+                error_attributes["error_kind"] = "context_window_exceeded".into();
+                error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
+                error_attributes["model_context_window"] = exceeded.model_context_window.into();
+                error_attributes["provider_attempted"] = false.into();
+            } else {
+                error_attributes["error_kind"] = "agent_error".into();
+                error_attributes["error_bytes"] = e.to_string().len().into();
+            }
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Cron)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(error_attributes),
+                "cron_agent_job_failed"
+            );
             purge_isolated_session(config, job, agent_alias, &session_path).await;
-            (false, format!("agent job failed: {e}"))
+            (false, agent_job_error_message(&e))
         }
     }
 }
@@ -1803,12 +1979,17 @@ struct PendingPersist {
     duration_ms: i64,
     action: RunCompletionAction,
     claim: CronClaimToken,
+    execution: &'static str,
+    delivery: DeliveryDisposition,
+    executing_agent: String,
+    worker_owner: ActiveOwnedWorkerGuard,
 }
 
 /// Write one completed result durably. Synchronous SQLite work; the caller
 /// drives it on a blocking worker while holding a persistence permit.
 /// Returns whether the combined history and state write committed.
 fn write_pending_persist(pending: PendingPersist) -> bool {
+    let _worker_owner = &pending.worker_owner;
     if let Err(e) = persist_run_result(
         &pending.config,
         &pending.job,
@@ -1816,6 +1997,19 @@ fn write_pending_persist(pending: PendingPersist) -> bool {
         pending.finished_at,
         pending.job_state_at,
         &pending.status,
+        super::store::RunOutcomes {
+            execution: pending.execution,
+            delivery: pending.delivery.as_str(),
+            persistence: "not_bound",
+        },
+        super::store::RunProvenance {
+            principal: Some(&zeroclaw_api::ingress::InternalPrincipal::Cron {
+                job_id: pending.job.id.clone(),
+                job_name: pending.job.name.clone(),
+            }),
+            executing_agent: Some(&pending.executing_agent),
+            job_source: Some(&pending.job.source),
+        },
         Some(pending.output.as_str()),
         pending.duration_ms,
         pending.action,
@@ -1888,58 +2082,10 @@ fn write_pending_persist(pending: PendingPersist) -> bool {
 /// under the same token fence. `retained_result_slots` bounds how many owners
 /// contend for capacity at once; the queueing happens on the owner's task, so
 /// the scheduler loop never blocks on it and no completed result is dropped.
-fn retain_pending_persist(pending: PendingPersist, persistence_pool: Arc<tokio::sync::Semaphore>) {
-    let job_id = pending.job.id.clone();
-    let retention_pool = retained_result_slots();
-    zeroclaw_spawn::spawn!(async move {
-        let Ok(_retention) = retention_pool.acquire_owned().await else {
-            return;
-        };
-        let Ok(permit) = persistence_pool.acquire_owned().await else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"job_id": job_id})),
-                "Cron persistence pool closed before a retained result could be written"
-            );
-            return;
-        };
-        let committed = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            write_pending_persist(pending)
-        })
-        .await;
-        match committed {
-            Ok(true) => ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"job_id": job_id})),
-                "Cron retained result persisted once capacity returned"
-            ),
-            Ok(false) => ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"job_id": job_id})),
-                "Cron retained result failed to persist"
-            ),
-            Err(join_error) => ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(
-                        ::serde_json::json!({"job_id": job_id, "error": join_error.to_string()})
-                    ),
-                "Cron retained result writer stopped before completion"
-            ),
-        }
-    });
-}
-
 async fn persist_claimed_job_result(
     config: &Config,
     job: &CronJob,
+    executing_agent: &str,
     success: bool,
     output: &str,
     started_at: DateTime<Utc>,
@@ -1980,9 +2126,15 @@ async fn persist_claimed_job_result(
         duration_ms,
         action,
         claim: claim.clone(),
+        execution: outcome.execution,
+        delivery: outcome.delivery,
+        executing_agent: executing_agent.to_string(),
+        worker_owner: OwnedWorkerTracker::for_config(config).register(),
     };
     #[cfg(test)]
     let persist_block = TEST_PERSIST_BLOCK.try_with(|duration| *duration).ok();
+    #[cfg(test)]
+    let persist_barrier = TEST_PERSIST_BARRIER.try_with(Arc::clone).ok();
     #[cfg(test)]
     let persist_timeout = TEST_PERSIST_TIMEOUT
         .try_with(|duration| *duration)
@@ -2000,39 +2152,62 @@ async fn persist_claimed_job_result(
     // Read the pool inside this task: the test seam is a task-local, and the
     // retained-result owner below runs on a task that does not inherit it.
     let persistence_pool = persistence_worker_pool();
-    let admitted = time::timeout_at(persist_deadline, persistence_pool.clone().acquire_owned())
-        .await
-        .ok()
-        .and_then(Result::ok);
-    let Some(permit) = admitted else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "timeout_secs": persist_timeout.as_secs_f64()})),
-            "Cron persistence pool stayed at capacity; retaining the completed result for a later write"
-        );
-        retain_pending_persist(pending, persistence_pool);
-        return ClaimedJobResult {
-            success: false,
-            output: crate::i18n::get_required_cli_string("cron-result-persistence-pending"),
-        };
-    };
-    let worker = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        #[cfg(test)]
-        if let Some(duration) = persist_block {
-            std::thread::sleep(duration);
+    // The result owner exists before cancellable admission. Dropping the
+    // caller only drops its JoinHandle: this owner retains both the claim and
+    // tracker registration until admission and the actual write have settled.
+    let writer_job_id = job.id.clone();
+    let worker = zeroclaw_spawn::spawn!(async move {
+        let result = async {
+            let _retention = retained_result_slots()
+                .acquire_owned()
+                .await
+                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+            let permit = persistence_pool
+                .acquire_owned()
+                .await
+                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                #[cfg(test)]
+                if let Some(duration) = persist_block {
+                    std::thread::sleep(duration);
+                }
+                #[cfg(test)]
+                if let Some(barrier) = persist_barrier {
+                    barrier.block();
+                }
+                write_pending_persist(pending)
+            })
+            .await
+            .map_err(anyhow::Error::from)
         }
-        write_pending_persist(pending)
+        .await;
+        if let Err(error) = &result {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"job_id": writer_job_id, "error": error.to_string()})
+                    ),
+                "Cron persistence worker failed"
+            );
+        }
+        result
     });
 
+    #[cfg(test)]
+    let _ = TEST_PERSIST_OWNER_READY.try_with(|ready| ready.notify_one());
     match time::timeout_at(persist_deadline, worker).await {
-        Ok(Ok(true)) => ClaimedJobResult {
+        Ok(Ok(Err(_error))) => ClaimedJobResult {
+            success: false,
+            output: crate::i18n::get_required_cli_string("cron-result-persistence-failed"),
+        },
+        Ok(Ok(Ok(true))) => ClaimedJobResult {
             success: reported_success,
             output: public_output,
         },
-        Ok(Ok(false)) => ClaimedJobResult {
+        Ok(Ok(Ok(false))) => ClaimedJobResult {
             success: false,
             output: crate::i18n::get_required_cli_string("cron-result-persistence-failed"),
         },
@@ -2071,6 +2246,7 @@ async fn persist_claimed_job_result(
 async fn persist_job_result(
     config: &Config,
     job: &CronJob,
+    executing_agent: &str,
     success: bool,
     output: &str,
     started_at: DateTime<Utc>,
@@ -2085,6 +2261,7 @@ async fn persist_job_result(
     persist_claimed_job_result(
         config,
         job,
+        executing_agent,
         success,
         output,
         started_at,
@@ -2130,7 +2307,11 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
     }
 }
 
-async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
+async fn deliver_if_configured(
+    config: &Config,
+    job: &CronJob,
+    output: &str,
+) -> Result<DeliveryDisposition> {
     deliver_if_configured_with_cancellation(config, job, output, None).await
 }
 
@@ -2139,13 +2320,13 @@ async fn deliver_if_configured_with_cancellation(
     job: &CronJob,
     output: &str,
     cancellation: Option<&CancellationToken>,
-) -> Result<()> {
+) -> Result<DeliveryDisposition> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         anyhow::bail!("scheduled delivery cancelled before dispatch");
     }
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
-        return Ok(());
+        return Ok(DeliveryDisposition::NotRequired);
     }
 
     if !announce_delivery_decision(output).should_deliver() {
@@ -2156,7 +2337,7 @@ async fn deliver_if_configured_with_cancellation(
                 .with_attrs(::serde_json::json!({"job_id": job.id})),
             "Cron job returned NO_REPLY sentinel — skipping delivery"
         );
-        return Ok(());
+        return Ok(DeliveryDisposition::Skipped);
     }
 
     let channel = delivery.channel.as_deref().ok_or_else(|| {
@@ -2189,6 +2370,7 @@ async fn deliver_if_configured_with_cancellation(
         cancellation,
     )
     .await
+    .map(|()| DeliveryDisposition::Delivered)
 }
 
 /// Delivery function type — takes owned values so the returned future is 'static.
@@ -2357,8 +2539,8 @@ async fn run_job_command_with_runtime_and_timeout(
 
     match time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = crate::tools::shell_output::decode_shell_output(&output.stdout);
+            let stderr = crate::tools::shell_output::decode_shell_output(&output.stderr);
             let combined = match output_format {
                 // Raw mode on success returns bare stdout, by design — the
                 // point is to hand back exactly what a direct shell run
@@ -3294,6 +3476,36 @@ mod tests {
         assert!(output.contains("always_missing_for_retry_test"));
     }
 
+    #[test]
+    fn agent_job_error_message_preserves_terminal_causes_and_safe_messages() {
+        let context = anyhow::Error::new(crate::agent::ContextWindowExceeded {
+            estimated_tokens: 65_537,
+            model_context_window: 65_536,
+        })
+        .context("maximum context length; https://private.invalid/?key=secret");
+        let provider =
+            anyhow::Error::new(zeroclaw_providers::ReliableProviderTerminalFailure::new(
+                zeroclaw_providers::ReliableProviderTerminalFailureKind::ProviderServer,
+                None,
+                "private provider response".to_string(),
+            ));
+        let semantic =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
+        let unknown = anyhow::Error::msg("private prompt; https://private.invalid/?key=secret");
+
+        for (error, key) in [
+            (&context, "turn-context-window-exceeded-error"),
+            (&provider, "cli-agent-error-provider-server"),
+            (&semantic, "cli-agent-error-invalid-semantic-completion"),
+            (&unknown, "cron-agent-job-failed"),
+        ] {
+            let output = agent_job_error_message(error);
+            assert_eq!(output, crate::i18n::get_required_cli_string(key));
+            assert!(!output.contains("private") && !output.contains("secret"));
+            assert!(!output.contains("agent job failed:"));
+        }
+    }
+
     #[tokio::test]
     async fn run_agent_job_returns_error_without_provider_key() {
         let tmp = TempDir::new().unwrap();
@@ -3306,7 +3518,114 @@ mod tests {
         let (success, output) =
             Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
         assert!(!success);
-        assert!(output.contains("agent job failed:"));
+        assert!(!output.trim().is_empty());
+        assert!(!output.contains("agent job failed:"));
+        assert!(!output.contains("All model providers/models failed"));
+    }
+
+    #[tokio::test]
+    async fn cron_context_window_failure_delivers_safe_text_without_provider_dispatch() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        // DELIVERY_FN is process-global and other suites install their own
+        // handlers; isolate this recorder without changing production state.
+        const CHILD_ENV: &str = "ZEROCLAW_CRON_CONTEXT_DELIVERY_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .arg("cron::scheduler::tests::cron_context_window_failure_delivers_safe_text_without_provider_dispatch")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .await
+                .unwrap();
+            assert!(
+                status.success(),
+                "isolated cron delivery test failed: {status}"
+            );
+            return;
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_route = calls.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                calls_for_route.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "unexpected dispatch"}, "finish_reason": "stop"}],
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        register_recording_delivery_fn();
+        let delivered_before = CONTEXT_FAILURES_DELIVERED.load(Ordering::SeqCst);
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.memory.backend = "none".to_string();
+        config.providers.models.ollama.insert(
+            "capacity".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("capacity-model".to_string()),
+                    context_window: Some(64),
+                    uri: Some(format!("http://{address}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.capacity".into();
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .max_context_tokens = Some(0);
+        let security = test_security(&config);
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("private-context-prompt ".repeat(256));
+        job.allowed_tools = Some(vec![]);
+        job.uses_memory = false;
+        job.delivery = DeliveryConfig {
+            mode: "announce".to_string(),
+            channel: Some(CONTEXT_FAILURE_CHANNEL.to_string()),
+            to: Some("test-target".to_string()),
+            ..Default::default()
+        };
+
+        let (success, output) = Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job)).await;
+        assert!(!success);
+        let expected = crate::i18n::get_required_cli_string("turn-context-window-exceeded-error");
+        assert_eq!(output, expected);
+        for context in [
+            CronDeliveryContext::Scheduled,
+            CronDeliveryContext::ToolManual,
+            CronDeliveryContext::GatewayManual,
+            CronDeliveryContext::RpcManual,
+        ] {
+            let outcome =
+                deliver_and_classify_run_result(&config, &job, success, output.clone(), context)
+                    .await;
+            assert!(!outcome.success);
+            assert_eq!(outcome.status, "error");
+            assert_eq!(outcome.output, expected);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            CONTEXT_FAILURES_DELIVERED.load(Ordering::SeqCst) - delivered_before,
+            4
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -5115,7 +5434,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -5157,6 +5485,7 @@ mod tests {
                     persist_claimed_job_result(
                         &config,
                         &job,
+                        &job.agent_alias,
                         true,
                         "late old result",
                         started,
@@ -5217,6 +5546,7 @@ mod tests {
                             persist_claimed_job_result(
                                 &config,
                                 &job,
+                                &job.agent_alias,
                                 true,
                                 "stalled result 1",
                                 started,
@@ -5241,6 +5571,7 @@ mod tests {
                         persist_claimed_job_result(
                             &config,
                             &job,
+                            &job.agent_alias,
                             true,
                             "stalled result 2",
                             started,
@@ -5293,6 +5624,7 @@ mod tests {
                             persist_claimed_job_result(
                                 &config,
                                 &first_job,
+                                &first_job.agent_alias,
                                 true,
                                 "held result",
                                 started,
@@ -5315,6 +5647,7 @@ mod tests {
                         persist_claimed_job_result(
                             &config,
                             &second_job,
+                            &second_job.agent_alias,
                             true,
                             "queued behind a busy pool",
                             started,
@@ -5389,6 +5722,7 @@ mod tests {
                             persist_claimed_job_result(
                                 &config,
                                 &first_job,
+                                &first_job.agent_alias,
                                 true,
                                 "held result",
                                 started,
@@ -5412,6 +5746,7 @@ mod tests {
                         persist_claimed_job_result(
                             &config,
                             &second_job,
+                            &second_job.agent_alias,
                             true,
                             "retained past the deadline",
                             started,
@@ -5460,7 +5795,16 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         crate::cron::store::reset_write_connection_count_for_tests(&config);
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
 
         assert!(success);
         assert_eq!(
@@ -5483,7 +5827,16 @@ mod tests {
             let finished = started + ChronoDuration::milliseconds(10);
             let output = format!("run-{idx}");
 
-            let success = persist_job_result(&config, &job, true, &output, started, finished).await;
+            let success = persist_job_result(
+                &config,
+                &job,
+                &job.agent_alias,
+                true,
+                &output,
+                started,
+                finished,
+            )
+            .await;
             assert!(success);
         }
 
@@ -5521,7 +5874,16 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
 
         assert!(
             !success,
@@ -5558,10 +5920,70 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
+
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
+
+        // The one-shot's durable record survives the job deletion: status,
+        // outcome triple, and provenance stay queryable after the job row
+        // is gone.
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert_eq!(runs[0].execution.as_deref(), Some("ok"));
+        assert_eq!(runs[0].delivery.as_deref(), Some("not_required"));
+        assert_eq!(runs[0].persistence.as_deref(), Some("not_bound"));
+        assert_eq!(
+            runs[0].principal,
+            Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+                job_id: job.id.clone(),
+                job_name: Some("one-shot".to_string()),
+            })
+        );
+        assert_eq!(
+            runs[0].executing_agent.as_deref(),
+            Some(job.agent_alias.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_stamps_resolved_executor_for_migrated_alias() {
+        // A migrated row carries an empty `agent_alias`; execution resolves
+        // the owner through config membership, and the run record must
+        // report that resolved identity, never the empty column value.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        job.agent_alias = String::new();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(
+            &config,
+            &job,
+            "resolved-owner",
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
+        assert!(success);
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].executing_agent.as_deref(), Some("resolved-owner"));
     }
 
     #[tokio::test]
@@ -5586,7 +6008,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            false,
+            "boom",
+            started,
+            finished,
+        )
+        .await;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -5616,7 +6047,16 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         crate::cron::store::reset_write_connection_count_for_tests(&config);
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            false,
+            "boom",
+            started,
+            finished,
+        )
+        .await;
 
         assert!(!success);
         assert_eq!(
@@ -5663,7 +6103,16 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(
             !success,
             "fallback state without durable run history is an incomplete persistence result"
@@ -5703,7 +6152,16 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(
             !success,
             "fallback disable without durable run history must not broadcast success"
@@ -5727,8 +6185,18 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
+
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
     }
@@ -5744,7 +6212,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            false,
+            "boom",
+            started,
+            finished,
+        )
+        .await;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -5783,7 +6260,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -5811,7 +6297,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -5881,7 +6376,17 @@ mod tests {
 
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         // After reschedule_after_run, At schedule jobs should be disabled
@@ -5901,7 +6406,173 @@ mod tests {
         let job = test_job("echo ok");
 
         // Default delivery mode is not "announce", so should be a no-op.
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        assert_eq!(
+            deliver_if_configured(&config, &job, "x").await.unwrap(),
+            DeliveryDisposition::NotRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_triple_separates_execution_from_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        register_recording_delivery_fn();
+
+        // Execution failure with no delivery configured.
+        let job = test_job("echo ok");
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            false,
+            "boom".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert_eq!(outcome.execution, "error");
+        assert_eq!(outcome.delivery, DeliveryDisposition::NotRequired);
+        assert_eq!(outcome.status, "error");
+
+        // Success with no delivery configured.
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            "fine".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert_eq!(outcome.execution, "ok");
+        assert_eq!(outcome.delivery, DeliveryDisposition::NotRequired);
+        assert_eq!(outcome.status, "ok");
+
+        // Best-effort delivery failure downgrades the rollup, never the
+        // execution axis.
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("fail-delivery".into()),
+            to: Some("123456".into()),
+            thread_id: None,
+            best_effort: true,
+        };
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            "fine".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert!(outcome.success);
+        assert_eq!(outcome.execution, "ok");
+        assert_eq!(outcome.delivery, DeliveryDisposition::Failed);
+        assert_eq!(outcome.status, "degraded");
+
+        // Required delivery failure downgrades the rollup to error and
+        // flips success, but the execution axis still records the turn's
+        // own completion.
+        job.delivery.best_effort = false;
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            "fine".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert!(!outcome.success);
+        assert_eq!(outcome.execution, "ok");
+        assert_eq!(outcome.delivery, DeliveryDisposition::Failed);
+        assert_eq!(outcome.status, "error");
+
+        // A NO_REPLY sentinel withholds a configured delivery: skipped, not
+        // failed and not delivered.
+        job.delivery.best_effort = true;
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            "NO_REPLY".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert!(outcome.success);
+        assert_eq!(outcome.execution, "ok");
+        assert_eq!(outcome.delivery, DeliveryDisposition::Skipped);
+        assert_eq!(outcome.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn persisted_runs_carry_the_outcome_triple() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        register_recording_delivery_fn();
+        let mut job = cron::add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("fail-delivery".into()),
+            to: Some("123456".into()),
+            thread_id: None,
+            best_effort: true,
+        };
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
+        assert!(success);
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "degraded");
+        assert_eq!(runs[0].execution.as_deref(), Some("ok"));
+        assert_eq!(runs[0].delivery.as_deref(), Some("failed"));
+        assert_eq!(runs[0].persistence.as_deref(), Some("not_bound"));
+        assert_eq!(
+            runs[0].principal,
+            Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+                job_id: job.id.clone(),
+                job_name: job.name.clone(),
+            })
+        );
+        assert_eq!(
+            runs[0].executing_agent.as_deref(),
+            Some(job.agent_alias.as_str())
+        );
+    }
+
+    #[test]
+    fn rollup_status_is_the_single_derivation_of_the_triple() {
+        // The full matrix: status is a pure function of execution, delivery,
+        // and the best-effort policy — matching the classifier's behavior
+        // exactly (verified end-to-end by the outcome-triple test above).
+        use DeliveryDisposition as D;
+        for (execution, delivery, best_effort, expected) in [
+            ("ok", D::NotRequired, false, "ok"),
+            ("ok", D::NotRequired, true, "ok"),
+            ("ok", D::Delivered, false, "ok"),
+            ("ok", D::Skipped, true, "ok"),
+            ("ok", D::Failed, true, "degraded"),
+            ("ok", D::Failed, false, "error"),
+            ("error", D::NotRequired, false, "error"),
+            ("error", D::Failed, true, "error"),
+            ("error", D::Failed, false, "error"),
+            ("error", D::Delivered, true, "error"),
+        ] {
+            assert_eq!(
+                rollup_status(execution, delivery, best_effort),
+                expected,
+                "({execution}, {delivery:?}, best_effort={best_effort})"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5928,6 +6599,9 @@ mod tests {
     }
 
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static CONTEXT_FAILURES_DELIVERED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    const CONTEXT_FAILURE_CHANNEL: &str = "context-failure-delivery";
 
     /// Channel name the recorder counts. Used only by the suppression test.
     const COUNT_CHANNEL: &str = "count-delivery";
@@ -5954,7 +6628,7 @@ mod tests {
         // so repeated calls across tests are safe and the first writer wins. The
         // handler honours the `fail-delivery` failure contract used by the
         // delivery-classification tests so it composes regardless of order.
-        register_delivery_fn(Box::new(|_config, channel, _target, _thread, _output| {
+        register_delivery_fn(Box::new(|_config, channel, _target, _thread, output| {
             Box::pin(async move {
                 if channel == "fail-delivery" {
                     anyhow::bail!("synthetic delivery failure");
@@ -5974,6 +6648,13 @@ mod tests {
                 }
                 if channel == COUNT_CHANNEL {
                     DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                if channel == CONTEXT_FAILURE_CHANNEL {
+                    assert_eq!(
+                        output,
+                        crate::i18n::get_required_cli_string("turn-context-window-exceeded-error")
+                    );
+                    CONTEXT_FAILURES_DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 Ok(())
             })
@@ -6150,9 +6831,16 @@ mod tests {
         let config = Config::default();
         let workspace = std::env::temp_dir();
         let cmd = build_configured_shell_command(&config, "echo cron-test", &workspace).unwrap();
+        let selected = zeroclaw_config::platform::native::default_shell();
+        let expected =
+            zeroclaw_config::platform::resolve_executable(std::ffi::OsStr::new(&selected)).unwrap();
         let debug = format!("{cmd:?}");
         assert!(debug.contains("echo cron-test"));
-        assert!(debug.contains("\"sh\""), "should use sh: {debug}");
+        assert_eq!(
+            cmd.as_std().get_program(),
+            expected.as_os_str(),
+            "cron should resolve platform default {selected:?} to an absolute shell path"
+        );
         // Must NOT use login shell (-l) — login shells load full profile
         // and are slow/unpredictable for cron jobs.
         assert!(
@@ -6192,6 +6880,10 @@ mod tests {
             tmp.path(),
         )
         .unwrap();
+        assert_eq!(
+            cmd.as_std().get_program(),
+            shim.canonicalize().unwrap().as_os_str()
+        );
         let output = cmd.output().await.unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -6207,12 +6899,37 @@ mod tests {
         config.runtime.docker.network = "none".into();
         config.runtime.docker.mount_workspace = false;
 
-        let cmd =
-            build_configured_shell_command(&config, "echo cron-docker", &std::env::temp_dir())
-                .unwrap();
+        #[cfg(unix)]
+        let launcher_dir = tempfile::tempdir().expect("launcher tempdir");
+        #[cfg(unix)]
+        let (runtime, expected) = {
+            use std::os::unix::fs::PermissionsExt;
+
+            let launcher = launcher_dir.path().join("docker");
+            std::fs::write(&launcher, "#!/bin/sh\n").expect("write Docker launcher");
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+                .expect("make Docker launcher executable");
+            let path = std::env::join_paths([launcher_dir.path()]).expect("launcher PATH");
+            let runtime =
+                crate::platform::create_runtime_with_path(&config.runtime, Some(path.as_os_str()))
+                    .expect("Docker runtime");
+            (
+                runtime,
+                launcher.canonicalize().expect("canonical launcher"),
+            )
+        };
+        #[cfg(not(unix))]
+        let (runtime, expected) = (
+            crate::platform::create_runtime(&config.runtime).expect("Docker runtime"),
+            std::path::PathBuf::from("docker"),
+        );
+
+        let cmd = runtime
+            .build_shell_command("echo cron-docker", &std::env::temp_dir())
+            .unwrap();
         let debug = format!("{cmd:?}");
 
-        assert!(debug.contains("\"docker\""), "{debug}");
+        assert_eq!(cmd.as_std().get_program(), expected.as_os_str(), "{debug}");
         assert!(debug.contains("\"run\""), "{debug}");
         assert!(debug.contains("\"--network\""), "{debug}");
         assert!(debug.contains("\"none\""), "{debug}");
@@ -6459,6 +7176,142 @@ mod tests {
         );
     }
 
+    /// Claim `ids` for an enabled agent that is fully executable (risk and
+    /// runtime profiles present), so a refusal can only come from ownership.
+    fn claim_with_profiles(config: &mut Config, alias: &str, ids: &[&str]) {
+        crate::cron::store::claim_job_in_config(config, alias, true, ids);
+        config
+            .risk_profiles
+            .entry(alias.to_string())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+    }
+
+    #[tokio::test]
+    async fn contested_config_only_job_is_not_executed_by_either_claimant() {
+        // A legacy job (empty stored alias) claimed by TWO fully executable
+        // enabled agents is unowned for cleanup; execution must agree on every
+        // path: selection never offers it (so it is never claimed and cannot
+        // spin), the defensive guard refuses it, the manual path refuses it,
+        // and no run record exists under either identity.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo contested").unwrap();
+        claim_with_profiles(&mut config, "agent-a", &[&job.id]);
+        claim_with_profiles(&mut config, "agent-b", &[&job.id]);
+        let contested = CronJob {
+            agent_alias: String::new(),
+            ..job.clone()
+        };
+        assert!(
+            resolve_owning_agent(&config, &contested).is_none(),
+            "two enabled claimants must resolve to no owner"
+        );
+
+        // Selection: make the stored row legacy-shaped and overdue.
+        crate::cron::store::with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET agent_alias = '', next_run = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                [&job.id],
+            )
+            .map_err(anyhow::Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+        let due = cron::due_jobs(&config, Utc::now()).unwrap();
+        assert!(
+            due.iter().all(|j| j.id != job.id),
+            "selection must not offer a contested job: {due:?}"
+        );
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "selection must not have claimed the contested job"
+        );
+        cron::release_job(&config, &job.id).unwrap();
+
+        // Defensive guard in process_due_jobs for jobs handed in directly.
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+        process_due_jobs(
+            &config,
+            vec![contested.clone()],
+            &unique_component("contested"),
+            &None,
+        )
+        .await;
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "the guard must release the lock it was handed"
+        );
+        cron::release_job(&config, &job.id).unwrap();
+
+        // Manual path: refused, and no owner-less run row is written.
+        let result =
+            run_manual_job(&config, &contested, CronDeliveryContext::RpcManual, &None).await;
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("no single owning agent"),
+            "{}",
+            result.output
+        );
+        assert!(
+            cron::list_runs(&config, &job.id, 10).unwrap().is_empty(),
+            "no run may be recorded under any claimant"
+        );
+        let after = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(
+            after.last_status.as_deref(),
+            Some("error"),
+            "refusal is visible on the job"
+        );
+        assert!(
+            after
+                .last_output
+                .unwrap_or_default()
+                .contains("no single owning agent")
+        );
+    }
+
+    #[tokio::test]
+    async fn sole_config_claimant_executes_a_legacy_job_under_its_identity() {
+        // Positive control for the unique-claimant fallback: one enabled
+        // claimant, an empty stored alias, and the job actually runs — the
+        // run is recorded under that claimant as executing agent.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo owned").unwrap();
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .expect("fixture agent")
+            .cron_jobs
+            .push(job.id.clone());
+        let legacy = CronJob {
+            agent_alias: String::new(),
+            ..job.clone()
+        };
+        assert_eq!(resolve_owning_agent(&config, &legacy), Some(TEST_AGENT));
+
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+        process_due_jobs(&config, vec![legacy], &unique_component("sole"), &None).await;
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "the sole claimant must execute the job: {runs:?}"
+        );
+        assert_eq!(runs[0].executing_agent.as_deref(), Some(TEST_AGENT));
+    }
+
     #[tokio::test]
     async fn broadcast_none_skips_without_error() {
         let tmp = TempDir::new().unwrap();
@@ -6484,5 +7337,205 @@ mod tests {
 
         process_due_jobs(&config, vec![job], &component, &event_tx).await;
         // If we got here without panic, the test passes.
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_persistence_survives_timeout_drop_and_replacement_recovery() {
+        for block_write in [false, true] {
+            for drop_caller in [false, true] {
+                let tmp = TempDir::new().unwrap();
+                let config = test_config(&tmp).await;
+                let job = cron::add_job(
+                    &config,
+                    TEST_AGENT,
+                    "*/5 * * * *",
+                    "echo must-not-run-again",
+                )
+                .unwrap();
+                let claim = claim_job_with_token(&config, &job.id, Utc::now())
+                    .unwrap()
+                    .unwrap();
+                let expected_token = claim.as_str().to_string();
+                let pool = Arc::new(tokio::sync::Semaphore::new(1));
+                let held = if block_write {
+                    None
+                } else {
+                    Some(pool.clone().acquire_owned().await.unwrap())
+                };
+                let gate = Arc::new(TestPersistenceGate::default());
+                let _gate_release = TestGateRelease(gate.clone());
+                let caller_config = config.clone();
+                let caller_job = job.clone();
+                let caller_gate = gate.clone();
+                let ready = Arc::new(tokio::sync::Notify::new());
+                let caller_ready = ready.clone();
+                let caller = zeroclaw_spawn::spawn!(async move {
+                    let operation = async {
+                        let now = Utc::now();
+                        persist_claimed_job_result(
+                            &caller_config,
+                            &caller_job,
+                            TEST_AGENT,
+                            true,
+                            "completed once",
+                            now,
+                            now,
+                            &claim,
+                        )
+                        .await
+                    };
+                    TEST_PERSIST_OWNER_READY
+                        .scope(
+                            caller_ready,
+                            TEST_PERSISTENCE_WORKER_POOL.scope(
+                                pool,
+                                TEST_PERSIST_TIMEOUT.scope(
+                                    if drop_caller {
+                                        Duration::from_secs(30)
+                                    } else {
+                                        Duration::from_millis(50)
+                                    },
+                                    async {
+                                        if block_write {
+                                            TEST_PERSIST_BARRIER.scope(caller_gate, operation).await
+                                        } else {
+                                            operation.await
+                                        }
+                                    },
+                                ),
+                            ),
+                        )
+                        .await
+                });
+                let tracker = OwnedWorkerTracker::for_config(&config);
+                if block_write {
+                    time::timeout(Duration::from_secs(10), gate.entered.notified())
+                        .await
+                        .unwrap();
+                } else {
+                    time::timeout(Duration::from_secs(10), ready.notified())
+                        .await
+                        .unwrap();
+                }
+
+                if drop_caller {
+                    caller.abort();
+                    assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+                } else {
+                    assert!(!caller.await.unwrap().success);
+                }
+                assert_eq!(
+                    clear_stale_locks(&config).unwrap(),
+                    0,
+                    "live result must survive atomic recovery"
+                );
+                assert_eq!(
+                    crate::cron::store::current_claim_for_test(&config, &job.id)
+                        .unwrap()
+                        .as_str(),
+                    expected_token
+                );
+                assert!(
+                    claim_job_with_token(&config, &job.id, Utc::now())
+                        .unwrap()
+                        .is_none(),
+                    "no second execution can acquire this job"
+                );
+                assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
+                let replacement_cancel = CancellationToken::new();
+                let replacement_config = config.clone();
+                let replacement_token = replacement_cancel.clone();
+                let replacement =
+                    zeroclaw_spawn::spawn!(run(replacement_config, None, replacement_token));
+                tokio::task::yield_now().await;
+                assert!(
+                    !replacement.is_finished(),
+                    "replacement must await the old writer"
+                );
+                // A rename after dispatch must not rewrite the persisted action facts.
+                crate::cron::store::with_initialized_connection(&config, |conn| {
+                    conn.execute("UPDATE cron_jobs SET name='renamed' WHERE id=?1", [&job.id])?;
+                    Ok(())
+                })
+                .unwrap();
+                if block_write {
+                    gate.unblock();
+                } else {
+                    drop(held);
+                }
+                time::timeout(Duration::from_secs(10), tracker.wait_for_drain())
+                    .await
+                    .unwrap();
+                replacement_cancel.cancel();
+                time::timeout(Duration::from_secs(10), replacement)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+                assert_eq!(runs.len(), 1);
+                assert_eq!(runs[0].output.as_deref(), Some("completed once"));
+                assert_eq!(runs[0].execution.as_deref(), Some("ok"));
+                assert_eq!(runs[0].delivery.as_deref(), Some("not_required"));
+                assert_eq!(runs[0].persistence.as_deref(), Some("not_bound"));
+                assert_eq!(runs[0].executing_agent.as_deref(), Some(TEST_AGENT));
+                assert_eq!(
+                    runs[0].principal,
+                    Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+                        job_id: job.id.clone(),
+                        job_name: job.name.clone()
+                    })
+                );
+                assert_eq!(tracker.active_count(), 0);
+                assert!(crate::cron::store::current_claim_for_test(&config, &job.id).is_err());
+            }
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_manual_owner_keeps_claim_until_owned_side_effect_settles() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo manual").unwrap();
+        let raw = cron::claim_job_for_agent_with_token(&config, &job.id, TEST_AGENT, Utc::now())
+            .unwrap()
+            .unwrap();
+        let owner = CronClaimToken::manual(&config, &job.id, raw);
+        let gate = Arc::new(TestPersistenceGate::default());
+        let _gate_release = TestGateRelease(gate.clone());
+        let worker_gate = gate.clone();
+        let tracker = OwnedWorkerTracker::for_config(&config);
+        let worker_tracker = tracker.clone();
+        let caller =
+            zeroclaw_spawn::spawn!(super::super::store::claim_scope::scope(owner, async move {
+                supervise_owned(
+                    Duration::from_secs(30),
+                    worker_tracker,
+                    Box::new(move |_| {
+                        Box::pin(async move {
+                            worker_gate.block();
+                        })
+                    }),
+                )
+                .await
+            }));
+        time::timeout(Duration::from_secs(10), gate.entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(clear_stale_locks(&config).unwrap(), 0);
+        assert!(
+            cron::claim_job_for_agent_with_token(&config, &job.id, TEST_AGENT, Utc::now())
+                .unwrap()
+                .is_none()
+        );
+        gate.unblock();
+        time::timeout(Duration::from_secs(10), tracker.wait_for_drain())
+            .await
+            .unwrap();
+        assert!(crate::cron::store::current_claim_for_test(&config, &job.id).is_err());
+        let next = cron::claim_job_for_agent_with_token(&config, &job.id, TEST_AGENT, Utc::now())
+            .unwrap()
+            .unwrap();
+        assert!(cron::release_job_for_token(&config, &job.id, &next).unwrap());
     }
 }

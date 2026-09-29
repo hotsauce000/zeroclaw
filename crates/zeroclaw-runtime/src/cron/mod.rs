@@ -7,6 +7,8 @@ mod schedule;
 mod store;
 mod types;
 
+#[cfg(feature = "plugins-wasm")]
+pub mod outbox;
 pub mod scheduler;
 
 #[allow(unused_imports)]
@@ -15,16 +17,19 @@ pub use schedule::{
 };
 #[cfg(test)]
 pub(crate) use store::current_claim_for_test;
+#[cfg(test)]
+pub(crate) use store::force_release_failure_for_tests;
+pub(crate) use store::{CronClaimToken, claim_scope};
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, all_overdue_jobs, clear_stale_locks, due_jobs, get_job, get_job_for_agent,
-    list_jobs, list_jobs_by_agent, list_runs, record_last_run, record_last_run_with_status,
-    record_run, remove_job, remove_job_for_agent, remove_jobs_by_agent, rename_jobs_by_agent,
-    reschedule_after_run, reschedule_after_run_with_status, resolve_job_id_or_name,
-    skip_missed_run, sync_declarative_jobs, update_job, update_job_for_agent,
+    RunOutcomes, RunProvenance, add_agent_job, all_overdue_jobs, claim_job, claim_job_for_agent,
+    claim_job_for_agent_with_token, clear_stale_locks, due_jobs, get_job, get_job_for_agent,
+    job_not_found, list_jobs, list_jobs_by_agent, list_runs, list_runs_for_agent, record_last_run,
+    record_last_run_with_status, record_run, release_job, release_job_for_token, remove_job,
+    remove_job_for_agent, remove_jobs_by_agent, rename_jobs_by_agent, reschedule_after_run,
+    reschedule_after_run_with_status, resolve_job_id_or_name, skip_missed_run,
+    sync_declarative_jobs, update_job, update_job_for_agent,
 };
-#[cfg(test)]
-pub use store::{claim_job, release_job};
 pub(crate) use store::{claim_job_with_token, release_claim};
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
