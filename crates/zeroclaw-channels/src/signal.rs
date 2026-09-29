@@ -356,7 +356,7 @@ pub struct SignalChannel {
     ignore_stories: bool,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
-    pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<Mutex<HashMap<String, crate::util::PendingApproval>>>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -594,6 +594,31 @@ impl SignalChannel {
         } else {
             RecipientTarget::Group(recipient.to_string())
         }
+    }
+
+    fn canonical_destination(recipient: &str) -> String {
+        match Self::parse_recipient_target(recipient) {
+            RecipientTarget::Direct(value) => value,
+            RecipientTarget::Group(value) => format!("{GROUP_TARGET_PREFIX}{value}"),
+        }
+    }
+
+    async fn resolve_approval_reply(
+        &self,
+        message: &ChannelMessage,
+    ) -> Option<crate::util::PendingApprovalResolution> {
+        let (token, response) = crate::util::parse_approval_reply(&message.content)?;
+        let destination = Self::canonical_destination(&message.reply_target);
+        Some(
+            crate::util::resolve_pending_approval(
+                &self.pending_approvals,
+                &token,
+                response,
+                self.is_sender_allowed(&message.sender),
+                &destination,
+            )
+            .await,
+        )
     }
 
     fn build_reaction_params(
@@ -853,12 +878,10 @@ impl SignalChannel {
             .process_envelope_with_pending_wait(&envelope, wait_for_pending)
             .await
         {
-            if let Some((token, response)) = crate::util::parse_approval_reply(&msg.content) {
-                let mut map = self.pending_approvals.lock().await;
-                if let Some(sender) = map.remove(&token) {
-                    let _ = sender.send(response);
-                    continue;
-                }
+            if let Some(resolution) = self.resolve_approval_reply(&msg).await
+                && !matches!(resolution, crate::util::PendingApprovalResolution::NotFound)
+            {
+                continue;
             }
             if tx.send(msg).await.is_err() {
                 return;
@@ -1178,6 +1201,24 @@ impl ::zeroclaw_api::attribution::Attributable for SignalChannel {
 impl Channel for SignalChannel {
     fn name(&self) -> &str {
         "signal"
+    }
+
+    /// A Signal 1:1 DM carries the bare sender (E.164 / UUID) as its
+    /// `reply_target`, whereas a group message carries `group:<id>`
+    /// (`GROUP_TARGET_PREFIX`). Reusing `parse_recipient_target` — the same
+    /// classifier `send`/`reply_target` rely on — a `Direct` target is a DM.
+    ///
+    /// Without this override Signal fell back to the trait default (`false`),
+    /// so every DM was treated as non-direct and ran through the reply-intent
+    /// precheck; plain 1:1 messages (e.g. a greeting) could be classified
+    /// `NO_REPLY` and silently dropped. Reporting DMs as direct lets the
+    /// orchestrator skip the classifier and always answer them, while group
+    /// traffic still goes through the precheck.
+    fn is_direct_message(&self, msg: &ChannelMessage) -> bool {
+        matches!(
+            Self::parse_recipient_target(&msg.reply_target),
+            RecipientTarget::Direct(_)
+        )
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -1583,16 +1624,25 @@ impl Channel for SignalChannel {
             &token,
             &request.tool_name,
             &request.arguments_summary,
+            request.position_counter(),
         );
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: Self::canonical_destination(recipient),
+                tool_name: request.tool_name.clone(),
+            },
+        );
+        let mut guard = crate::util::PendingApprovalGuard::new(
+            Arc::clone(&self.pending_approvals),
+            token.clone(),
+        );
 
         if let Err(err) = self.send(&SendMessage::new(text, recipient)).await {
-            self.pending_approvals.lock().await.remove(&token);
+            guard.remove().await;
             return Err(err);
         }
 
@@ -1600,16 +1650,19 @@ impl Channel for SignalChannel {
         // dropped-sender and timeout arms are the runtime denying on its own.
         let attributed =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(resp)) => zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
+                Ok(Ok(resp)) => {
+                    guard.disarm();
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                }
                 Ok(Err(_)) => {
-                    self.pending_approvals.lock().await.remove(&token);
+                    guard.remove().await;
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::Unreachable,
                     )
                 }
                 Err(_) => {
-                    self.pending_approvals.lock().await.remove(&token);
+                    guard.remove().await;
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::TimedOut,
@@ -1996,6 +2049,35 @@ mod tests {
     }
 
     #[test]
+    fn is_direct_message_true_for_dm_target_false_for_group() {
+        let ch = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+            false,
+        );
+        let e164_dm = ChannelMessage {
+            reply_target: "+1111111111".to_string(),
+            ..Default::default()
+        };
+        let uuid_dm = ChannelMessage {
+            reply_target: "a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string(),
+            ..Default::default()
+        };
+        let group = ChannelMessage {
+            reply_target: "group:group123".to_string(),
+            ..Default::default()
+        };
+        assert!(ch.is_direct_message(&e164_dm));
+        assert!(ch.is_direct_message(&uuid_dm));
+        assert!(!ch.is_direct_message(&group));
+    }
+
+    #[test]
     fn parse_recipient_target_e164_is_direct() {
         assert_eq!(
             SignalChannel::parse_recipient_target("+1234567890"),
@@ -2008,6 +2090,22 @@ mod tests {
         assert_eq!(
             SignalChannel::parse_recipient_target("group:abc123"),
             RecipientTarget::Group("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_destination_normalizes_bare_and_prefixed_groups() {
+        assert_eq!(
+            SignalChannel::canonical_destination("abc123"),
+            "group:abc123"
+        );
+        assert_eq!(
+            SignalChannel::canonical_destination("group:abc123"),
+            "group:abc123"
+        );
+        assert_eq!(
+            SignalChannel::canonical_destination("+1234567890"),
+            "+1234567890"
         );
     }
 
@@ -2612,15 +2710,146 @@ mod tests {
             ignore_stories,
         );
         let (tx, rx) = tokio::sync::oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
-        // simulate listen() routing
-        let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
-        sender.send(ChannelApprovalResponse::Approve).unwrap();
+        ch.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "+1111111111".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+        let resolution = crate::util::resolve_pending_approval(
+            &ch.pending_approvals,
+            "abc123",
+            ChannelApprovalResponse::Approve,
+            true,
+            "+1111111111",
+        )
+        .await;
+        assert_eq!(resolution, crate::util::PendingApprovalResolution::Resolved);
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
     }
+
+    #[tokio::test]
+    async fn approval_reply_uses_canonical_group_destination_and_rejects_replay() {
+        let ch = make_channel();
+        let mut group_envelope = make_envelope(Some("+1111111111"), Some("abc123 deny"));
+        group_envelope.data_message.as_mut().unwrap().group_info = Some(GroupInfo {
+            group_id: Some("group123".to_string()),
+        });
+        let (approval_tx, mut approval_rx) = oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            crate::util::PendingApproval {
+                sender: approval_tx,
+                destination: "group:other-group".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+        let msg = ch
+            .process_envelope_async(&group_envelope)
+            .await
+            .pop()
+            .unwrap();
+        assert_eq!(
+            ch.resolve_approval_reply(&msg).await,
+            Some(crate::util::PendingApprovalResolution::Rejected)
+        );
+        assert!(ch.pending_approvals.lock().await.contains_key("abc123"));
+        assert!(matches!(
+            approval_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        let mut right_envelope = group_envelope;
+        right_envelope.data_message.as_mut().unwrap().message = Some("abc123 approve".to_string());
+        right_envelope.data_message.as_mut().unwrap().group_info = Some(GroupInfo {
+            group_id: Some("other-group".to_string()),
+        });
+        let right_msg = ch
+            .process_envelope_async(&right_envelope)
+            .await
+            .pop()
+            .unwrap();
+        assert_eq!(
+            ch.resolve_approval_reply(&right_msg).await,
+            Some(crate::util::PendingApprovalResolution::Resolved)
+        );
+        assert_eq!(approval_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            ch.resolve_approval_reply(&right_msg).await,
+            Some(crate::util::PendingApprovalResolution::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_envelope_preserves_approval_destination_and_unmatched_messages() {
+        let ch = make_channel();
+        let (approval_tx, mut approval_rx) = oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "scoped".to_string(),
+            crate::util::PendingApproval {
+                sender: approval_tx,
+                destination: "group:expected".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut envelope = make_envelope(Some("+1111111111"), Some("scoped approve"));
+        envelope.data_message.as_mut().unwrap().group_info = Some(GroupInfo {
+            group_id: Some("wrong".to_string()),
+        });
+
+        ch.dispatch_envelope(envelope, tx.clone(), false).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            approval_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(ch.pending_approvals.lock().await.contains_key("scoped"));
+
+        let mut envelope = make_envelope(Some("+1111111111"), Some("scoped approve"));
+        envelope.data_message.as_mut().unwrap().group_info = Some(GroupInfo {
+            group_id: Some("expected".to_string()),
+        });
+        ch.dispatch_envelope(envelope, tx.clone(), false).await;
+        assert_eq!(approval_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!ch.pending_approvals.lock().await.contains_key("scoped"));
+
+        // A token with no pending approval remains ordinary inbound text.
+        let envelope = make_envelope(Some("+1111111111"), Some("unknown yes"));
+        ch.dispatch_envelope(envelope, tx, false).await;
+        assert_eq!(rx.recv().await.unwrap().content, "unknown yes");
+    }
+
+    #[tokio::test]
+    async fn approval_reply_resolves_direct_e164_destination() {
+        let ch = make_channel();
+        let (tx, rx) = oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "direct".to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "+1111111111".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+        let envelope = make_envelope(Some("+1111111111"), Some("direct yes"));
+        let msg = ch.process_envelope_async(&envelope).await.pop().unwrap();
+        assert_eq!(
+            ch.resolve_approval_reply(&msg).await,
+            Some(crate::util::PendingApprovalResolution::Resolved)
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
     fn make_reaction_channel() -> SignalChannel {
         SignalChannel::new(
             "http://127.0.0.1:8686".to_string(),

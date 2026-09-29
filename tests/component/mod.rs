@@ -1,5 +1,8 @@
+#[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
+mod acp_cli;
 #[cfg(feature = "channel-acp-server")]
 mod acp_session_cwd_stdio;
+mod agents_export_cli;
 #[cfg(feature = "agent-runtime")]
 mod config_dir_locale_regression;
 mod config_patch_cli;
@@ -11,6 +14,7 @@ mod cost_status_cli;
 mod cron_delivery_cli;
 mod cron_help_examples;
 mod daemon_startup_feedback;
+mod degraded_config_remediation;
 #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
 mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
@@ -18,10 +22,13 @@ mod dockerignore_test;
 mod gateway;
 mod gemini_capabilities;
 mod hardware_probe_feature_graph;
+mod oidc_enrollment_cli;
 mod otel_dependency_feature_regression;
 mod plugin_feature_graph;
 mod provider_resolution;
 mod provider_schema;
+#[cfg(feature = "agent-runtime")]
+mod relay_claim_cli;
 mod reply_target_field_regression;
 mod schema_export_feature_graph;
 mod security;
@@ -29,3 +36,6 @@ mod skills_bundle_cli;
 #[cfg(feature = "agent-runtime")]
 mod verifiable_intent_notice_visibility;
 mod whatsapp_webhook_security;
+
+#[cfg(feature = "plugins-wasm")]
+mod plugin_info_cli;
