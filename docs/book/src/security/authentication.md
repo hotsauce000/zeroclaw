@@ -220,7 +220,10 @@ pairs as the shared operator, and existing tokens are unchanged.
   `gateway.paired_token_users`, which maps the token's SHA-256 hash to the
   entry's principal id, and never also in `gateway.paired_tokens`. It
   writes both fields in one save. Both are gateway-managed, so do not edit
-  them by hand.
+  them by hand. The map holds hashes, not tokens, and a hash cannot be
+  presented as a credential. Unlike `gateway.paired_tokens`, it is stored
+  in plain text, and principals granted `Config:Read` can see it through
+  the configuration APIs.
 - **Revocation and rotation.** Revoking the token (the dashboard's device
   controls, or `zeroclaw gateway get-paircode --rotate-device <id>`) drops
   the binding with it. Rotating a bound device mints a replacement code
@@ -230,6 +233,10 @@ pairs as the shared operator, and existing tokens are unchanged.
   or not, and mints an unbound code. Removing the user's roster entry
   denies the token at its next operation; it never falls back to the
   shared operator.
+- **Retiring a user.** Removing a roster entry suspends that user's tokens
+  but keeps their bindings, so re-adding an entry with the same principal
+  id revives every device still bound to it, lost ones included. Revoke
+  the user's devices when you retire the user.
 - **Downgrading.** A daemon older than this feature ignores
   `gateway.paired_token_users`, so bound tokens stop working there instead
   of turning into operator tokens. Entries left in the file work again
