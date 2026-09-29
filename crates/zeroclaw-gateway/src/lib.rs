@@ -4971,6 +4971,25 @@ impl ReplacementWithheld {
     }
 }
 
+/// The gateway-host command that mints a code pairing as `subject`, for
+/// replies that cannot issue one themselves. A roster subject is named by its
+/// current `[users]` entry, or a placeholder when the roster has none.
+pub(crate) fn mint_command_for(
+    users: &HashMap<String, zeroclaw_config::schema::UserConfig>,
+    subject: &PairedTokenSubject,
+) -> String {
+    match subject {
+        PairedTokenSubject::SharedOperator => "zeroclaw gateway get-paircode --new".to_string(),
+        PairedTokenSubject::RosterUser { principal_id } => {
+            let name = users
+                .iter()
+                .find(|(name, user)| user.effective_principal_id(name) == principal_id)
+                .map_or("<name>", |(name, _)| name.as_str());
+            format!("zeroclaw gateway get-paircode --new --user {name}")
+        }
+    }
+}
+
 /// The subject a device rotation's replacement code carries: the revoked
 /// token's own, so rotating a roster user's device never widens it.
 /// `revoked` is what the revocation removed, `None` when the token was
@@ -6776,6 +6795,10 @@ path = "{trigger_path}"
         assert!(
             !message.contains("use it"),
             "an unbound pending code must not be offered for a bound device: {message}"
+        );
+        assert!(
+            message.contains("zeroclaw gateway get-paircode --new --user alice"),
+            "the reply names the remedy that works, since calling again finds no device: {message}"
         );
         assert_eq!(
             state.pairing.pending_pairing_code(),

@@ -736,24 +736,28 @@ pub async fn rotate_token(
         Err(zeroclaw_config::pairing::GeneratePairingCodeError::Pending) => {
             // Reusing the pending code is right only when it pairs as this
             // device did; otherwise it would re-pair the device as someone
-            // else, possibly as the shared operator.
+            // else, possibly as the shared operator. Calling this route again
+            // cannot help either: the device row is already gone.
             let pending = state
                 .pairing
                 .pending_pairing_code()
                 .map(|(_, pending)| pending);
+            let mint = super::mint_command_for(&state.config.read().users, &subject);
             let message = match &pending {
-                Some(pending) if *pending == subject => "Old token revoked. A pairing code is \
-                    already pending; use it or call again after it clears."
-                    .to_string(),
+                Some(pending) if *pending == subject => format!(
+                    "Old token revoked. A pairing code that pairs as {principal_id} is already \
+                     pending; use it, or on the gateway host run `{mint}` for a fresh one."
+                ),
                 Some(pending) => format!(
                     "Old token revoked. The pending pairing code pairs as {}, not as this \
-                     device's {principal_id}, so it cannot re-pair this device; call again \
-                     after it clears.",
+                     device's {principal_id}, so it cannot re-pair this device. On the gateway \
+                     host, run `{mint}` to replace it with one that does.",
                     super::paired_principal_id(pending)
                 ),
-                None => "Old token revoked. A pending pairing code has just cleared; call \
-                    again to issue a replacement."
-                    .to_string(),
+                None => format!(
+                    "Old token revoked. A pending pairing code has just cleared. On the gateway \
+                     host, run `{mint}` to mint a replacement."
+                ),
             };
             Json(serde_json::json!({
                 "device_id": device_id,
