@@ -37,6 +37,13 @@ impl StreamProviderFailure {
     pub(crate) fn fallback_safe(&self) -> bool {
         self.fallback_safe
     }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self.source,
+            zeroclaw_api::model_provider::StreamError::Terminal(_)
+        )
+    }
 }
 
 #[derive(Debug, Default)]
