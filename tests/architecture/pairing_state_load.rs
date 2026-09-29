@@ -17,10 +17,12 @@ use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-/// Every place a production `PairingGuard` is built today, plus the root
-/// binary. Extending the scan is one entry away.
+/// Every crate that builds a production `PairingGuard` today (the channels
+/// build their own guards from literal lists), plus the root binary. A new
+/// crate that builds one must be added here.
 const SCAN_ROOTS: &[&str] = &[
     "src",
+    "crates/zeroclaw-channels/src",
     "crates/zeroclaw-config/src",
     "crates/zeroclaw-gateway/src",
     "crates/zeroclaw-runtime/src",
