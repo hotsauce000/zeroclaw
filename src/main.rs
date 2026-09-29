@@ -881,7 +881,8 @@ mod auth;
 mod channels;
 #[cfg(feature = "agent-runtime")]
 mod cli_input;
-mod commands;
+#[cfg(feature = "agent-runtime")]
+use zeroclaw::commands;
 #[cfg(feature = "agent-runtime")]
 mod rag {
     pub use zeroclaw::rag::*;
