@@ -6815,6 +6815,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 principal_id,
                             } => (Some(code), message, principal_id),
                             PaircodeResult::NoCode { message } => (None, message, None),
+                            PaircodeResult::BindingUnconfirmed { user } => {
+                                (None, Some(binding_unconfirmed_message(&user)), None)
+                            }
                         };
                         println!(
                             "{}",
@@ -6889,6 +6892,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                     message.as_deref(),
                                 )
                             );
+                        }
+                        Ok(PaircodeResult::BindingUnconfirmed { user }) => {
+                            // Not a fetch failure: the gateway answered, so the
+                            // "is the gateway running" hint below would misdirect.
+                            println!("  ⚠️  {}", binding_unconfirmed_message(&user));
                         }
                         Err(e) => {
                             println!(
@@ -10772,6 +10780,9 @@ enum PaircodeResult {
     /// No code is available (with an optional explanatory message from the
     /// gateway, e.g. a revoke that succeeded but could not issue a code).
     NoCode { message: Option<String> },
+    /// A code was requested for a roster user, but the gateway did not
+    /// confirm the binding, so the code it returned is withheld.
+    BindingUnconfirmed { user: String },
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -10901,12 +10912,9 @@ fn interpret_paircode_response(
                         .as_deref()
                         .is_some_and(|id| id.starts_with("user:"));
                 if !confirmed {
-                    anyhow::bail!(
-                        "The gateway minted a pairing code but did not confirm it is bound to \
-                         user '{user}', so the code is not shown. The gateway is probably older \
-                         than this CLI: update it and run the command again. The unshown code \
-                         stays pending, unbound, until it expires or another code is minted."
-                    );
+                    return Ok(PaircodeResult::BindingUnconfirmed {
+                        user: user.to_string(),
+                    });
                 }
             }
             Ok(PaircodeResult::Code {
@@ -10917,6 +10925,19 @@ fn interpret_paircode_response(
         }
         None => Ok(PaircodeResult::NoCode { message }),
     }
+}
+
+/// Why a code requested with `--user` is withheld: the gateway did not confirm
+/// the binding, most likely because it predates `--user`.
+#[cfg(feature = "agent-runtime")]
+fn binding_unconfirmed_message(user: &str) -> String {
+    ta(
+        "cli-pairing-bound-unconfirmed",
+        &[("user", user)],
+        format!(
+            "The gateway did not confirm the code is bound to user {user}, so it is not shown."
+        ),
+    )
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -11013,7 +11034,7 @@ fn paircode_no_code_message(
                 "cli-pairing-bound-no-code",
                 &[("user", user)],
                 format!(
-                    "No code was minted for user {user}. Check that [users.{user}] exists in the running gateway's config, then run:"
+                    "No code was minted for user {user}. Check that pairing is enabled and that [users.{user}] exists in the running gateway's config, then run:"
                 ),
             ));
             lines.push(paircode_command(
@@ -15286,7 +15307,33 @@ mod tests {
             other => panic!("expected gateway get-paircode command, got {other:?}"),
         }
 
+        // The name is trimmed before it is sent, so the gateway's echo of the
+        // trimmed name confirms the binding.
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "gateway",
+            "get-paircode",
+            "--new",
+            "--user",
+            " alice ",
+        ])
+        .expect("a padded name parses");
+        match cli.command {
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { user, .. }),
+            } => assert_eq!(user.as_deref(), Some("alice")),
+            other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+
         for args in [
+            vec![
+                "zeroclaw",
+                "gateway",
+                "get-paircode",
+                "--new",
+                "--user",
+                "  ",
+            ],
             vec!["zeroclaw", "gateway", "get-paircode", "--user", "alice"],
             vec![
                 "zeroclaw",
@@ -15350,8 +15397,11 @@ mod tests {
         });
         for response in [older_gateway, other_user, unbound] {
             assert!(
-                interpret_paircode_response(reqwest::StatusCode::OK, &response, &action).is_err(),
-                "an unconfirmed binding must not show the code: {response}"
+                matches!(
+                    interpret_paircode_response(reqwest::StatusCode::OK, &response, &action),
+                    Ok(PaircodeResult::BindingUnconfirmed { ref user }) if user == "alice"
+                ),
+                "an unconfirmed binding must withhold the code: {response}"
             );
         }
 

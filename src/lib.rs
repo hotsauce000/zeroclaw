@@ -205,7 +205,8 @@ Examples:
             long,
             value_name = "NAME",
             requires = "new",
-            conflicts_with_all = ["rotate", "rotate_device"]
+            conflicts_with_all = ["rotate", "rotate_device"],
+            value_parser = parse_roster_user_name
         )]
         user: Option<String>,
 
@@ -217,8 +218,8 @@ Examples:
         #[arg(long)]
         host: Option<String>,
 
-        /// Print one JSON object (`pairing_code`, `message`) instead of text,
-        /// for programs such as the desktop app
+        /// Print one JSON object (`pairing_code`, `message`, `principal_id`)
+        /// instead of text, for programs such as the desktop app
         #[arg(long)]
         json: bool,
     },
@@ -661,6 +662,17 @@ pub enum MigrateCommands {
 /// whichever syntax supplied it, so `--to=--thread` is rejected identically and
 /// the message must not offer that as a workaround. No supported channel has a
 /// recipient beginning with `--`.
+/// A `[users.<name>]` entry name for `gateway get-paircode --user`, trimmed.
+/// A blank name is refused here instead of being sent: the operator asked for
+/// a bound code and must never get an unbound one by mistake.
+fn parse_roster_user_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("--user must name a [users.<name>] entry".to_string());
+    }
+    Ok(name.to_string())
+}
+
 fn parse_delivery_recipient(raw: &str) -> Result<String, String> {
     if raw.starts_with("--") {
         return Err(format!(
