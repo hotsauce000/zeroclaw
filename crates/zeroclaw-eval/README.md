@@ -19,7 +19,8 @@ each turn is bounded by `[eval] case_timeout_secs`.
 ## CLI
 
 ```bash
-# Replay every *.json fixture in the suite directory (defaults to ./evals/regression)
+# Replay every *.json fixture in the suite directory
+# (defaults to [eval].suite_dir = evals/regression)
 zeroclaw eval run
 
 # Point at an explicit suite, emit machine-readable JSON
@@ -60,11 +61,42 @@ declarative `expects` the run is graded against.
 
 Supported expectations: `response_contains`, `response_not_contains`,
 `response_matches` (regex), `response_json` (JSON pointer to expected value),
-`tools_used`, `tools_not_used`, `max_tool_calls`, `all_tools_succeeded`,
-`workspace` (`file_exists`, `file_absent`, `file_contains`), and `budget`
-(`max_input_tokens`, `max_output_tokens`, `max_total_tokens`, `max_duration_ms`,
-`max_llm_calls`). Fixture loading rejects unknown keys and declarations that
-cannot fail; see the eval-harness book page for the full reference.
+`tools_used`, `tools_not_used`, `max_tool_calls`, `min_tool_calls`,
+`exact_tool_calls`, `all_tools_succeeded`, `tool_arguments_contain`,
+`tool_results_contain`, `workspace` (`file_exists`, `file_absent`,
+`file_contains`), and `budget` (`max_input_tokens`, `max_output_tokens`,
+`max_total_tokens`, `max_duration_ms`, `max_llm_calls`). Fixture loading rejects
+unknown keys and declarations that cannot fail; see the eval-harness book page
+for the full reference.
+
+### Grading the dispatch boundary
+
+`response_contains` only ever grades text the replay provider scripted for
+itself, so on its own it cannot show that a value survived the round trip
+through the agent. `tool_arguments_contain` and `tool_results_contain` grade
+what actually crossed the dispatch boundary — the arguments the agent passed to
+the tool, and the output the tool returned:
+
+```json
+"expects": {
+  "exact_tool_calls": 2,
+  "tool_arguments_contain": [
+    { "tool": "echo", "needle": "alpha", "call_index": 0 },
+    { "tool": "echo", "needle": "beta",  "call_index": 1 }
+  ],
+  "tool_results_contain": [
+    { "tool": "echo", "needle": "alpha", "call_index": 0 }
+  ]
+}
+```
+
+`call_index` is optional and 0-based across calls to the named tool in dispatch
+order; omit it to accept a match on any call to that tool. Prefer
+`exact_tool_calls` over `tools_used` + `max_tool_calls` when the fixture claims a
+specific number of dispatches: `tools_used` is existential and `max_tool_calls`
+is only an upper bound, so together they still pass when a dispatch is missing.
+Fixture loading rejects unknown nested fields, empty tool names or needles,
+`min_tool_calls: 0`, and contradictory min/max/exact bounds before execution.
 
 Replay fixtures may only call tools the harness registers; Phase 0 ships a
 side-effect-free `echo` tool (see `tools::default_tools`). Live evals assemble
@@ -76,7 +108,10 @@ filter it to the effective allowlist; `shell` remains unavailable.
 - `case` — the `LlmTrace` fixture format + suite loading.
 - `replay::TraceLlmProvider` — a `ModelProvider` that replays trace steps in FIFO order.
 - `tools` — deterministic built-in tools the replay agent can dispatch.
-- `observer::RecordingObserver` — captures tool-call outcomes and token usage.
+- `observer::RecordingObserver` — captures each dispatched tool call
+  (`RecordedCall`: name, arguments, result, success) and token usage. The
+  recorded-call list is the canonical dispatch fact; tool names and aggregate
+  success are derived from it rather than stored again.
 - `grader` — non-panicking `GradeResult` checks: expectations, workspace
   end state, run budgets, and the LLM judge (the `Grader` trait remains the
   extension point).
@@ -85,3 +120,7 @@ filter it to the effective allowlist; `shell` remains unavailable.
   exact judge prompt and rubric contracts.
 - `runner` — builds an isolated agent per case, drives it, grades it.
 - `report` — pass/fail aggregation, table + JSON rendering.
+
+## Test boundary
+
+`tests/regression_suite.rs` is the repository gate, not a shipped test. It replays the workspace corpus at `evals/regression` and holds every fixture to the idle-run check, so it needs files outside this package; `cargo package` therefore excludes the target (see `exclude` in `Cargo.toml`). The published crate carries the library and the fixture format, not the suite. From a repository checkout run `cargo test -p zeroclaw-eval --test regression_suite`; the same corpus is what `zeroclaw eval run` replays by default.
