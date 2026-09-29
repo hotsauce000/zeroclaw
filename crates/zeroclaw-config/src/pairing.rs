@@ -2491,6 +2491,14 @@ mod tests {
         ));
         assert!(!guard.token_is_paired("zc_plain"));
 
+        // A plaintext binding key padded with whitespace, for a token that
+        // paired_tokens lists as legacy plaintext.
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &["zc_plain"],
+            &[(" zc_plain", "alice")],
+        ));
+        assert!(!guard.token_is_paired("zc_plain"));
+
         // A binding key damaged only by stray whitespace or case.
         for padded in [
             format!(" {hash}"),
