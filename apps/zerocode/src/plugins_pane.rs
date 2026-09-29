@@ -93,8 +93,9 @@ fn is_hidden(c: char) -> bool {
 /// Default-ignorable characters outside the format-control denylist that
 /// render as nothing (or as blank space) and so could make two different
 /// names look the same: the combining grapheme joiner, Hangul fillers, Khmer
-/// inherent vowels, Mongolian variation selectors, variation selectors,
-/// reserved default-ignorables and the tag and supplementary selector plane.
+/// inherent vowels, Mongolian variation selectors, the blank braille pattern,
+/// variation selectors, reserved default-ignorables and the tag and
+/// supplementary selector plane.
 fn is_invisible_filler(c: char) -> bool {
     matches!(
         c as u32,
@@ -103,6 +104,7 @@ fn is_invisible_filler(c: char) -> bool {
             | 0x17B4..=0x17B5
             | 0x180B..=0x180F
             | 0x2065
+            | 0x2800
             | 0x3164
             | 0xFE00..=0xFE0F
             | 0xFFA0
@@ -336,27 +338,33 @@ fn escape_untrusted(raw: &str) -> Vec<char> {
 /// `"calendar "` never reads as the installed `calendar`. No valid name
 /// starts with a quote, so the two forms never collide.
 fn display_name(raw: &str) -> String {
-    if zeroclaw_api::plugin::validate_plugin_package_name(raw).is_ok() {
+    // The grammar caps names at this length, and checking it first keeps the
+    // validator from copying an oversized invalid name into its error.
+    const MAX_PACKAGE_NAME_BYTES: usize = 128;
+    if raw.len() <= MAX_PACKAGE_NAME_BYTES
+        && zeroclaw_api::plugin::validate_plugin_package_name(raw).is_ok()
+    {
         return raw.to_string();
     }
     quoted(raw)
 }
 
-/// A version as shown in the row and the detail. The row interpolates it
-/// into a sentence, so a version that is not one printable token (it is
-/// empty, too long, or holds whitespace or a hidden character) is shown
-/// escaped and quoted; an unvalidated registry version can then never add
-/// words such as "installed" to the row.
-fn display_version(raw: &str) -> String {
+/// A version or `name@version` install identity as shown in the row and the
+/// detail. The row interpolates versions into a sentence, and an identity
+/// names a package, so only an allowlisted token is shown as is: non-empty
+/// printable ASCII within [`MAX_DISPLAY_CHARS`], which covers SemVer versions
+/// and valid identities. Anything else is shown escaped and quoted, so an
+/// unvalidated registry value can never add words such as "installed" to the
+/// row or pass for another package's identity.
+fn display_token(raw: &str) -> String {
     let token = !raw.is_empty()
-        && raw.chars().count() <= MAX_DISPLAY_CHARS
-        && raw.chars().all(|c| !c.is_whitespace() && !is_hidden(c));
+        && raw.len() <= MAX_DISPLAY_CHARS
+        && raw.bytes().all(|byte| byte.is_ascii_graphic());
     if token { raw.to_string() } else { quoted(raw) }
 }
 
 /// [`escape_untrusted`] capped at [`MAX_DISPLAY_CHARS`], ending in an
-/// ellipsis when cut. The input is cut before it is escaped, so an oversized
-/// registry value costs no more to show than a capped one.
+/// ellipsis when cut. The input is cut to the cap before it is escaped.
 fn quoted(raw: &str) -> String {
     let head: String = raw.chars().take(MAX_DISPLAY_CHARS).collect();
     let escaped = escape_untrusted(&head);
@@ -377,22 +385,22 @@ fn versions_text(entry: &PluginCatalogEntry) -> String {
     match (&entry.installed, &entry.available) {
         (Some(installed), Some(available)) if installed.version == available.version => t_args(
             "zc-plugins-row-same-version",
-            &[("version", &display_version(&installed.version))],
+            &[("version", &display_token(&installed.version))],
         ),
         (Some(installed), Some(available)) => t_args(
             "zc-plugins-row-other-version",
             &[
-                ("installed", &display_version(&installed.version)),
-                ("registry", &display_version(&available.version)),
+                ("installed", &display_token(&installed.version)),
+                ("registry", &display_token(&available.version)),
             ],
         ),
         (Some(installed), None) => t_args(
             "zc-plugins-row-installed-only",
-            &[("version", &display_version(&installed.version))],
+            &[("version", &display_token(&installed.version))],
         ),
         (None, Some(available)) => t_args(
             "zc-plugins-row-registry-only",
-            &[("version", &display_version(&available.version))],
+            &[("version", &display_token(&available.version))],
         ),
         (None, None) => t("zc-plugins-row-no-record"),
     }
@@ -413,16 +421,16 @@ fn project_detail(entry: &PluginCatalogEntry, unreadable: Unreadable) -> Package
         installed_unknown: entry.installed.is_none() && unreadable.installed,
         registry_unknown: entry.available.is_none() && unreadable.registry,
         installed: entry.installed.as_ref().map(|installed| InstalledView {
-            version: display_version(&installed.version),
+            version: display_token(&installed.version),
             description: safe_description(installed.description.as_deref()),
             capabilities: safe_list(&installed.capabilities),
             permissions: safe_list(&installed.permissions),
         }),
         registry: entry.available.as_ref().map(|available| RegistryView {
-            version: display_version(&available.version),
+            version: display_token(&available.version),
             description: safe_description(available.description.as_deref()),
             capabilities: safe_list(&available.capabilities),
-            install_source: display_safe(&available.install_source),
+            install_source: display_token(&available.install_source),
         }),
     }
 }
@@ -1583,8 +1591,25 @@ mod tests {
                 .version,
             "\"1.0.0\\u{20}installed,\\u{20}in\\u{20}registry\""
         );
-        for raw in ["", "1.0.0\u{200b}", "1.0.0\n"] {
-            let shown = display_version(raw);
+        // An allowlist, not a denylist: a blank-looking character that is
+        // neither whitespace nor a control still makes the value quoted.
+        let braille = entry(
+            "evil",
+            None,
+            Some(("1.0.0\u{2800}installed,\u{2800}in\u{2800}registry", &[])),
+        );
+        assert_eq!(
+            versions_text(&braille),
+            "v\"1.0.0\\u{2800}installed,\\u{2800}in\\u{2800}registry\" in registry"
+        );
+        for raw in [
+            "",
+            "1.0.0\u{200b}",
+            "1.0.0\n",
+            "1.0.0\u{2800}",
+            "1.0.\u{e9}",
+        ] {
+            let shown = display_token(raw);
             assert!(shown.starts_with('"'), "{raw:?} shown as {shown:?}");
             assert!(
                 shown.chars().all(|c| !is_hidden(c) && c != ' '),
@@ -1592,21 +1617,30 @@ mod tests {
             );
         }
         assert_eq!(
-            display_version("0.2.0-beta.1+build.7"),
+            display_token("0.2.0-beta.1+build.7"),
             "0.2.0-beta.1+build.7"
+        );
+        assert_eq!(display_safe("a\u{2800}b"), "a\u{fffd}b");
+
+        // The install identity names a package, so a lookalike is quoted
+        // instead of reading as the real package's identity.
+        assert_eq!(display_token("calendar@1.0.0"), "calendar@1.0.0");
+        assert_eq!(
+            display_token(" calendar@1.0.0"),
+            "\"\\u{20}calendar@1.0.0\""
         );
     }
 
     #[test]
-    fn oversized_names_and_versions_are_cut_before_escaping() {
+    fn oversized_names_and_versions_are_capped_in_quoted_form() {
         let huge = "\u{200b}".repeat(100_000);
-        for shown in [display_name(&huge), display_version(&huge)] {
+        for shown in [display_name(&huge), display_token(&huge)] {
             assert_eq!(shown.chars().count(), MAX_DISPLAY_CHARS);
             assert!(shown.starts_with('"') && shown.ends_with('\u{2026}'));
         }
         let long_token = "9".repeat(MAX_DISPLAY_CHARS + 1);
         assert_eq!(
-            display_version(&long_token).chars().count(),
+            display_token(&long_token).chars().count(),
             MAX_DISPLAY_CHARS
         );
     }
