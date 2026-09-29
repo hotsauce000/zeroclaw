@@ -208,9 +208,12 @@ pairs as the shared operator, and existing tokens are unchanged.
 - **Where the token works.** It is accepted where the daemon resolves
   principals: the RPC connection zerocode uses (over WSS, over the relay,
   or on the local socket with an `auth_token`) and the gateway's
-  configuration routes. Every other gateway route, the web dashboard
-  included, acts with the operator's full authority and answers a bound
-  token with `401`. Pair the dashboard with an unbound code.
+  configuration routes. Every other gateway route that checks a pairing
+  token, the web dashboard's included, acts with the operator's full
+  authority and answers a bound token with `401`. Pair the dashboard with an
+  unbound code. Routes that trust a loopback caller without a token, such
+  as `/admin/reload` and `/admin/shutdown`, keep doing so; a token, bound
+  or not, changes nothing there.
 - **The roster entry.** `--user` must name an existing `[users.<name>]`
   entry. An unknown name is refused and nothing is minted. The entry still
   needs a `uid` today. For a person who only connects remotely, choose a
