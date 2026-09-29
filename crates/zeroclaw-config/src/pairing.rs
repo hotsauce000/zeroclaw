@@ -836,8 +836,9 @@ impl PairingGuard {
     /// regardless of `require_pairing`.
     /// The gateway's `is_authenticated` convenience fails OPEN when pairing
     /// is disabled, which is only correct on surfaces that already treat
-    /// the transport as trusted — an auth provider must use this instead,
-    /// so an empty token set denies everything.
+    /// the transport as trusted — an auth provider must use a strict check
+    /// instead, so an empty token set denies everything. One that needs to
+    /// know who the token authenticates as uses [`Self::subject_for_token`].
     pub fn token_is_paired(&self, token: &str) -> bool {
         let hashed = hash_token(token);
         self.paired_tokens.lock().contains_key(&hashed)

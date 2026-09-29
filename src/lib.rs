@@ -177,7 +177,11 @@ leak when you do not know which token was compromised; every client \
 must re-pair.
 
 With --rotate-device ID, revokes just that device's bearer token \
-and issues a fresh code for re-pairing that one device.
+and issues a fresh code for re-pairing that one device. A device \
+bound to a roster user gets a code bound to the same user. No code is \
+issued when that user's [users] entry is gone, or when the device's \
+token was already revoked; mint one with --new, adding --user NAME \
+for a roster user.
 
 Examples:
   zeroclaw gateway get-paircode               # show current pairing code
@@ -196,6 +200,7 @@ Examples:
         rotate: bool,
 
         /// Revoke a single device's bearer token by id, then issue a new code
+        /// that pairs as the device did (none if that cannot be determined)
         #[arg(long, value_name = "DEVICE_ID", conflicts_with_all = ["new", "rotate"])]
         rotate_device: Option<String>,
 

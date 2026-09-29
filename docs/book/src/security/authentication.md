@@ -212,8 +212,8 @@ pairs as the shared operator, and existing tokens are unchanged.
   token, the web dashboard's included, acts with the operator's full
   authority and answers a bound token with `401`. Pair the dashboard with an
   unbound code. Routes that trust a loopback caller without a token, such
-  as `/admin/reload` and `/admin/shutdown`, keep doing so; a token, bound
-  or not, changes nothing there.
+  as `/admin/reload` and `/admin/shutdown`, keep doing so, and a bound
+  token changes nothing there.
 - **The roster entry.** `--user` must name an existing `[users.<name>]`
   entry. An unknown name is refused and nothing is minted. The entry still
   needs a `uid` today. For a person who only connects remotely, choose a
