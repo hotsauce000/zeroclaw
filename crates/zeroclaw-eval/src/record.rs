@@ -82,7 +82,7 @@ pub struct CaseProvenance {
 
 /// The data that only exists once a run finishes: the transcript, the tool
 /// trajectory, and the usage counters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RunCompletion {
     /// The agent's final text response for the case.
     pub final_response: String,
@@ -120,20 +120,6 @@ impl Serialize for RunCompletion {
         state.serialize_field("duration_ms", &self.duration_ms)?;
         state.serialize_field("llm_calls", &self.llm_calls)?;
         state.end()
-    }
-}
-
-impl Default for RunCompletion {
-    fn default() -> Self {
-        Self {
-            final_response: String::new(),
-            history: Vec::new(),
-            tool_calls: Vec::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-            duration_ms: 0,
-            llm_calls: 0,
-        }
     }
 }
 
