@@ -232,6 +232,7 @@ pub fn live_shell_sandbox(workspace: &Path) -> anyhow::Result<Arc<dyn Sandbox>> 
             enabled: Some(true),
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         },
         RuntimeKind::Native,
         Some(workspace),
@@ -351,6 +352,7 @@ pub async fn run_live_case_with_graders(
         provider,
         provider_name,
         model_name,
+        model_route_resolver,
         finish_turn: _,
     } = (deps.provider)(trace)?;
     // Resolve the dispatcher from the provider's capabilities so XML-dialect
@@ -383,6 +385,9 @@ pub async fn run_live_case_with_graders(
     if let Some(ptype) = provider_name {
         builder = builder.model_provider_name(ptype);
     }
+    if let Some(resolver) = model_route_resolver {
+        builder = builder.model_route_resolver(resolver);
+    }
     let mut agent = builder.build()?;
 
     let start = std::time::Instant::now();
@@ -405,8 +410,7 @@ pub async fn run_live_case_with_graders(
     let record = RunRecord {
         final_response,
         history: agent.history().to_vec(),
-        tools_called: observer.tool_names(),
-        all_tools_succeeded: observer.all_tools_succeeded(),
+        tool_calls: observer.calls(),
         input_tokens,
         output_tokens,
         duration_ms,
@@ -506,7 +510,7 @@ mod tests {
         // resolves its requirement to `Prompt` and auto-denies it - no
         // interactive/channel backchannel is wired here - *before* the call
         // ever reaches tool dispatch. That means it never shows up in
-        // `tools_called`/`all_tools_succeeded` at all (see
+        // `tool_calls` at all (see
         // `crate::agent::turn::approval_gate::gate_tool_approval`'s `Deny`
         // path, which returns straight to `prepare_tool_calls` without
         // touching the observer). The real proof the call never ran is in
@@ -530,10 +534,10 @@ mod tests {
 
         let record = run_live_case(&trace, &deps).await.unwrap().record;
         assert!(
-            !record.tools_called.contains(&"shell".to_string()),
+            !record.tool_names().contains(&"shell"),
             "shell must be auto-denied before it ever reaches tool \
              dispatch, so it must not appear as a dispatched tool call: {:?}",
-            record.tools_called
+            record.tool_names()
         );
         let denied = record.history.iter().any(|msg| {
             matches!(
@@ -637,8 +641,12 @@ mod tests {
         );
 
         let outcome = run_live_case(&trace, &deps).await.unwrap();
-        assert_eq!(outcome.record.tools_called, vec!["echo"]);
-        assert!(outcome.record.all_tools_succeeded);
+        assert_eq!(outcome.record.tool_names(), vec!["echo"]);
+        assert!(outcome.record.all_tools_succeeded());
+        let call = &outcome.record.tool_calls[0];
+        assert!(call.arguments.contains("hello"));
+        assert_eq!(call.result, "hello");
+        assert_eq!(outcome.record.final_response, "done");
     }
 
     #[test]
@@ -1258,7 +1266,7 @@ mod tests {
             canary_parent.display()
         );
         assert!(
-            !outcome.record.all_tools_succeeded,
+            !outcome.record.all_tools_succeeded(),
             "the out-of-workspace file_write must not report success"
         );
     }
@@ -1396,7 +1404,7 @@ mod tests {
             record.history
         );
         assert!(
-            !record.all_tools_succeeded,
+            !record.all_tools_succeeded(),
             "the out-of-workspace file_read must not report success"
         );
     }
@@ -1474,6 +1482,7 @@ mod tests {
                     }),
                     provider_name: Some("testprov".to_string()),
                     model_name: Some("model-under-test".to_string()),
+                    model_route_resolver: None,
                     finish_turn: None,
                 })
             }),

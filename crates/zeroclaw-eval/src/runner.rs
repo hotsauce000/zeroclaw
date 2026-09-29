@@ -35,6 +35,9 @@ pub struct CaseProvider {
     /// Sets `Agent::builder().model_name(..)` when present; this is the value
     /// passed to every `provider.chat` call for the built agent.
     pub model_name: Option<String>,
+    /// The factory-owned resolver shared with the provider. Forward the same
+    /// handle to the agent so route metadata comes from its dispatch owner.
+    pub model_route_resolver: Option<Arc<zeroclaw_providers::router::ModelRouteResolver>>,
     /// Replay-only per-turn exhaustion boundary; `None` for live.
     pub finish_turn: Option<FinishTurnFn>,
 }
@@ -46,6 +49,7 @@ impl CaseProvider {
             provider,
             provider_name: None,
             model_name: None,
+            model_route_resolver: None,
             finish_turn: None,
         }
     }
@@ -94,6 +98,7 @@ impl RunDeps {
                     provider: Box::new(provider),
                     provider_name: None,
                     model_name: None,
+                    model_route_resolver: None,
                     finish_turn: Some(Box::new(move |turn_index| handle.finish_turn(turn_index))),
                 })
             }),
@@ -274,11 +279,11 @@ async fn run_replay_case(
     let duration_ms = duration_millis_saturating(start.elapsed());
 
     let (input_tokens, output_tokens) = observer.tokens();
+    let tool_calls = observer.calls();
     let record = RunRecord {
         final_response,
         history: agent.history().to_vec(),
-        tools_called: observer.tool_names(),
-        all_tools_succeeded: observer.all_tools_succeeded(),
+        tool_calls,
         input_tokens,
         output_tokens,
         duration_ms,
@@ -495,7 +500,7 @@ pub(crate) mod tests {
         let trace: LlmTrace = serde_json::from_str(SMOKE).unwrap();
         let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
         assert!(outcome.record.final_response.contains("Hello"));
-        assert!(outcome.record.tools_called.is_empty());
+        assert!(outcome.record.tool_names().is_empty());
         assert!(
             outcome.grades.iter().all(|g| g.passed),
             "grades: {:?}",
@@ -507,12 +512,89 @@ pub(crate) mod tests {
     async fn replays_tool_call_trace() {
         let trace: LlmTrace = serde_json::from_str(ECHO).unwrap();
         let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
-        assert_eq!(outcome.record.tools_called, vec!["echo".to_string()]);
-        assert!(outcome.record.all_tools_succeeded);
+        assert_eq!(outcome.record.tool_names(), vec!["echo".to_string()]);
+        assert!(outcome.record.all_tools_succeeded());
         assert!(
             outcome.grades.iter().all(|g| g.passed),
             "grades: {:?}",
             outcome.grades
+        );
+    }
+
+    #[tokio::test]
+    async fn run_record_carries_dispatched_arguments_and_tool_results() {
+        // End-to-end proof that the boundary payloads survive a real agent run:
+        // the Unicode argument reaches the tool and the tool's own output comes
+        // back, independent of whatever text the replay provider scripted.
+        const UNICODE: &str = r#"{
+            "model_name": "test-unicode-roundtrip",
+            "turns": [{
+                "user_input": "Répète: naïve café 日本語 ✓",
+                "steps": [
+                    { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": {"message": "naïve café 日本語 ✓"} }] } },
+                    { "response": { "type": "text", "content": "done" } }
+                ]
+            }],
+            "expects": {}
+        }"#;
+        let trace: LlmTrace = serde_json::from_str(UNICODE).unwrap();
+        let record = run_case(&trace, &RunDeps::replay()).await.unwrap().record;
+        assert_eq!(record.tool_calls.len(), 1, "calls: {:?}", record.tool_calls);
+        let call = &record.tool_calls[0];
+        assert_eq!(call.name, "echo");
+        assert!(
+            call.arguments.contains("naïve café 日本語 ✓"),
+            "dispatched arguments did not carry the Unicode message: {:?}",
+            call.arguments
+        );
+        assert_eq!(
+            call.result, "naïve café 日本語 ✓",
+            "tool result did not round-trip the Unicode message"
+        );
+        // The final response is scripted text and deliberately does NOT contain the
+        // Unicode string, so this assertion can only be satisfied by the boundary.
+        assert_eq!(record.final_response, "done");
+    }
+
+    #[tokio::test]
+    async fn a_call_missing_the_expected_argument_reaches_the_tool_and_the_loop_continues() {
+        // The shape the `missing_tool_argument_continues_loop` fixture replays: the
+        // model asks for `echo` with a key the tool does not read. The dispatch has
+        // to happen against the real tool with the arguments as written, and its
+        // fallback output has to come back, or the fixture's boundary expectations
+        // would be grading something the harness invented.
+        const MALFORMED: &str = r#"{
+            "model_name": "test-missing-tool-argument",
+            "turns": [{
+                "user_input": "Echo my greeting for zeroclaw_user.",
+                "steps": [
+                    { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": {"wrong_key": "hello"} }] } },
+                    { "response": { "type": "text", "content": "The echo tool received no usable message." } }
+                ]
+            }],
+            "expects": {}
+        }"#;
+        let trace: LlmTrace = serde_json::from_str(MALFORMED).unwrap();
+        let record = run_case(&trace, &RunDeps::replay()).await.unwrap().record;
+
+        assert_eq!(record.tool_calls.len(), 1, "calls: {:?}", record.tool_calls);
+        let call = &record.tool_calls[0];
+        assert_eq!(call.name, "echo");
+        assert!(
+            call.arguments.contains("wrong_key"),
+            "the malformed key did not survive to the dispatch boundary: {:?}",
+            call.arguments
+        );
+        assert!(
+            call.result.contains("(empty)"),
+            "the tool's missing-message fallback did not reach the record: {:?}",
+            call.result
+        );
+        assert!(call.success, "the dispatch itself must not be an error");
+        // The loop continued past the tool call to the turn's second scripted step.
+        assert_eq!(
+            record.final_response,
+            "The echo tool received no usable message."
         );
     }
 
