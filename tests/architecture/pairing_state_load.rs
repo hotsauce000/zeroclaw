@@ -7,7 +7,9 @@
 //! `PairingGuard::new(.., &config.gateway.paired_tokens, ..)` would load the
 //! first field without the second, so every roster-bound token would stop
 //! authenticating after a restart. Tests may still build guards from literal
-//! token lists, so items gated on `cfg(test)` are skipped.
+//! token lists, so items compiled only for tests (`cfg(test)`, or
+//! `cfg(any(test, feature = "test-helpers"))`) are skipped; a
+//! `cfg(not(test))` item is production code and is scanned.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -70,9 +72,26 @@ fn detector_flags_a_production_call_and_skips_test_items() {
             zeroclaw_config::pairing::PairingGuard::new(true, &config.gateway.paired_tokens, p)
         }
     }
-    fn channel() -> PairingGuard { PairingGuard::new(true, &channel.paired_tokens, p) }";
+    fn channel() -> PairingGuard { PairingGuard::new(true, &channel.paired_tokens, p) }
+    #[cfg(any(test, feature = \"test-helpers\"))]
+    fn helper(config: &Config) -> PairingGuard {
+        PairingGuard::new(true, &config.gateway.paired_tokens, p)
+    }";
+    let production_only = "#[cfg(not(test))]
+    fn boot(config: &Config) -> PairingGuard {
+        PairingGuard::new(true, &config.gateway.paired_tokens, p)
+    }
+    #[cfg(all(unix, not(test)))]
+    fn boot_unix(config: &Config) -> PairingGuard {
+        PairingGuard::new(true, &config.gateway.paired_tokens, p)
+    }";
     assert_eq!(hits(flagged), 1);
     assert_eq!(hits(skipped), 0);
+    assert_eq!(
+        hits(production_only),
+        2,
+        "items compiled outside tests must stay in the scan"
+    );
 }
 
 fn hits(source: &str) -> usize {
@@ -143,11 +162,42 @@ fn member_is(member: &syn::Member, name: &str) -> bool {
     matches!(member, syn::Member::Named(ident) if ident == name)
 }
 
+/// Whether an item is compiled only for tests: a `cfg` whose predicate can
+/// hold only under `test` (or the test-support `test-helpers` feature). A
+/// `cfg(not(test))` item is production code and stays in the scan.
 fn is_test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         attr.path().is_ident("cfg")
-            && matches!(&attr.meta, syn::Meta::List(list) if list.tokens.to_string().contains("test"))
+            && attr
+                .parse_args::<syn::Meta>()
+                .is_ok_and(|predicate| holds_only_under_test(&predicate))
     })
+}
+
+fn holds_only_under_test(predicate: &syn::Meta) -> bool {
+    match predicate {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::NameValue(pair) => {
+            pair.path.is_ident("feature")
+                && matches!(&pair.value, syn::Expr::Lit(lit)
+                    if matches!(&lit.lit, syn::Lit::Str(name) if name.value() == "test-helpers"))
+        }
+        syn::Meta::List(list) => {
+            let Ok(children) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                children.iter().any(holds_only_under_test)
+            } else if list.path.is_ident("any") {
+                !children.is_empty() && children.iter().all(holds_only_under_test)
+            } else {
+                // `not(..)` and anything unrecognized can hold in production.
+                false
+            }
+        }
+    }
 }
 
 fn is_pairing_guard_new(func: &syn::Expr) -> bool {
