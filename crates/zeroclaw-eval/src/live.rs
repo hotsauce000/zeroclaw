@@ -181,6 +181,7 @@ pub fn live_shell_sandbox(workspace: &Path) -> anyhow::Result<Arc<dyn Sandbox>> 
             enabled: Some(true),
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         },
         RuntimeKind::Native,
         Some(workspace),
@@ -316,8 +317,7 @@ pub async fn run_live_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<R
     Ok(RunRecord {
         final_response,
         history: agent.history().to_vec(),
-        tools_called: observer.tool_names(),
-        all_tools_succeeded: observer.all_tools_succeeded(),
+        tool_calls: observer.calls(),
         input_tokens,
         output_tokens,
     })
@@ -410,7 +410,7 @@ mod tests {
         // resolves its requirement to `Prompt` and auto-denies it - no
         // interactive/channel backchannel is wired here - *before* the call
         // ever reaches tool dispatch. That means it never shows up in
-        // `tools_called`/`all_tools_succeeded` at all (see
+        // `tool_calls` at all (see
         // `crate::agent::turn::approval_gate::gate_tool_approval`'s `Deny`
         // path, which returns straight to `prepare_tool_calls` without
         // touching the observer). The real proof the call never ran is in
@@ -434,10 +434,10 @@ mod tests {
 
         let record = run_live_case(&trace, &deps).await.unwrap();
         assert!(
-            !record.tools_called.contains(&"shell".to_string()),
+            !record.tool_names().contains(&"shell"),
             "shell must be auto-denied before it ever reaches tool \
              dispatch, so it must not appear as a dispatched tool call: {:?}",
-            record.tools_called
+            record.tool_names()
         );
         let denied = record.history.iter().any(|msg| {
             matches!(
@@ -537,8 +537,12 @@ mod tests {
         );
 
         let record = run_live_case(&trace, &deps).await.unwrap();
-        assert_eq!(record.tools_called, vec!["echo"]);
-        assert!(record.all_tools_succeeded);
+        assert_eq!(record.tool_names(), vec!["echo"]);
+        assert!(record.all_tools_succeeded());
+        let call = &record.tool_calls[0];
+        assert!(call.arguments.contains("hello"));
+        assert_eq!(call.result, "hello");
+        assert_eq!(record.final_response, "done");
     }
 
     #[test]
@@ -733,7 +737,7 @@ mod tests {
             canary_parent.display()
         );
         assert!(
-            !record.all_tools_succeeded,
+            !record.all_tools_succeeded(),
             "the out-of-workspace file_write must not report success"
         );
     }
@@ -871,7 +875,7 @@ mod tests {
             record.history
         );
         assert!(
-            !record.all_tools_succeeded,
+            !record.all_tools_succeeded(),
             "the out-of-workspace file_read must not report success"
         );
     }
