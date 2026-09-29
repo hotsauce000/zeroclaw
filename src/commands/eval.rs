@@ -963,7 +963,7 @@ fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::Jud
     }
 
     let judge_config = fixed_identity_judge_config(config, &provider_ref)?;
-    let (provider, _provider_type, model) =
+    let (provider, _provider_type, model, _) =
         build_session_model_provider(&judge_config, &provider_ref, None)?;
     let judge_ref = format!("{provider_ref}:{model}");
 
