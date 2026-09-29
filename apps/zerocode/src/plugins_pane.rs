@@ -185,11 +185,11 @@ impl CatalogFilter {
         }
     }
 
-    fn label(self) -> String {
+    fn fluent_key(self) -> &'static str {
         match self {
-            Self::All => t("zc-plugins-filter-all"),
-            Self::Installed => t("zc-plugins-filter-installed"),
-            Self::Registry => t("zc-plugins-filter-registry"),
+            Self::All => "zc-plugins-filter-all",
+            Self::Installed => "zc-plugins-filter-installed",
+            Self::Registry => "zc-plugins-filter-registry",
         }
     }
 
@@ -211,7 +211,7 @@ impl CatalogFilter {
     /// no count to show, and the total is only a lower bound while any source
     /// is unreadable.
     fn counted_label(self, plugins: &[PluginCatalogEntry], unreadable: Unreadable) -> String {
-        let label = self.label();
+        let label = t(self.fluent_key());
         let count = self.count(plugins).to_string();
         let args = [("label", label.as_str()), ("count", count.as_str())];
         if self.is_unknown(unreadable) {
@@ -310,7 +310,7 @@ fn safe_description(description: Option<&str>) -> Option<String> {
         .filter(|description| !description.is_empty())
 }
 
-/// Quote an untrusted package name with every character [`display_safe`]
+/// Quote an untrusted name or version with every character [`display_safe`]
 /// would change escaped: newline, carriage return and tab as `\n`, `\r` and
 /// `\t`, every other whitespace character (the plain space included) and
 /// every hidden one as `\u{..}`, and the backslash and quote themselves. The
@@ -339,9 +339,29 @@ fn display_name(raw: &str) -> String {
     if zeroclaw_api::plugin::validate_plugin_package_name(raw).is_ok() {
         return raw.to_string();
     }
-    let escaped = escape_untrusted(raw);
-    if escaped.len() > MAX_DISPLAY_CHARS {
-        let mut text: String = escaped[..MAX_DISPLAY_CHARS - 1].iter().collect();
+    quoted(raw)
+}
+
+/// A version as shown in the row and the detail. The row interpolates it
+/// into a sentence, so a version that is not one printable token (it is
+/// empty, too long, or holds whitespace or a hidden character) is shown
+/// escaped and quoted; an unvalidated registry version can then never add
+/// words such as "installed" to the row.
+fn display_version(raw: &str) -> String {
+    let token = !raw.is_empty()
+        && raw.chars().count() <= MAX_DISPLAY_CHARS
+        && raw.chars().all(|c| !c.is_whitespace() && !is_hidden(c));
+    if token { raw.to_string() } else { quoted(raw) }
+}
+
+/// [`escape_untrusted`] capped at [`MAX_DISPLAY_CHARS`], ending in an
+/// ellipsis when cut. The input is cut before it is escaped, so an oversized
+/// registry value costs no more to show than a capped one.
+fn quoted(raw: &str) -> String {
+    let head: String = raw.chars().take(MAX_DISPLAY_CHARS).collect();
+    let escaped = escape_untrusted(&head);
+    if head.len() < raw.len() || escaped.len() > MAX_DISPLAY_CHARS {
+        let mut text: String = escaped.into_iter().take(MAX_DISPLAY_CHARS - 1).collect();
         text.push('\u{2026}');
         text
     } else {
@@ -350,29 +370,29 @@ fn display_name(raw: &str) -> String {
 }
 
 /// The versions column. The wording follows exact equality of the daemon's
-/// strings, so "same version" is never shown for different values, even when
-/// they look alike once sanitized. Versions are never ordered, so the pane
-/// never implies that one is newer or that an upgrade exists.
+/// strings, so "same version" is never shown for different values. Versions
+/// are never ordered, so the pane never implies that one is newer or that an
+/// upgrade exists.
 fn versions_text(entry: &PluginCatalogEntry) -> String {
     match (&entry.installed, &entry.available) {
         (Some(installed), Some(available)) if installed.version == available.version => t_args(
             "zc-plugins-row-same-version",
-            &[("version", &display_safe(&installed.version))],
+            &[("version", &display_version(&installed.version))],
         ),
         (Some(installed), Some(available)) => t_args(
             "zc-plugins-row-other-version",
             &[
-                ("installed", &display_safe(&installed.version)),
-                ("registry", &display_safe(&available.version)),
+                ("installed", &display_version(&installed.version)),
+                ("registry", &display_version(&available.version)),
             ],
         ),
         (Some(installed), None) => t_args(
             "zc-plugins-row-installed-only",
-            &[("version", &display_safe(&installed.version))],
+            &[("version", &display_version(&installed.version))],
         ),
         (None, Some(available)) => t_args(
             "zc-plugins-row-registry-only",
-            &[("version", &display_safe(&available.version))],
+            &[("version", &display_version(&available.version))],
         ),
         (None, None) => t("zc-plugins-row-no-record"),
     }
@@ -393,13 +413,13 @@ fn project_detail(entry: &PluginCatalogEntry, unreadable: Unreadable) -> Package
         installed_unknown: entry.installed.is_none() && unreadable.installed,
         registry_unknown: entry.available.is_none() && unreadable.registry,
         installed: entry.installed.as_ref().map(|installed| InstalledView {
-            version: display_safe(&installed.version),
+            version: display_version(&installed.version),
             description: safe_description(installed.description.as_deref()),
             capabilities: safe_list(&installed.capabilities),
             permissions: safe_list(&installed.permissions),
         }),
         registry: entry.available.as_ref().map(|available| RegistryView {
-            version: display_safe(&available.version),
+            version: display_version(&available.version),
             description: safe_description(available.description.as_deref()),
             capabilities: safe_list(&available.capabilities),
             install_source: display_safe(&available.install_source),
@@ -1091,7 +1111,7 @@ impl PluginsPane {
                 let text = if counted {
                     filter.counted_label(plugins, unreadable)
                 } else {
-                    filter.label()
+                    t(filter.fluent_key())
                 };
                 ListItem::new(Line::from(Span::styled(text, theme::body_style())))
             })
@@ -1540,11 +1560,55 @@ mod tests {
         let hostile = "\u{1b}]2;title\u{7}\r\n\u{202e}\u{200d}\u{feff}\u{85}\u{9c}ok\u{0}\
                        \u{fe0f}\u{fe00}\u{34f}\u{3164}\u{115f}\u{ffa0}\u{180b}\u{e0100}\u{e0041}";
         let safe = display_safe(hostile);
-        assert!(
-            safe.chars().all(|c| !is_hidden(c)),
-            "unsafe character survived: {safe:?}"
+        // An exact expectation, so a character dropped from the denylist
+        // fails here instead of passing its own membership check.
+        let replaced = |n: usize| "\u{fffd}".repeat(n);
+        assert_eq!(
+            safe,
+            format!("\u{fffd}]2;title\u{fffd} {}ok{}", replaced(5), replaced(10))
         );
-        assert!(safe.contains("ok"));
+    }
+
+    #[test]
+    fn a_version_that_is_not_one_token_is_quoted() {
+        let spoof = entry("evil", None, Some(("1.0.0 installed, in registry", &[])));
+        assert_eq!(
+            versions_text(&spoof),
+            "v\"1.0.0\\u{20}installed,\\u{20}in\\u{20}registry\" in registry"
+        );
+        assert_eq!(
+            project_detail(&spoof, Unreadable::default())
+                .registry
+                .unwrap()
+                .version,
+            "\"1.0.0\\u{20}installed,\\u{20}in\\u{20}registry\""
+        );
+        for raw in ["", "1.0.0\u{200b}", "1.0.0\n"] {
+            let shown = display_version(raw);
+            assert!(shown.starts_with('"'), "{raw:?} shown as {shown:?}");
+            assert!(
+                shown.chars().all(|c| !is_hidden(c) && c != ' '),
+                "{shown:?}"
+            );
+        }
+        assert_eq!(
+            display_version("0.2.0-beta.1+build.7"),
+            "0.2.0-beta.1+build.7"
+        );
+    }
+
+    #[test]
+    fn oversized_names_and_versions_are_cut_before_escaping() {
+        let huge = "\u{200b}".repeat(100_000);
+        for shown in [display_name(&huge), display_version(&huge)] {
+            assert_eq!(shown.chars().count(), MAX_DISPLAY_CHARS);
+            assert!(shown.starts_with('"') && shown.ends_with('\u{2026}'));
+        }
+        let long_token = "9".repeat(MAX_DISPLAY_CHARS + 1);
+        assert_eq!(
+            display_version(&long_token).chars().count(),
+            MAX_DISPLAY_CHARS
+        );
     }
 
     #[test]
