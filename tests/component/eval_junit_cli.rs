@@ -203,3 +203,138 @@ fn junit_write_baseline_does_not_leak_table_output() {
         "JUnit stdout must be the XML document only, got:\n{stdout}"
     );
 }
+
+#[tokio::test]
+async fn diagnostic_judge_agrees_with_json_history_and_junit() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model": "mock-judge",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant",
+                "content": r#"{"score":0.1,"unknown":false,"reason":"negative <&> advisory"}"#
+            }}]
+        })))
+        .expect(6)
+        .mount(&server)
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    let suite = root.path().join("suite");
+    let history = root.path().join("history");
+    let baseline = root.path().join("baseline.json");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&suite).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        format!(
+            r#"schema_version = 3
+[reliability]
+provider_retries = 0
+provider_backoff_ms = 0
+[risk_profiles.default]
+[runtime_profiles.default]
+[providers.models.custom.judge]
+api_key = "test-key"
+uri = "{}"
+model = "mock-judge"
+wire_api = "chat_completions"
+[eval]
+judge_provider = "custom.judge"
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    for (index, (format, fails, baseline_mode)) in [
+        ("json", false, "none"),
+        ("junit", false, "none"),
+        ("junit", false, "write"),
+        ("junit", false, "compare"),
+        ("json", true, "none"),
+        ("junit", true, "none"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::fs::write(suite.join("case.json"), serde_json::to_vec(&serde_json::json!({
+            "model_name":"diagnostic-case",
+            "turns":[{"user_input":"Greet", "steps":[{"response":{"type":"text","content":"hello"}}]}],
+            "expects":{"response_contains":[if fails { "missing" } else { "hello" }],
+                "judge":[{"name":"quality","rubric":"Assess quality","threshold":0.7}]}
+        })).unwrap()).unwrap();
+        let config = config.clone();
+        let suite = suite.clone();
+        let run_history = history.join(index.to_string());
+        let history_arg = run_history.clone();
+        let baseline = baseline.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_zeroclaw"));
+            command
+                .env("ZEROCLAW_CONFIG_DIR", config)
+                .env("RUST_LOG", "off")
+                .args(["eval", "run", "--mode", "replay", "--suite"])
+                .arg(suite)
+                .args(["--format", format, "--history-dir"])
+                .arg(history_arg);
+            match baseline_mode {
+                "write" => {
+                    command.arg("--write-baseline").arg(baseline);
+                }
+                "compare" => {
+                    command.arg("--baseline").arg(baseline);
+                }
+                _ => {}
+            }
+            command.output().unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.status.code(), Some(i32::from(fails)), "{out:?}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        if format == "json" {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["all_passed"],
+                !fails
+            );
+        } else {
+            assert_eq!(parse_junit(&stdout), (1, 1, Some("1".into())));
+            assert_eq!(stdout.matches("<failure ").count(), usize::from(fails));
+            assert!(stdout.contains(&format!("failures=\"{}\"", usize::from(fails))));
+            assert!(!stdout.contains("<error "));
+            assert!(!stdout.contains("<skipped"));
+            assert!(stdout.contains("<system-out>advisory (failed) judge:quality:"));
+            assert!(stdout.contains("negative &lt;&amp;&gt; advisory"));
+        }
+        let suite_dir = std::fs::read_dir(&run_history)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let receipt_path = std::fs::read_dir(suite_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let receipt_text = std::fs::read_to_string(receipt_path).unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt_text).unwrap();
+        assert_eq!(
+            receipt["cases"][0]["verdict"],
+            if fails { "fail" } else { "pass" }
+        );
+        assert!(!receipt_text.contains("negative <&> advisory"));
+        assert!(
+            receipt["cases"][0]["checks"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|check| check["diagnostic"] == true && check["passed"] == false)
+        );
+    }
+}

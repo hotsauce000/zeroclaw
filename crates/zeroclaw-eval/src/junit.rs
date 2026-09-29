@@ -76,7 +76,7 @@ fn duration_secs(case: &CaseReport) -> f64 {
     })
 }
 
-/// The `check: detail` lines for every failing grade, in order. Used for both
+/// The `check: detail` lines for every failing gating grade, in order. Used for both
 /// the `<failure>` body and the flaky case's `<system-out>`.
 ///
 /// ⚠️ These details can carry the model's complete final response (a failed
@@ -87,7 +87,7 @@ fn duration_secs(case: &CaseReport) -> f64 {
 fn failure_body(case: &CaseReport) -> String {
     case.grades
         .iter()
-        .filter(|g| !g.passed)
+        .filter(|g| !g.passed && !g.diagnostic)
         .map(|g| format!("{}: {}", g.check, g.detail))
         .collect::<Vec<_>>()
         .join("\n")
@@ -144,10 +144,6 @@ pub fn render_junit(report: &SuiteReport, skipped: &[&str], flaky: &[&str]) -> S
                 "<skipped message=\"{}\"/>",
                 escape_attr(FLAKY_UNCONFIRMED_MESSAGE)
             ));
-            let detail = failure_body(case);
-            if !detail.is_empty() {
-                xml.push_str(&format!("<system-out>{}</system-out>", escape(&detail)));
-            }
         } else if is_skipped(case) {
             xml.push_str("<skipped/>");
         } else if let Some(err) = &case.error {
@@ -157,15 +153,45 @@ pub fn render_junit(report: &SuiteReport, skipped: &[&str], flaky: &[&str]) -> S
                 escape(err)
             ));
         } else {
-            let failing: Vec<&crate::grader::GradeResult> =
-                case.grades.iter().filter(|g| !g.passed).collect();
-            if let Some(first) = failing.first() {
+            let failing: Vec<&crate::grader::GradeResult> = case
+                .grades
+                .iter()
+                .filter(|g| !g.passed && !g.diagnostic)
+                .collect();
+            if !case.passed() {
                 xml.push_str(&format!(
                     "<failure message=\"{}\">{}</failure>",
-                    escape_attr(&first.check),
+                    escape_attr(
+                        failing
+                            .first()
+                            .map_or("no gating grades", |grade| &grade.check)
+                    ),
                     escape(&failure_body(case))
                 ));
             }
+        }
+        // Advisory grades never become failures, including alongside an error
+        // or a baseline skip. Keep their evidence in the existing escaped sink.
+        let mut output = Vec::new();
+        if is_flaky(case) {
+            let detail = failure_body(case);
+            if !detail.is_empty() {
+                output.push(detail);
+            }
+        }
+        output.extend(case.grades.iter().filter(|g| g.diagnostic).map(|g| {
+            format!(
+                "advisory ({}) {}: {}",
+                if g.passed { "passed" } else { "failed" },
+                g.check,
+                g.detail
+            )
+        }));
+        if !output.is_empty() {
+            xml.push_str(&format!(
+                "<system-out>{}</system-out>",
+                escape(&output.join("\n"))
+            ));
         }
         xml.push_str("</testcase>\n");
     }
@@ -192,6 +218,60 @@ mod tests {
             repeat: None,
             cluster: None,
         }
+    }
+
+    #[test]
+    fn diagnostic_evidence_preserves_verdicts_and_xml_counts() {
+        let mut advisory = grade("judge:<quality>", false, "negative <&>\u{1} evidence");
+        advisory.diagnostic = true;
+        let report = SuiteReport {
+            cases: vec![
+                case(
+                    "pass",
+                    vec![grade("response", true, "ok"), advisory.clone()],
+                    None,
+                ),
+                case(
+                    "fail",
+                    vec![advisory.clone(), grade("response", false, "missing")],
+                    None,
+                ),
+                case("error", vec![advisory.clone()], Some("execution error")),
+                case("skip", vec![advisory.clone()], Some("skipped error")),
+                case(
+                    "flaky",
+                    vec![grade("response", false, "original failure"), advisory],
+                    None,
+                ),
+                case("empty", vec![], None),
+            ],
+        };
+        let xml = render_junit(&report, &["skip"], &["flaky"]);
+        let elements = parse_elements(&xml).expect("valid advisory XML");
+        for (attribute, element, count) in [
+            ("tests", "testcase", 6),
+            ("failures", "failure", 2),
+            ("errors", "error", 1),
+            ("skipped", "skipped", 2),
+        ] {
+            assert_eq!(
+                attr(&elements, "testsuite", attribute),
+                Some(count.to_string().as_str())
+            );
+            assert_eq!(
+                elements.iter().filter(|(name, _)| name == element).count(),
+                count
+            );
+        }
+        assert_eq!(attr(&elements, "failure", "message"), Some("response"));
+        let text = parse_text(&xml).expect("advisory text parses");
+        assert_eq!(
+            text.matches("advisory (failed) judge:<quality>: negative <&>\u{FFFD} evidence")
+                .count(),
+            5
+        );
+        assert!(text.contains("original failure"));
+        assert!(!xml.contains('\u{1}'));
     }
 
     #[test]
