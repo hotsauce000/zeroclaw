@@ -2317,15 +2317,17 @@ pub fn create_routed_model_provider_with_live_config_options(
 }
 
 /// Build a routed provider from an already-captured configuration generation
-/// while keeping the canonical handle for per-request credential resolution.
+/// while keeping the canonical handle for live credential attempts.
 ///
-/// Everything the provider fixes at construction time - endpoint, auth mode,
-/// runtime options, reliability settings, and the route graph - comes from
-/// `config`. Only the credential pool follows the live handle afterwards,
-/// which is the documented live-rotation contract. Passing the same generation
-/// the caller used for its own state is what keeps an owner such as `Agent`
-/// from combining a provider built from one generation with model, route, and
-/// policy state read from another.
+/// The initial providers, reliability settings, route graph, and fallback chain
+/// come from `config`. Passing the same generation the caller used for its own
+/// state keeps an owner such as `Agent` from combining a provider graph built
+/// from one generation with model, route, and policy state read from another.
+///
+/// Live credential attempts resolve the credential, endpoint, auth mode, and
+/// runtime options together from one current snapshot of the canonical handle.
+/// This atomic per-attempt resolution does not rebuild the construction-time
+/// route graph or fallback chain.
 pub fn create_routed_model_provider_for_live_generation(
     config: &zeroclaw_config::schema::Config,
     live_config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
