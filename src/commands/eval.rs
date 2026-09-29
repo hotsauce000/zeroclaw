@@ -455,7 +455,7 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
             // Resolve the model once for the receipt label; the closure builds a
             // fresh provider per case (isolation) and must be `'static`, so it owns
             // a config clone.
-            let (_, _provider_type, resolved_model) =
+            let (_, _provider_type, resolved_model, _) =
                 build_session_model_provider(config, &provider_ref, None)?;
             let receipt_ref = format!("{provider_ref}:{resolved_model}");
             let cfg = config.clone();
