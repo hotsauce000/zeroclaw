@@ -1822,7 +1822,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             "gateway admin token could not be written; pairing-code admin routes will refuse all callers"
         );
     }
-    if let Some(code) = pairing.pairing_code() {
+    if let Some((code, subject)) = pairing.pending_pairing_code() {
         // The box is sized from the code, not from a literal: since the policy became config-driven,
         // the code length is operator-configurable (6..=128 chars).
         let rule = "─".repeat(code.chars().count() + 4);
@@ -1832,6 +1832,18 @@ pub async fn run_gateway_with_plugin_webhooks(
         println!("     │  {code}  │");
         println!("     └{rule}┘");
         println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
+        // A code minted for a roster user outlives a supervised gateway
+        // restart on the daemon's guard; say whose it is.
+        if subject != PairedTokenSubject::SharedOperator {
+            let principal = paired_principal_id(&subject);
+            println!(
+                "   {}",
+                i18n::get_required_cli_string_with_args(
+                    "cli-pairing-bound-user",
+                    &[("principal", principal.as_str())]
+                )
+            );
+        }
     } else if pairing.require_pairing() {
         for line in already_paired_pairing_notice(host, actual_port, pfx, &admin_token_path) {
             println!("{line}");
@@ -4944,9 +4956,9 @@ pub(crate) enum ReplacementWithheld {
 impl ReplacementWithheld {
     pub(crate) fn message(&self) -> String {
         match self {
-            Self::TokenNotPaired => "Its bearer token was no longer paired, so the user it was \
-                bound to, if any, is unknown and no replacement code was issued. Mint one with \
-                `zeroclaw gateway get-paircode --new`, adding `--user <name>` for a roster user."
+            Self::TokenNotPaired => "The user its token was bound to, if any, is unknown, so \
+                no replacement code was issued. Mint one with `zeroclaw gateway get-paircode \
+                --new`, adding `--user <name>` for a roster user."
                 .to_string(),
             Self::RosterEntryRemoved { principal_id } => format!(
                 "It was bound to {}, which no longer has a [users] entry, so no replacement \
@@ -5165,7 +5177,14 @@ async fn handle_admin_paircode_new(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "single device token revoked via admin endpoint"
             );
-            let revoked_message = format!("Revoked the bearer token for device '{device_id}'.");
+            let revoked_message = if revoked.is_some() {
+                format!("Revoked the bearer token for device '{device_id}'.")
+            } else {
+                format!(
+                    "Removed device '{device_id}' from the registry; its bearer token was \
+                     already revoked."
+                )
+            };
             // The replacement pairs as the revoked token did, or not at all.
             let replacement = rotation_replacement_subject(&state.config.read().users, revoked);
             match replacement {
@@ -6667,6 +6686,11 @@ path = "{trigger_path}"
         assert_eq!(status, StatusCode::OK, "{json}");
         assert!(json["pairing_code"].is_null(), "{json}");
         assert_eq!(state.pairing.pending_pairing_code(), None);
+        let message = json["message"].as_str().unwrap();
+        assert!(
+            message.contains("already revoked") && !message.contains("Revoked the bearer token"),
+            "the reply must not claim a revocation that did not happen: {message}"
+        );
     }
 
     #[tokio::test]
@@ -6718,6 +6742,73 @@ path = "{trigger_path}"
             Some((code.to_string(), alice()))
         );
         assert!(!state.pairing.token_is_paired(&old));
+    }
+
+    /// When a code is already pending, dashboard rotation may point the
+    /// operator at it only if it pairs as the rotated device did. An unbound
+    /// pending code would re-pair a roster user's device as the operator.
+    #[tokio::test]
+    async fn dashboard_rotation_never_steers_a_device_to_a_differently_bound_pending_code() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let operator = pair_device(&state, "laptop").await;
+        let old = pair_bound_device(&state, "phone").await;
+        let unbound = state
+            .pairing
+            .generate_new_pairing_code(live_pairing_code_policy(&state))
+            .expect("pairing enabled");
+
+        let (status, json) = json_of(
+            api_pairing::rotate_token(
+                State(state.clone()),
+                bearer(&operator),
+                axum::extract::Path("phone".to_string()),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(json["pairing_code"].is_null());
+        assert_eq!(json["principal_id"], "user:alice");
+        assert_eq!(json["pending_principal_id"], "shared-operator");
+        let message = json["message"].as_str().unwrap();
+        assert!(
+            !message.contains("use it"),
+            "an unbound pending code must not be offered for a bound device: {message}"
+        );
+        assert_eq!(
+            state.pairing.pending_pairing_code(),
+            Some((unbound, PairedTokenSubject::SharedOperator)),
+            "the pending code is left as it was"
+        );
+        assert!(!state.pairing.token_is_paired(&old), "the revoke stands");
+
+        // A pending code that pairs as the same user is fine to reuse.
+        let second = pair_bound_device(&state, "tablet").await;
+        let bound_pending = state
+            .pairing
+            .generate_new_pairing_code_as(live_pairing_code_policy(&state), alice())
+            .expect("pairing enabled");
+        let (_, json) = json_of(
+            api_pairing::rotate_token(
+                State(state.clone()),
+                bearer(&operator),
+                axum::extract::Path("tablet".to_string()),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert!(
+            json["message"].as_str().unwrap().contains("use it"),
+            "{json}"
+        );
+        assert_eq!(
+            state.pairing.pending_pairing_code(),
+            Some((bound_pending, alice()))
+        );
+        assert!(!state.pairing.token_is_paired(&second));
     }
 
     /// Headers carrying this test gateway's admin secret, minted the way a

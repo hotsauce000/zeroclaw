@@ -702,10 +702,16 @@ pub async fn rotate_token(
     let subject = match replacement {
         Ok(subject) => subject,
         Err(withheld) => {
+            let outcome = match withheld {
+                super::ReplacementWithheld::TokenNotPaired => {
+                    "Device removed; its token was already revoked."
+                }
+                super::ReplacementWithheld::RosterEntryRemoved { .. } => "Old token revoked.",
+            };
             return Json(serde_json::json!({
                 "device_id": device_id,
                 "pairing_code": null,
-                "message": format!("Old token revoked. {}", withheld.message()),
+                "message": format!("{outcome} {}", withheld.message()),
             }))
             .into_response();
         }
@@ -716,10 +722,10 @@ pub async fn rotate_token(
     // flow holds the slot, the revoke still stands — return 200 with
     // `pairing_code: null` and a message that tells the operator what
     // happened so they do not assume rotation failed.
-    match state
-        .pairing
-        .generate_pairing_code_if_vacant_as(crate::live_pairing_code_policy(&state), subject)
-    {
+    match state.pairing.generate_pairing_code_if_vacant_as(
+        crate::live_pairing_code_policy(&state),
+        subject.clone(),
+    ) {
         Ok(code) => Json(serde_json::json!({
             "device_id": device_id,
             "pairing_code": code,
@@ -728,10 +734,33 @@ pub async fn rotate_token(
         }))
         .into_response(),
         Err(zeroclaw_config::pairing::GeneratePairingCodeError::Pending) => {
+            // Reusing the pending code is right only when it pairs as this
+            // device did; otherwise it would re-pair the device as someone
+            // else, possibly as the shared operator.
+            let pending = state
+                .pairing
+                .pending_pairing_code()
+                .map(|(_, pending)| pending);
+            let message = match &pending {
+                Some(pending) if *pending == subject => "Old token revoked. A pairing code is \
+                    already pending; use it or call again after it clears."
+                    .to_string(),
+                Some(pending) => format!(
+                    "Old token revoked. The pending pairing code pairs as {}, not as this \
+                     device's {principal_id}, so it cannot re-pair this device; call again \
+                     after it clears.",
+                    super::paired_principal_id(pending)
+                ),
+                None => "Old token revoked. A pending pairing code has just cleared; call \
+                    again to issue a replacement."
+                    .to_string(),
+            };
             Json(serde_json::json!({
                 "device_id": device_id,
                 "pairing_code": null,
-                "message": "Old token revoked. A pairing code is already pending; use it or call again after it clears.",
+                "principal_id": principal_id,
+                "pending_principal_id": pending.as_ref().map(super::paired_principal_id),
+                "message": message,
             }))
             .into_response()
         }
