@@ -300,9 +300,11 @@ impl AcceptedAuthState {
 /// caller that owns the live layer. Surfaces that stage a configuration
 /// without one (the gateway's Quickstart) use this so they can refuse an
 /// invalid policy before their first persistent write rather than after it.
-/// Pairing state does not affect whether the policy compiles.
+/// Pairing state does not affect whether the policy compiles, so the guard
+/// here holds no tokens: loading the real ones would repeat the load-time
+/// warning about damaged bindings on every staged configuration.
 pub fn validate_accepted_auth_config(config: &Config) -> anyhow::Result<()> {
-    let pairing = Arc::new(PairingGuard::from_gateway_config(&config.gateway));
+    let pairing = Arc::new(PairingGuard::new(false, &[], config.gateway.pairing_code));
     let _ = AcceptedAuthState::from_config(config, pairing, 1)?;
     Ok(())
 }
