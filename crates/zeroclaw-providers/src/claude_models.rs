@@ -23,8 +23,22 @@ pub enum ClaudeThinkingShape {
 pub fn claude_thinking_shape(model: &str) -> ClaudeThinkingShape {
     match claude_id(model) {
         ClaudeId::NotClaude => ClaudeThinkingShape::FixedBudget,
-        ClaudeId::Generation(generation) if generation < (4, 6) => ClaudeThinkingShape::FixedBudget,
-        ClaudeId::Generation(_) | ClaudeId::Unversioned => ClaudeThinkingShape::Adaptive,
+        ClaudeId::Generation { version, .. } if version < (4, 6) => {
+            ClaudeThinkingShape::FixedBudget
+        }
+        ClaudeId::Generation { .. } | ClaudeId::Unversioned => ClaudeThinkingShape::Adaptive,
+    }
+}
+
+/// Existing chat-completions gateway serialization contract. This intentionally
+/// preserves its case-sensitive substring eligibility instead of applying the
+/// broader native-adapter capability policy to an opted-in gateway route.
+#[must_use]
+pub(crate) fn compatible_claude_thinking_shape(model: &str) -> ClaudeThinkingShape {
+    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5") {
+        ClaudeThinkingShape::Adaptive
+    } else {
+        ClaudeThinkingShape::FixedBudget
     }
 }
 
@@ -39,9 +53,59 @@ pub fn claude_thinking_shape(model: &str) -> ClaudeThinkingShape {
 pub fn claude_accepts_display_updates(model: &str) -> bool {
     match claude_id(model) {
         ClaudeId::NotClaude => true,
-        ClaudeId::Generation(generation) => generation < (5, 1),
+        ClaudeId::Generation { version, .. } => version < (5, 1),
         ClaudeId::Unversioned => false,
     }
+}
+
+/// Whether signed thinking from completed turns remains part of the prompt.
+/// Unknown models retain their records: request-shape support alone does not
+/// establish that discarding reasoning is safe.
+#[must_use]
+pub fn claude_keeps_prior_reasoning(model: &str) -> bool {
+    match claude_id(model) {
+        ClaudeId::Generation {
+            family: ClaudeFamily::Opus,
+            version,
+        } => version >= (4, 5),
+        ClaudeId::Generation {
+            family: ClaudeFamily::Sonnet,
+            version,
+        } => version >= (4, 6),
+        ClaudeId::Generation {
+            family: ClaudeFamily::Haiku,
+            version,
+        } if version <= (4, 5) => false,
+        _ => true,
+    }
+}
+
+/// Whether a known model binds thinking to its preceding prompt and permits
+/// removing invalidated blocks after a real prefix rewrite. This is independent
+/// of adaptive requests and prior-turn retention; in particular 4.6 models
+/// require their in-flight blocks. Unknown/future contracts preserve records.
+#[must_use]
+pub fn claude_invalidates_reasoning_on_prefix_rewrite(model: &str) -> bool {
+    matches!(
+        claude_id(model),
+        ClaudeId::Generation {
+            family: ClaudeFamily::Fable,
+            version: (5, 1)
+        } | ClaudeId::Generation {
+            family: ClaudeFamily::Opus | ClaudeFamily::Sonnet,
+            version: (5, 5)
+        }
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeFamily {
+    Opus,
+    Sonnet,
+    Haiku,
+    Fable,
+    Mythos,
+    Unknown,
 }
 
 /// What a model id says about the Claude generation it names.
@@ -52,7 +116,10 @@ enum ClaudeId {
     /// A Claude id whose generation cannot be read.
     Unversioned,
     /// A Claude id naming this `(major, minor)` generation.
-    Generation((u32, u32)),
+    Generation {
+        family: ClaudeFamily,
+        version: (u32, u32),
+    },
 }
 
 /// Anchors on the `claude-` substring so Bedrock ids carrying region and
@@ -63,7 +130,21 @@ fn claude_id(model: &str) -> ClaudeId {
         return ClaudeId::NotClaude;
     };
     let rest = &lower[start + "claude-".len()..];
-    claude_generation(rest).map_or(ClaudeId::Unversioned, ClaudeId::Generation)
+    let family = rest
+        .split('-')
+        .find_map(|token| match token {
+            "opus" => Some(ClaudeFamily::Opus),
+            "sonnet" => Some(ClaudeFamily::Sonnet),
+            "haiku" => Some(ClaudeFamily::Haiku),
+            "fable" => Some(ClaudeFamily::Fable),
+            "mythos" => Some(ClaudeFamily::Mythos),
+            _ => None,
+        })
+        .unwrap_or(ClaudeFamily::Unknown);
+    claude_generation(rest).map_or(ClaudeId::Unversioned, |version| ClaudeId::Generation {
+        family,
+        version,
+    })
 }
 
 /// Read the `(major, minor)` generation from the id tokens after `claude-`.
@@ -98,6 +179,53 @@ fn short_number(token: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_policy_is_independent_of_request_shape() {
+        for model in [
+            "claude-opus-4-5",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-fable-5-1",
+            "claude-mythos-preview",
+            "claude-next",
+            "other",
+        ] {
+            assert!(claude_keeps_prior_reasoning(model), "{model}");
+        }
+        for model in [
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "claude-opus-4-1",
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        ] {
+            assert!(!claude_keeps_prior_reasoning(model), "{model}");
+        }
+        for model in [
+            "claude-fable-5-1",
+            "global.anthropic.claude-opus-5-5-v1",
+            "claude-sonnet-5-5",
+        ] {
+            assert!(
+                claude_invalidates_reasoning_on_prefix_rewrite(model),
+                "{model}"
+            );
+        }
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-fable-5",
+            "claude-mythos-5-1",
+            "claude-fable-6",
+            "claude-next",
+            "other",
+        ] {
+            assert!(
+                !claude_invalidates_reasoning_on_prefix_rewrite(model),
+                "{model}"
+            );
+        }
+    }
 
     #[test]
     fn adaptive_generations_classify_as_adaptive() {
