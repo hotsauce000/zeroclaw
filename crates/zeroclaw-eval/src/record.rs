@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::model_provider::ConversationMessage;
 
+use crate::observer::RecordedCall;
+
 /// The schema tag stamped on every serialized run record.
 pub const RECORD_SCHEMA: &str = "zeroclaw-eval/record/v1";
 
@@ -87,16 +89,16 @@ pub struct CaseProvenance {
 
 /// The data that only exists once a run finishes: the transcript, the tool
 /// trajectory, and the usage counters.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default)]
 pub struct RunCompletion {
     /// The agent's final text response for the case.
     pub final_response: String,
     /// The full conversation trajectory (messages + tool calls + tool results).
     pub history: Vec<ConversationMessage>,
-    /// Names of tools that were dispatched, in call order.
-    pub tools_called: Vec<String>,
-    /// Whether every dispatched tool call succeeded.
-    pub all_tools_succeeded: bool,
+    /// Every dispatched tool call with its arguments and result, in call order.
+    /// This creates the canonical dispatch fact: names, success, arguments, and
+    /// results are derived from this list rather than copied into parallel fields.
+    pub tool_calls: Vec<RecordedCall>,
     /// Accumulated input tokens reported by the provider.
     pub input_tokens: u64,
     /// Accumulated output tokens reported by the provider.
@@ -107,18 +109,24 @@ pub struct RunCompletion {
     pub llm_calls: u32,
 }
 
-impl Default for RunCompletion {
-    fn default() -> Self {
-        Self {
-            final_response: String::new(),
-            history: Vec::new(),
-            tools_called: Vec::new(),
-            all_tools_succeeded: true,
-            input_tokens: 0,
-            output_tokens: 0,
-            duration_ms: 0,
-            llm_calls: 0,
-        }
+// Preserve receipt fields as views of the canonical dispatch records.
+impl Serialize for RunCompletion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("RunCompletion", 9)?;
+        state.serialize_field("final_response", &self.final_response)?;
+        state.serialize_field("history", &self.history)?;
+        state.serialize_field("tool_calls", &self.tool_calls)?;
+        state.serialize_field("tools_called", &self.tool_names())?;
+        state.serialize_field("all_tools_succeeded", &self.all_tools_succeeded())?;
+        state.serialize_field("input_tokens", &self.input_tokens)?;
+        state.serialize_field("output_tokens", &self.output_tokens)?;
+        state.serialize_field("duration_ms", &self.duration_ms)?;
+        state.serialize_field("llm_calls", &self.llm_calls)?;
+        state.end()
     }
 }
 
@@ -163,6 +171,21 @@ impl RunRecord {
 /// Extremely long durations saturate instead of truncating through an integer cast.
 pub fn duration_millis_saturating(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+impl RunCompletion {
+    /// Names of tools actually dispatched, in call order.
+    pub fn tool_names(&self) -> Vec<&str> {
+        self.tool_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect()
+    }
+
+    /// Whether every dispatched tool call succeeded (vacuously true if none).
+    pub fn all_tools_succeeded(&self) -> bool {
+        self.tool_calls.iter().all(|call| call.success)
+    }
 }
 
 #[cfg(test)]
@@ -227,7 +250,7 @@ mod tests {
         let record = RunRecord::from_provenance(provenance());
         let c = record.completion_or_default();
         assert_eq!(c.llm_calls, 0);
-        assert!(c.tools_called.is_empty());
+        assert!(c.tool_calls.is_empty());
         assert!(c.final_response.is_empty());
     }
 }
