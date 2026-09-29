@@ -6,10 +6,13 @@
 //! production site that built a guard with
 //! `PairingGuard::new(.., &config.gateway.paired_tokens, ..)` would load the
 //! first field without the second, so every roster-bound token would stop
-//! authenticating after a restart. Tests may still build guards from literal
-//! token lists, so items compiled only for tests (`cfg(test)`, or
+//! authenticating after a restart. Any `.paired_tokens` read passed to
+//! `PairingGuard::new` is flagged, so an alias such as `gw.paired_tokens` is
+//! caught too. Tests may still build guards from literal token lists, so
+//! items compiled only for tests (`cfg(test)`, or
 //! `cfg(any(test, feature = "test-helpers"))`) are skipped; a
-//! `cfg(not(test))` item is production code and is scanned.
+//! `cfg(not(test))` item is production code and is scanned. Calls written
+//! inside a macro body are not parsed and so are not checked.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -68,13 +71,17 @@ fn detector_flags_a_production_call_and_skips_test_items() {
     let flagged = "fn boot(config: &Config) -> PairingGuard {
         PairingGuard::new(config.gateway.require_pairing, &config.gateway.paired_tokens, policy)
     }";
+    let aliased = "fn boot(config: &Config) -> PairingGuard {
+        let gw = &config.gateway;
+        PairingGuard::new(gw.require_pairing, &gw.paired_tokens, gw.pairing_code)
+    }";
     let skipped = "#[cfg(test)]
     mod tests {
         fn guard(config: &Config) -> PairingGuard {
             zeroclaw_config::pairing::PairingGuard::new(true, &config.gateway.paired_tokens, p)
         }
     }
-    fn channel() -> PairingGuard { PairingGuard::new(true, &channel.paired_tokens, p) }
+    fn channel() -> PairingGuard { PairingGuard::new(true, &[], p) }
     #[cfg(any(test, feature = \"test-helpers\"))]
     fn helper(config: &Config) -> PairingGuard {
         PairingGuard::new(true, &config.gateway.paired_tokens, p)
@@ -88,6 +95,11 @@ fn detector_flags_a_production_call_and_skips_test_items() {
         PairingGuard::new(true, &config.gateway.paired_tokens, p)
     }";
     assert_eq!(hits(flagged), 1);
+    assert_eq!(
+        hits(aliased),
+        1,
+        "an alias of the gateway section is caught"
+    );
     assert_eq!(hits(skipped), 0);
     assert_eq!(
         hits(production_only),
@@ -135,7 +147,7 @@ impl<'ast> Visit<'ast> for GuardFromPairedTokens {
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if is_pairing_guard_new(&call.func)
             && call.args.iter().any(|arg| {
-                let mut reads = ReadsGatewayPairedTokens(false);
+                let mut reads = ReadsPairedTokens(false);
                 reads.visit_expr(arg);
                 reads.0
             })
@@ -146,14 +158,14 @@ impl<'ast> Visit<'ast> for GuardFromPairedTokens {
     }
 }
 
-/// Whether an expression reads a `<..>.gateway.paired_tokens` field.
-struct ReadsGatewayPairedTokens(bool);
+/// Whether an expression reads a `paired_tokens` field. Only the gateway
+/// section and its persisted form carry one, and loading either through
+/// `PairingGuard::new` would drop the roster-bound tokens.
+struct ReadsPairedTokens(bool);
 
-impl<'ast> Visit<'ast> for ReadsGatewayPairedTokens {
+impl<'ast> Visit<'ast> for ReadsPairedTokens {
     fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
-        if member_is(&field.member, "paired_tokens")
-            && matches!(&*field.base, syn::Expr::Field(base) if member_is(&base.member, "gateway"))
-        {
+        if member_is(&field.member, "paired_tokens") {
             self.0 = true;
         }
         visit::visit_expr_field(self, field);
