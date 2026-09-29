@@ -4978,9 +4978,9 @@ pub(crate) fn mint_command_for(
     users: &HashMap<String, zeroclaw_config::schema::UserConfig>,
     subject: &PairedTokenSubject,
 ) -> String {
-    match subject {
-        PairedTokenSubject::SharedOperator => "zeroclaw gateway get-paircode --new".to_string(),
-        PairedTokenSubject::RosterUser { principal_id } => {
+    match subject.roster_principal_id() {
+        None => "zeroclaw gateway get-paircode --new".to_string(),
+        Some(principal_id) => {
             let name = users
                 .iter()
                 .find(|(name, user)| user.effective_principal_id(name) == principal_id)
