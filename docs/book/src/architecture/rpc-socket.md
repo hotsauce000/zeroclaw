@@ -76,8 +76,10 @@ the operating system:
 | Method | Direction | Description |
 |---|---|---|
 | `initialize` | client -> daemon | Authenticate and negotiate protocol version |
-| `session/new` | client -> daemon | Create an agent session (requires `agentAlias`, optional `cwd`, `sessionId`; an ID that is already live rebinds the caller to that canonical in-memory session instead of replacing its agent history; optional `keep_siblings` suppresses the idle same-mode sibling eviction for multi-session clients that manage sibling lifecycle themselves) |
-| `session/close` | client -> daemon | Close and clean up a session |
+| `session/new` | client -> daemon | Create an agent session (requires `agentAlias`, optional `cwd`, `sessionId`; an ID that is already live rebinds the caller to that canonical in-memory session instead of replacing its agent history, and is refused with `FORBIDDEN` when the forwarded environment the caller may use under its current grants differs from the one that session was created with; optional `keep_siblings` suppresses the idle same-mode sibling eviction for multi-session clients that manage sibling lifecycle themselves) |
+| `session/close` | client -> daemon | Remove the live session owner; ACP durable history remains resumable |
+| `session/kill` | client -> daemon | Remove the live session and tombstone its ACP durable history |
+| `session/delete` | client -> daemon | Remove the live session and its selected durable history |
 | `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications); a leading `/effort:<level>` names the depth for that turn only |
 | `session/configure` | client -> daemon | Set session overrides (`model`, `model_provider`, `temperature`, `thinking_level`, `thinking_display`); `reset` names thinking fields to clear first; the result echoes the merged overrides and the session's `thinking_options` |
 | `session/thinking-options` | client -> daemon | The depths and displays the session's model accepts, what the session currently has, and where each value comes from |
@@ -86,6 +88,32 @@ the operating system:
 | `status` | client -> daemon | Server version, protocol version, active session list |
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
 | `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |
+
+### Atomic configuration writes
+
+`config/set-many` accepts an ordered `sets` array containing 1–256 objects,
+each with `prop` and `value`. It uses the same property syntax and value rules
+as `config/set`. For example, after creating a permission profile named
+`operator`, an administrator can create a complete user in one request:
+
+```json
+{"jsonrpc":"2.0","method":"config/set-many","params":{"sets":[{"prop":"users.example.uid","value":1001},{"prop":"users.example.permission_profiles","value":["operator"]}]},"id":2}
+```
+
+Success returns `{"props":["users.example.uid","users.example.permission_profiles"],"set":true}`.
+All fields are staged on one candidate and validated before one persistent
+commit. Later entries for the same property win. A staging or commit failure
+leaves the persisted and live config unchanged; an invalid entry error names
+its zero-based index.
+
+The caller needs `Config:Update` and authorization for every requested path.
+The daemon resolves current authority while holding the config write lock,
+before staging any entry. If one path is forbidden, the entire batch is
+refused with `FORBIDDEN`, including the entry index, even if earlier paths
+were allowed. Revocation while waiting for that lock also refuses the batch.
+Provider/model views are prepared from the complete candidate and installed
+after the successful commit. Deletes and map-key operations are not part of
+this method.
 
 ### Bidirectional requests
 
@@ -170,6 +198,22 @@ depth); `display_source` is `session`, `alias` (the provider slot's
 time and rebuild no provider; the daemon resolves the turn's depth as the
 inline prefix, then the session override, then the profile default, and
 applies native request parameters only.
+
+### ACP durable lifecycle
+
+Native RPC keeps the original visible transcript separate from the retained provider context. Automatic trimming does not delete or renumber original transcript rows. A trim notification is sent only after its retained-context snapshot and covered checkpoint boundary have committed together; a failed write suppresses that notification. The snapshot excludes runtime system prompts, recalled-memory injection, and hidden reasoning. On interruption, recovery appends visible checkpoint progress once while restoring the model from the latest retained snapshot plus later checkpoint events. An explicitly empty retained snapshot remains authoritative. Sessions without a snapshot keep the legacy provider-safe replay path.
+
+ACP sessions can retain durable history before reaching a terminal state. When the in-memory owner is reaped, RPC prompt recovery considers only durable rows whose persisted `interaction_surface` is supported; an unsupported surface is left untouched so a later direct recovery can inspect the original checkpoint.
+
+Recovery adds a client-visible interruption marker for an unfinished turn. Provider replay excludes that synthetic marker, and persisted tool output remains subject to the existing transcript bounds.
+
+The lifecycle operations have distinct durable meanings:
+
+- `session/close` may retain durable resumable history.
+- `session/kill` retains the history but marks the row as tombstoned, so it is not eligible for runtime rehydration.
+- `session/delete` removes the ACP row and its recoverable checkpoint before unregistering and removing the live session when the target is a live ACP session, or when no live mode exists and an ACP durable row is selected. A live same-ID Chat session remains isolated from ACP storage.
+
+Kill and delete signal cancellation before attempting their fallible SQLite operation. If that operation fails for an idle target, the RPC reports an internal error and preserves the live owner and channel registration. If hard cancellation has already removed an active owner, the RPC cannot restore that live generation; the durable row and recoverable checkpoint remain available once storage is working again.
 
 ## Ephemeral mode
 

@@ -151,11 +151,11 @@ const DISPLAYS_CURRENT: &[ThinkingDisplay] =
 /// models at all get no controls.
 #[must_use]
 pub fn thinking_capabilities(slot: ClaudeProviderSlot, model: &str) -> ThinkingCapabilities {
-    let lower = model.to_ascii_lowercase();
-    let Some(rest) = claude_id_rest(&lower) else {
-        return ThinkingCapabilities::NONE;
+    let generation = match claude_id(model) {
+        ClaudeId::NotClaude => return ThinkingCapabilities::NONE,
+        ClaudeId::Generation { version, .. } => Some(version),
+        ClaudeId::Unversioned => None,
     };
-    let generation = claude_generation(rest);
     match generation {
         Some(generation) if generation < (4, 6) => FIXED_BUDGET,
         Some((4, 6)) => ThinkingCapabilities {
@@ -187,15 +187,130 @@ pub fn thinking_capabilities(slot: ClaudeProviderSlot, model: &str) -> ThinkingC
 /// Anthropic-compatible proxies accepted before this classification existed.
 #[must_use]
 pub fn claude_thinking_shape(model: &str) -> ClaudeThinkingShape {
-    thinking_capabilities(ClaudeProviderSlot::Anthropic, model).shape
+    match claude_id(model) {
+        ClaudeId::NotClaude => ClaudeThinkingShape::FixedBudget,
+        ClaudeId::Generation { version, .. } if version < (4, 6) => {
+            ClaudeThinkingShape::FixedBudget
+        }
+        ClaudeId::Generation { .. } | ClaudeId::Unversioned => ClaudeThinkingShape::Adaptive,
+    }
 }
 
-/// The part of a lowercase id after `claude-`, or `None` for an id that is
-/// not a Claude model.
-fn claude_id_rest(lower: &str) -> Option<&str> {
-    lower
-        .find("claude-")
-        .map(|start| &lower[start + "claude-".len()..])
+/// Existing chat-completions gateway serialization contract. This intentionally
+/// preserves its case-sensitive substring eligibility instead of applying the
+/// broader native-adapter capability policy to an opted-in gateway route.
+#[must_use]
+pub(crate) fn compatible_claude_thinking_shape(model: &str) -> ClaudeThinkingShape {
+    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5") {
+        ClaudeThinkingShape::Adaptive
+    } else {
+        ClaudeThinkingShape::FixedBudget
+    }
+}
+
+/// Whether a Claude model accepts `updates` as its thinking display value.
+///
+/// Generation 5.1 narrowed the display values to `summarized` and `omitted`.
+/// Earlier generations keep accepting `updates`, and so do ids that are not
+/// Claude models, whose wire contract this module does not know. A Claude id
+/// whose version cannot be read follows the newest generation, the same rule
+/// `claude_thinking_shape` applies.
+#[must_use]
+pub fn claude_accepts_display_updates(model: &str) -> bool {
+    match claude_id(model) {
+        ClaudeId::NotClaude => true,
+        ClaudeId::Generation { version, .. } => version < (5, 1),
+        ClaudeId::Unversioned => false,
+    }
+}
+
+/// Whether signed thinking from completed turns remains part of the prompt.
+/// Unknown models retain their records: request-shape support alone does not
+/// establish that discarding reasoning is safe.
+#[must_use]
+pub fn claude_keeps_prior_reasoning(model: &str) -> bool {
+    match claude_id(model) {
+        ClaudeId::Generation {
+            family: ClaudeFamily::Opus,
+            version,
+        } => version >= (4, 5),
+        ClaudeId::Generation {
+            family: ClaudeFamily::Sonnet,
+            version,
+        } => version >= (4, 6),
+        ClaudeId::Generation {
+            family: ClaudeFamily::Haiku,
+            version,
+        } if version <= (4, 5) => false,
+        _ => true,
+    }
+}
+
+/// Whether a known model binds thinking to its preceding prompt and permits
+/// removing invalidated blocks after a real prefix rewrite. This is independent
+/// of adaptive requests and prior-turn retention; in particular 4.6 models
+/// require their in-flight blocks. Unknown/future contracts preserve records.
+#[must_use]
+pub fn claude_invalidates_reasoning_on_prefix_rewrite(model: &str) -> bool {
+    matches!(
+        claude_id(model),
+        ClaudeId::Generation {
+            family: ClaudeFamily::Fable,
+            version: (5, 1)
+        } | ClaudeId::Generation {
+            family: ClaudeFamily::Opus | ClaudeFamily::Sonnet,
+            version: (5, 5)
+        }
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeFamily {
+    Opus,
+    Sonnet,
+    Haiku,
+    Fable,
+    Mythos,
+    Unknown,
+}
+
+/// What a model id says about the Claude generation it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeId {
+    /// The id does not name a Claude model.
+    NotClaude,
+    /// A Claude id whose generation cannot be read.
+    Unversioned,
+    /// A Claude id naming this `(major, minor)` generation.
+    Generation {
+        family: ClaudeFamily,
+        version: (u32, u32),
+    },
+}
+
+/// Anchors on the `claude-` substring so Bedrock ids carrying region and
+/// vendor prefixes resolve the same way as bare API ids.
+fn claude_id(model: &str) -> ClaudeId {
+    let lower = model.to_ascii_lowercase();
+    let Some(start) = lower.find("claude-") else {
+        return ClaudeId::NotClaude;
+    };
+    let rest = &lower[start + "claude-".len()..];
+    let family = rest
+        .split('-')
+        .find_map(|token| match token {
+            "opus" => Some(ClaudeFamily::Opus),
+            "sonnet" => Some(ClaudeFamily::Sonnet),
+            "haiku" => Some(ClaudeFamily::Haiku),
+            "fable" => Some(ClaudeFamily::Fable),
+            "mythos" => Some(ClaudeFamily::Mythos),
+            _ => None,
+        })
+        .unwrap_or(ClaudeFamily::Unknown);
+    claude_generation(rest).map_or(ClaudeId::Unversioned, |version| ClaudeId::Generation {
+        family,
+        version,
+    })
 }
 
 /// Read the `(major, minor)` generation from the id tokens after `claude-`.
@@ -265,6 +380,53 @@ mod tests {
         "claude-2.1",
         "claude-instant-1.2",
     ];
+
+    #[test]
+    fn history_policy_is_independent_of_request_shape() {
+        for model in [
+            "claude-opus-4-5",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-fable-5-1",
+            "claude-mythos-preview",
+            "claude-next",
+            "other",
+        ] {
+            assert!(claude_keeps_prior_reasoning(model), "{model}");
+        }
+        for model in [
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "claude-opus-4-1",
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        ] {
+            assert!(!claude_keeps_prior_reasoning(model), "{model}");
+        }
+        for model in [
+            "claude-fable-5-1",
+            "global.anthropic.claude-opus-5-5-v1",
+            "claude-sonnet-5-5",
+        ] {
+            assert!(
+                claude_invalidates_reasoning_on_prefix_rewrite(model),
+                "{model}"
+            );
+        }
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-fable-5",
+            "claude-mythos-5-1",
+            "claude-fable-6",
+            "claude-next",
+            "other",
+        ] {
+            assert!(
+                !claude_invalidates_reasoning_on_prefix_rewrite(model),
+                "{model}"
+            );
+        }
+    }
 
     #[test]
     fn adaptive_generations_classify_as_adaptive() {

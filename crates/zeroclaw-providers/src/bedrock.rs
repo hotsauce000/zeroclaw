@@ -656,9 +656,6 @@ struct ConverseResponse {
     #[serde(default)]
     output: Option<ConverseOutput>,
     #[serde(default)]
-    #[allow(dead_code)]
-    stop_reason: Option<String>,
-    #[serde(default)]
     usage: Option<BedrockUsage>,
 }
 
@@ -679,8 +676,6 @@ struct ConverseOutput {
 
 #[derive(Debug, Deserialize)]
 struct ConverseOutputMessage {
-    #[allow(dead_code)]
-    role: String,
     content: Vec<ResponseContentBlock>,
 }
 
@@ -690,7 +685,7 @@ enum ResponseContentBlock {
     ToolUse(ResponseToolUseWrapper),
     ReasoningContent(ReasoningContentWrapper),
     Text(TextBlock),
-    Other(#[allow(dead_code)] serde_json::Value),
+    Other(serde_json::Value),
 }
 
 #[derive(Debug, Deserialize)]
@@ -1023,11 +1018,12 @@ impl BedrockModelProvider {
 
     fn convert_messages(
         messages: &[ChatMessage],
+        model: &str,
     ) -> (Option<Vec<SystemBlock>>, Vec<ConverseMessage>) {
         let mut system_blocks = Vec::new();
         let mut converse_messages = Vec::new();
-        // Same boundary rule as the Anthropic adapter: only the round still in
-        // flight replays its signed reasoning.
+        // Older stripping models retain only the in-flight exchange; other
+        // models preserve signed prior turns across append-only requests.
         let last_exchange_start = messages.iter().enumerate().rev().find_map(|(index, msg)| {
             (!matches!(msg.role.as_str(), "system" | "assistant" | "tool")).then_some(index)
         });
@@ -1042,7 +1038,8 @@ impl BedrockModelProvider {
                     }
                 }
                 "assistant" => {
-                    let replay_thinking = last_exchange_start.is_some_and(|start| index > start);
+                    let replay_thinking = crate::claude_models::claude_keeps_prior_reasoning(model)
+                        || last_exchange_start.is_some_and(|start| index > start);
                     if let Some(blocks) =
                         Self::parse_assistant_tool_call_message(&msg.content, replay_thinking)
                     {
@@ -1321,8 +1318,8 @@ impl BedrockModelProvider {
 
     /// Parse assistant message containing structured tool calls.
     /// Rebuild an assistant turn's blocks from the stored envelope.
-    /// `replay_thinking` gates the signed reasoning, which only the round
-    /// still in flight may resend.
+    /// `replay_thinking` follows the selected model's history policy, retaining
+    /// prior turns where supported and current tool exchanges on older models.
     fn parse_assistant_tool_call_message(
         content: &str,
         replay_thinking: bool,
@@ -1457,6 +1454,7 @@ impl BedrockModelProvider {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
 
         if let Some(output) = response.output
@@ -1490,7 +1488,7 @@ impl BedrockModelProvider {
                             });
                         }
                     }
-                    ResponseContentBlock::Other(_) => {}
+                    ResponseContentBlock::Other(value) => drop(value),
                 }
             }
         }
@@ -1714,7 +1712,8 @@ impl ModelProvider for BedrockModelProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let auth = self.resolve_auth().await?;
 
-        let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
+        let (system_blocks, mut converse_messages) =
+            Self::convert_messages(request.messages, model);
 
         // Strip empty text ContentBlocks that would cause Bedrock 400 errors.
         Self::sanitize_empty_content_blocks(&mut converse_messages);
@@ -1812,6 +1811,73 @@ mod tests {
     use crate::traits::ChatMessage;
 
     // ── SigV4 signing tests ─────────────────────────────────────
+
+    #[test]
+    fn signed_history_replay_is_stable_across_new_user_turns() {
+        for model in [
+            "claude-opus-4-5",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-fable-5-1",
+            "us.anthropic.claude-opus-4-5-v1:0",
+            "global.anthropic.claude-sonnet-4-6-v1",
+            "claude-next",
+            "proxy-model",
+        ] {
+            for text in ["signed thought", ""] {
+                let envelope = serde_json::json!({
+                    "content": "", "tool_calls": [{"id":"call_1", "name":"shell", "arguments":"{}"}],
+                    "reasoning_content": serde_json::json!({"text":text, "signature":"retained-signature"}).to_string(),
+                }).to_string();
+                let mut history = vec![
+                    ChatMessage::user("first request"),
+                    ChatMessage::assistant(envelope),
+                    ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"done"}"#),
+                    ChatMessage::assistant("completed"),
+                ];
+                let (_, before) = BedrockModelProvider::convert_messages(&history, model);
+                history.push(ChatMessage::user("next request"));
+                let (_, after) = BedrockModelProvider::convert_messages(&history, model);
+                let assistant_rows = |messages| {
+                    let wire = serde_json::to_value(messages).unwrap();
+                    wire.as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|m| m["role"] == "assistant")
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                let before = assistant_rows(before);
+                let after = assistant_rows(after);
+                assert!(
+                    serde_json::to_string(&before)
+                        .unwrap()
+                        .contains("retained-signature"),
+                    "{model}"
+                );
+                assert_eq!(
+                    before, after,
+                    "append-only history must preserve signed blocks for {model}"
+                );
+            }
+        }
+        for model in ["claude-sonnet-4-5", "us.anthropic.claude-haiku-4-5-v1:0"] {
+            let envelope = serde_json::json!({"content":"reply", "tool_calls":[],
+                "reasoning_content":serde_json::json!({"text":"thought", "signature":"old-signature"}).to_string()}).to_string();
+            let history = vec![
+                ChatMessage::user("first"),
+                ChatMessage::assistant(envelope),
+                ChatMessage::user("next"),
+            ];
+            let (_, after) = BedrockModelProvider::convert_messages(&history, model);
+            assert!(
+                !serde_json::to_string(&after)
+                    .unwrap()
+                    .contains("old-signature"),
+                "{model}"
+            );
+        }
+    }
 
     #[test]
     fn sha256_hex_empty_string() {
@@ -2125,7 +2191,7 @@ mod tests {
             ChatMessage::system("You are helpful"),
             ChatMessage::user("Hello"),
         ];
-        let (system, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (system, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         assert!(system.is_some());
         let system_blocks = system.unwrap();
         assert_eq!(system_blocks.len(), 1);
@@ -2139,7 +2205,7 @@ mod tests {
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi there"),
         ];
-        let (system, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (system, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         assert!(system.is_none());
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
@@ -2150,7 +2216,7 @@ mod tests {
     fn convert_messages_tool_role_to_tool_result() {
         let tool_json = r#"{"tool_call_id": "call_123", "content": "Result data"}"#;
         let messages = vec![ChatMessage::tool(tool_json)];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
         assert!(matches!(msgs[0].content[0], ContentBlock::ToolResult(_)));
@@ -2160,7 +2226,7 @@ mod tests {
     fn convert_messages_assistant_tool_calls_parsed() {
         let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
         let messages = vec![ChatMessage::assistant(tool_call_json)];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "assistant");
         assert_eq!(msgs[0].content.len(), 2);
@@ -2175,7 +2241,7 @@ mod tests {
         // reject with "Expected toolResult blocks at messages.N.content".
         let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_ORPHAN", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
         let messages = vec![ChatMessage::assistant(tool_call_json)];
-        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         // Pre-condition: the converter produced an (orphaned) ToolUse block.
         assert!(
             msgs[0]
@@ -2206,7 +2272,7 @@ mod tests {
             ChatMessage::assistant(tool_call_json),
             ChatMessage::tool(tool_result_json),
         ];
-        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         BedrockModelProvider::strip_orphaned_tool_uses(&mut msgs);
         assert!(
             msgs[0]
@@ -2220,7 +2286,7 @@ mod tests {
     #[test]
     fn convert_messages_plain_assistant_text() {
         let messages = vec![ChatMessage::assistant("Just text")];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].content[0], ContentBlock::Text(_)));
     }
@@ -2703,7 +2769,7 @@ mod tests {
                 content: "not valid json".to_string(),
             },
         ];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         let tool_msg = &msgs[2];
         assert_eq!(tool_msg.role, "user");
         assert!(
@@ -2725,7 +2791,7 @@ mod tests {
                 content: "raw output with no json".to_string(),
             },
         ];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         if let ContentBlock::ToolResult(ref wrapper) = msgs[2].content[0] {
             assert_eq!(wrapper.tool_result.tool_use_id, "tool_abc");
             assert_eq!(wrapper.tool_result.status, "error");
@@ -2744,7 +2810,7 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"result 1"}"#),
             ChatMessage::tool(r#"{"tool_call_id":"t2","content":"result 2"}"#),
         ];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         // Should be: user, assistant, user (merged tool results)
         assert_eq!(msgs.len(), 3, "Expected 3 messages, got {}", msgs.len());
         assert_eq!(msgs[2].role, "user");
@@ -2865,7 +2931,7 @@ mod tests {
             },
             ChatMessage::user("Continue"),
         ];
-        let (_, converse) = BedrockModelProvider::convert_messages(&messages);
+        let (_, converse) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         let assistant_msg = &converse[1];
         assert_eq!(assistant_msg.role, "assistant");
         if let ContentBlock::Text(ref tb) = assistant_msg.content[0] {
