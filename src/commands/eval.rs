@@ -313,6 +313,7 @@ mod tests {
         config.model_routes = vec![ModelRouteConfig {
             hint: "code".to_string(),
             model_provider: "custom.routed".to_string(),
+            model: "routed-model".to_string(),
             ..ModelRouteConfig::default()
         }];
         let deps = build_run_deps(&config, Mode::Live).unwrap();
@@ -326,7 +327,7 @@ mod tests {
             .expect("factory route resolver");
         let route = resolver.resolve("hint:code");
         assert_eq!(route.provider_name, "custom.routed");
-        assert_eq!(route.model, "mock-echo");
+        assert_eq!(route.model, "routed-model");
         assert_eq!(provider.provider_name.as_deref(), Some("custom.mock"));
         assert_eq!(provider.model_name.as_deref(), Some("mock-echo"));
     }
@@ -425,6 +426,7 @@ mod tests {
         config.model_routes = vec![ModelRouteConfig {
             hint: "code".to_string(),
             model_provider: "custom.routed".to_string(),
+            model: "routed-model".to_string(),
             ..ModelRouteConfig::default()
         }];
 
