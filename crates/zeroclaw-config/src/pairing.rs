@@ -1,7 +1,7 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroclaw_macros::Configurable;
@@ -516,28 +516,49 @@ impl PairingGuard {
     /// surface loads one field without the other.
     ///
     /// A binding entry whose key is not a token hash, or whose value is not a
-    /// valid roster principal id, is skipped with a warning, so that token
-    /// does not authenticate at all. A hash listed in both fields loads as
-    /// bound, never as the shared operator. A binding to a principal the
-    /// roster no longer has still loads: the resolver refuses it.
+    /// valid roster principal id, is skipped with a warning, and so are two
+    /// entries naming one hash with different principals. The token such an
+    /// entry names does not authenticate at all, even when `paired_tokens`
+    /// lists it too: a damaged binding must never leave the shared operator
+    /// behind. A hash listed in both fields with a valid binding loads as
+    /// bound. A binding to a principal the roster no longer has still loads:
+    /// the resolver refuses it.
     pub fn from_gateway_config(gateway: &crate::schema::GatewayConfig) -> Self {
         let mut tokens: HashMap<String, PairedTokenSubject> = gateway
             .paired_tokens
             .iter()
             .map(|t| (stored_token_hash(t), PairedTokenSubject::SharedOperator))
             .collect();
+        let mut bound: HashMap<String, String> = HashMap::new();
+        let mut rejected: HashSet<String> = HashSet::new();
         let mut skipped = 0usize;
-        for (hash, principal_id) in &gateway.paired_token_users {
-            if !is_token_hash(hash) || !crate::schema::is_valid_auth_section_name(principal_id) {
+        for (key, principal_id) in &gateway.paired_token_users {
+            let hash = key.to_ascii_lowercase();
+            if !is_token_hash(key) || !crate::schema::is_valid_auth_section_name(principal_id) {
                 skipped += 1;
+                // Every form under which `paired_tokens` could hold the same
+                // token: as written, as a normalized hash, or hashed plaintext.
+                rejected.extend([key.clone(), hash, hash_token(key)]);
                 continue;
             }
-            tokens.insert(
-                hash.to_ascii_lowercase(),
-                PairedTokenSubject::RosterUser {
-                    principal_id: principal_id.clone(),
-                },
-            );
+            if bound
+                .get(&hash)
+                .is_some_and(|existing| existing != principal_id)
+            {
+                // Two spellings of one hash naming different principals:
+                // neither can be trusted.
+                skipped += 1;
+                rejected.insert(hash);
+            } else {
+                bound.insert(hash, principal_id.clone());
+            }
+        }
+        for hash in &rejected {
+            bound.remove(hash);
+            tokens.remove(hash);
+        }
+        for (hash, principal_id) in bound {
+            tokens.insert(hash, PairedTokenSubject::RosterUser { principal_id });
         }
         if skipped > 0 {
             ::zeroclaw_log::record!(
@@ -545,9 +566,9 @@ impl PairingGuard {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({ "skipped": skipped })),
-                "gateway.paired_token_users has entries that are not a token hash mapped to a \
-                 valid roster principal id; those tokens will not authenticate. Pair the \
-                 affected devices again."
+                "gateway.paired_token_users has entries that are not a token hash mapped to one \
+                 valid roster principal id; those tokens will not authenticate, even if \
+                 gateway.paired_tokens lists them. Pair the affected devices again."
             );
         }
         Self::with_tokens(gateway.require_pairing, tokens, gateway.pairing_code)
@@ -2436,6 +2457,54 @@ mod tests {
             );
         }
         assert!(guard.persisted_tokens().paired_tokens.is_empty());
+    }
+
+    /// A damaged binding must not leave the token behind as the shared
+    /// operator when `paired_tokens` lists the same token: that would widen
+    /// a roster user to full authority after a bad hand edit or restore.
+    #[test]
+    async fn a_malformed_binding_fails_closed_even_when_paired_tokens_lists_the_token() {
+        let hash = hash_token("zc_both");
+        for principal in ["not a valid id", ""] {
+            let guard =
+                PairingGuard::from_gateway_config(&gateway_with(&[&hash], &[(&hash, principal)]));
+            assert!(
+                !guard.token_is_paired("zc_both"),
+                "binding {principal:?}: the token must not authenticate at all"
+            );
+            assert!(!guard.is_authenticated("zc_both"));
+        }
+
+        // The same token as a legacy plaintext entry, bound under its
+        // plaintext instead of its hash.
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &["zc_plain"],
+            &[("zc_plain", "alice")],
+        ));
+        assert!(!guard.token_is_paired("zc_plain"));
+    }
+
+    /// Two spellings of one hash naming different principals leave no way to
+    /// know who the token belongs to, so neither binding loads.
+    #[test]
+    async fn conflicting_bindings_for_one_hash_fail_closed() {
+        let lower = hash_token("zc_split");
+        let upper = lower.to_ascii_uppercase();
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &[&lower],
+            &[(&lower, "alice"), (&upper, "bob")],
+        ));
+        assert!(!guard.token_is_paired("zc_split"));
+
+        let agreeing = PairingGuard::from_gateway_config(&gateway_with(
+            &[],
+            &[(&lower, "alice"), (&upper, "alice")],
+        ));
+        assert_eq!(
+            agreeing.subject_for_token("zc_split"),
+            Some(alice()),
+            "two spellings that agree are one binding"
+        );
     }
 
     #[test]
