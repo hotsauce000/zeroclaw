@@ -37,6 +37,7 @@ use zeroclaw_config::pairing::PairingGuard;
 use zeroclaw_config::schema::Config;
 
 use super::transport::TransportKind;
+use crate::security::auth_provider::native::identity_for_subject;
 use crate::security::auth_provider::{
     Credential, NativeAuthProvider, OidcAuthProvider, PeercredAuthProvider, ProviderRegistry,
     UidRoster,
@@ -253,9 +254,12 @@ impl AcceptedAuthState {
         pairing: &PairingGuard,
     ) -> Result<(), DenyReason> {
         let reverified = match evidence {
+            // Rebuilt from the token's live subject exactly as the native
+            // provider builds it, so a roster-bound connection revalidates
+            // as its roster principal and an unbound one as the operator.
             LocalCredentialEvidence::NativeTokenHash => native_token_hash
-                .is_some_and(|hash| pairing.token_hash_is_paired(hash))
-                .then(|| AuthenticatedIdentity::shared_operator(AuthMethod::Native)),
+                .and_then(|hash| pairing.subject_for_hash(hash))
+                .map(identity_for_subject),
             LocalCredentialEvidence::Peercred { uid }
                 if *uid == self.daemon_uid && self.trust_daemon_uid.load(Ordering::Relaxed) =>
             {
@@ -298,11 +302,7 @@ impl AcceptedAuthState {
 /// invalid policy before their first persistent write rather than after it.
 /// Pairing state does not affect whether the policy compiles.
 pub fn validate_accepted_auth_config(config: &Config) -> anyhow::Result<()> {
-    let pairing = Arc::new(PairingGuard::new(
-        config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
-        config.gateway.pairing_code,
-    ));
+    let pairing = Arc::new(PairingGuard::from_gateway_config(&config.gateway));
     let _ = AcceptedAuthState::from_config(config, pairing, 1)?;
     Ok(())
 }
@@ -349,11 +349,7 @@ impl RpcInboundAuth {
     /// Test-only permissive layer: empty auth config, fresh pairing guard.
     /// Local connections resolve through the legacy shared-operator path.
     pub fn for_tests(config: &Config) -> Arc<Self> {
-        let pairing = Arc::new(PairingGuard::new(
-            config.gateway.require_pairing,
-            &config.gateway.paired_tokens,
-            config.gateway.pairing_code,
-        ));
+        let pairing = Arc::new(PairingGuard::from_gateway_config(&config.gateway));
         Arc::new(Self::from_config(config, pairing).expect("test auth config is valid"))
     }
 
@@ -780,6 +776,122 @@ mod tests {
             auth.pairing()
                 .token_hash_is_paired(conn.native_token_hash.as_deref().unwrap())
         );
+    }
+
+    /// `alice` (Sessions:Read only) with one pairing token bound to her and
+    /// one unbound token, loaded the way the daemon loads them.
+    fn config_with_bound_token() -> Config {
+        let mut config = config_with_roster(4242);
+        config.gateway.paired_tokens = vec!["zc_shared".into()];
+        config
+            .gateway
+            .paired_token_users
+            .insert(PairingGuard::token_hash("zc_bound"), "alice".into());
+        config
+    }
+
+    fn auth_from_gateway(config: &Config) -> RpcInboundAuth {
+        RpcInboundAuth::from_config(
+            config,
+            Arc::new(PairingGuard::from_gateway_config(&config.gateway)),
+        )
+        .expect("valid")
+    }
+
+    async fn bound_connection(auth: &RpcInboundAuth) -> ConnectionAuth {
+        auth.authenticate(TransportKind::Wss, Credential::None, Some("zc_bound"), None)
+            .await
+            .expect("a bound pairing token authenticates")
+    }
+
+    #[tokio::test]
+    async fn bound_pairing_token_resolves_to_its_roster_grants() {
+        let auth = auth_from_gateway(&config_with_bound_token());
+        let conn = bound_connection(&auth).await;
+        assert_eq!(conn.principal.id.as_str(), "user:alice");
+        assert_eq!(conn.principal.auth_method, AuthMethod::Native);
+        assert!(
+            conn.principal.is_authenticated(),
+            "a bound token is a distinct, scoped principal"
+        );
+        assert!(conn.grants.permits(Resource::Sessions, Verb::Read));
+        assert!(!conn.grants.admin, "never the operator's full access");
+        assert!(!conn.grants.permits(Resource::Config, Verb::Update));
+        assert_eq!(
+            conn.native_token_hash.as_deref(),
+            Some(PairingGuard::token_hash("zc_bound").as_str()),
+            "liveness is still checked by the token's hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbound_pairing_token_beside_a_roster_stays_the_shared_operator() {
+        let auth = auth_from_gateway(&config_with_bound_token());
+        let conn = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("zc_shared"),
+                None,
+            )
+            .await
+            .expect("an unbound pairing token authenticates");
+        assert_eq!(conn.principal.id.as_str(), PrincipalId::SHARED_OPERATOR);
+        assert!(conn.grants.admin);
+    }
+
+    #[tokio::test]
+    async fn bound_connection_survives_a_policy_generation_change() {
+        let config = config_with_bound_token();
+        let auth = auth_from_gateway(&config);
+        let conn = bound_connection(&auth).await;
+
+        let mut next = config.clone();
+        next.permission_profiles
+            .insert("extra".into(), PermissionProfileConfig::default());
+        auth.refresh_from_config(&next).expect("valid refresh");
+        assert_ne!(auth.generation(), conn.generation);
+
+        let resolved = auth
+            .resolve_current(&conn)
+            .expect("the connection revalidates as its roster principal");
+        assert_eq!(resolved.principal.id.as_str(), "user:alice");
+        assert!(
+            auth.current_grants(&conn)
+                .expect("still live")
+                .permits(Resource::Sessions, Verb::Read)
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_token_of_a_removed_user_is_not_entitled() {
+        let config = config_with_bound_token();
+        let auth = auth_from_gateway(&config);
+        let conn = bound_connection(&auth).await;
+
+        let mut next = config.clone();
+        next.users.clear();
+        auth.refresh_from_config(&next).expect("valid refresh");
+
+        assert_eq!(
+            auth.resolve_current(&conn).unwrap_err(),
+            DenyReason::NotEntitled,
+            "an established connection loses its grants, it never widens"
+        );
+        let denied = auth
+            .authenticate(TransportKind::Wss, Credential::None, Some("zc_bound"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code, FORBIDDEN, "a fresh handshake is refused too");
+    }
+
+    #[tokio::test]
+    async fn revoking_a_bound_token_ends_its_connection() {
+        let auth = auth_from_gateway(&config_with_bound_token());
+        let conn = bound_connection(&auth).await;
+        assert!(auth.pairing().revoke_token("zc_bound"));
+        let denied = auth.credential_is_live(&conn).unwrap_err();
+        assert_eq!(denied.code, AUTH_REQUIRED);
     }
 
     #[tokio::test]
