@@ -2824,9 +2824,9 @@ mod tests {
         assert!(!ch.pending_approvals.lock().await.contains_key("scoped"));
 
         // A token with no pending approval remains ordinary inbound text.
-        let envelope = make_envelope(Some("+1111111111"), Some("unknown yes"));
+        let envelope = make_envelope(Some("+1111111111"), Some("absent yes"));
         ch.dispatch_envelope(envelope, tx, false).await;
-        assert_eq!(rx.recv().await.unwrap().content, "unknown yes");
+        assert_eq!(rx.recv().await.unwrap().content, "absent yes");
     }
 
     #[tokio::test]

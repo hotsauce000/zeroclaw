@@ -46117,7 +46117,7 @@ This is an example JSON object for profile settings."#;
         }
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Signal"),
             "every alias sharing one normalized Signal endpoint/account must be rejected; \
@@ -46146,7 +46146,7 @@ This is an example JSON object for profile settings."#;
         }
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Signal"),
             "proxy routing must not make duplicate endpoint/account listeners safe"
@@ -46170,7 +46170,7 @@ This is an example JSON object for profile settings."#;
         }
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert_eq!(
             channels
                 .iter()
