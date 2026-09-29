@@ -8,7 +8,7 @@ use zeroclaw_config::scattered_types::EvalHarnessConfig;
 use zeroclaw_eval::baseline::SuiteKind;
 use zeroclaw_eval::case::load_suite;
 use zeroclaw_eval::grader::evaluate_expects;
-use zeroclaw_eval::record::{RunCompletion, ToolSurface};
+use zeroclaw_eval::record::ToolSurface;
 use zeroclaw_eval::runner::case_provenance;
 use zeroclaw_eval::{LlmTrace, RecordedCall, RunDeps, RunRecord, run_case, run_suite};
 
