@@ -378,14 +378,17 @@ fn display_name(raw: &str) -> String {
 /// A version or `name@version` install identity as shown in the row and the
 /// detail. The row interpolates versions into a sentence, and an identity
 /// names a package, so only an allowlisted token is shown as is: non-empty
-/// printable ASCII within [`MAX_DISPLAY_CHARS`], which covers SemVer versions
-/// and valid identities. Anything else is shown escaped and quoted, so an
-/// unvalidated registry value can never add words such as "installed" to the
-/// row or pass for another package's identity.
+/// printable ASCII other than a quote or backslash, within
+/// [`MAX_DISPLAY_CHARS`], which covers SemVer versions and valid identities.
+/// Anything else is shown escaped and quoted, so an unvalidated registry value
+/// can never add words such as "installed" to the row, pass for another
+/// package's identity, or look like the quoted form of a different value.
 fn display_token(raw: &str) -> String {
     let token = !raw.is_empty()
         && raw.len() <= MAX_DISPLAY_CHARS
-        && raw.bytes().all(|byte| byte.is_ascii_graphic());
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'));
     if token { raw.to_string() } else { quoted(raw) }
 }
 
@@ -1647,6 +1650,12 @@ mod tests {
             "0.2.0-beta.1+build.7"
         );
         assert_eq!(display_safe("a\u{2800}b"), "a\u{fffd}b");
+
+        // A raw value spelled like the quoted form of another value is
+        // itself quoted, so the two never render the same.
+        let spelled_quoted = r#""1.0.0\u{20}""#;
+        assert_eq!(display_token("1.0.0 "), spelled_quoted);
+        assert_eq!(display_token(spelled_quoted), r#""\"1.0.0\\u{20}\"""#);
 
         // The install identity names a package, so a lookalike is quoted
         // instead of reading as the real package's identity.

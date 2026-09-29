@@ -31,8 +31,8 @@ Keybindings use canonical modifier names: `control` is literal Control, `primary
 ## Plugins sub-tab
 
 The Config pane has three sub-tabs: `zeroclaw` for the daemon's settings,
-`zerocode` for zerocode's own settings, and `plugins`. `Tab` and `Shift+Tab`
-move between them by default, and clicking a sub-tab name selects it.
+`zerocode` for zerocode's own settings, and `plugins`. `Tab` moves to the
+next sub-tab by default, and clicking a sub-tab name selects it.
 
 The `plugins` sub-tab is a read-only view of the connected daemon's plugin
 catalog, the same package catalog the dashboard's Plugins page shows. It lists
