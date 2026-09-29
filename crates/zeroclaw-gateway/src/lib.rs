@@ -6481,6 +6481,39 @@ path = "{trigger_path}"
         );
     }
 
+    /// The `user` binding arrives through axum's query parsing exactly as the
+    /// CLI sends it (`POST /admin/paircode/new?user=<name>`), not only
+    /// through a hand-built `AdminPaircodeQuery`.
+    #[tokio::test]
+    async fn admin_paircode_route_binds_the_user_named_in_the_query() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let app = Router::new()
+            .route("/admin/paircode/new", post(handle_admin_paircode_new))
+            .with_state(state.clone())
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            ));
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/admin/paircode/new?user=alice")
+            .body(Body::empty())
+            .unwrap();
+        request.headers_mut().extend(admin_headers(&state));
+
+        let (status, json) = json_of(app.oneshot(request).await.unwrap().into_response()).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["user"], "alice");
+        assert_eq!(json["principal_id"], "user:alice");
+        assert_eq!(
+            state
+                .pairing
+                .pending_pairing_code()
+                .map(|(_, subject)| subject),
+            Some(alice())
+        );
+    }
+
     #[tokio::test]
     async fn admin_paircode_new_rejects_an_unknown_user_and_mints_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();

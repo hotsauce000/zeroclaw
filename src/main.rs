@@ -10815,14 +10815,7 @@ async fn fetch_paircode(
     let client = reqwest::Client::new();
 
     let response = if action.mints_code() {
-        let mut url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
-        if let Some(rotate) = action.rotate_query() {
-            url.push_str("?rotate=");
-            url.push_str(&urlencoding::encode(&rotate));
-        } else if let Some(user) = action.user_query() {
-            url.push_str("?user=");
-            url.push_str(&urlencoding::encode(user));
-        }
+        let url = admin_paircode_new_url(host, port, path_prefix, action);
         client
             .post(&url)
             .header(
@@ -10970,6 +10963,26 @@ fn binding_unconfirmed_message(user: &str) -> String {
             "The gateway did not confirm the code is bound to user {user}, so it is not shown."
         ),
     )
+}
+
+/// The minting request for `action`: `rotate` or `user`, never both (the
+/// actions that carry them are distinct), each percent-encoded.
+#[cfg(feature = "agent-runtime")]
+fn admin_paircode_new_url(
+    host: &str,
+    port: u16,
+    path_prefix: Option<&str>,
+    action: &PaircodeAction,
+) -> String {
+    let mut url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
+    if let Some(rotate) = action.rotate_query() {
+        url.push_str("?rotate=");
+        url.push_str(&urlencoding::encode(&rotate));
+    } else if let Some(user) = action.user_query() {
+        url.push_str("?user=");
+        url.push_str(&urlencoding::encode(user));
+    }
+    url
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -15561,6 +15574,34 @@ mod tests {
         assert!(
             !msg.contains(&generic_hint),
             "the generic rotation hint must not follow a withheld replacement: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn a_user_code_request_carries_the_encoded_user_query() {
+        assert_eq!(
+            admin_paircode_new_url(
+                "127.0.0.1",
+                42617,
+                Some("/gw"),
+                &PaircodeAction::AddUserClient("alice".into())
+            ),
+            "http://127.0.0.1:42617/gw/admin/paircode/new?user=alice"
+        );
+        assert!(
+            admin_paircode_new_url(
+                "127.0.0.1",
+                42617,
+                None,
+                &PaircodeAction::AddUserClient("a&rotate=all".into())
+            )
+            .ends_with("?user=a%26rotate%3Dall"),
+            "a name cannot smuggle a second parameter"
+        );
+        assert_eq!(
+            admin_paircode_new_url("127.0.0.1", 42617, None, &PaircodeAction::AddClient),
+            "http://127.0.0.1:42617/admin/paircode/new"
         );
     }
 
