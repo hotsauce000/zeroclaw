@@ -159,8 +159,9 @@ impl<'ast> Visit<'ast> for GuardFromPairedTokens {
 }
 
 /// Whether an expression reads a `paired_tokens` field. Only the gateway
-/// section and its persisted form carry one, and loading either through
-/// `PairingGuard::new` would drop the roster-bound tokens.
+/// section and its persisted form carry a token list that could be passed to
+/// `PairingGuard::new`, and loading either that way would drop the
+/// roster-bound tokens.
 struct ReadsPairedTokens(bool);
 
 impl<'ast> Visit<'ast> for ReadsPairedTokens {

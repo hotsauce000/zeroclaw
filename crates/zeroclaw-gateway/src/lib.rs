@@ -1944,7 +1944,8 @@ pub async fn run_gateway_with_plugin_webhooks(
         // Reconcile the registry against the canonical paired-token set so that
         // tokens paired via the legacy `/pair` route (and any other historical
         // orphans) become visible and revocable in the management UI. The token
-        // set itself stays owned by `PairingGuard`/`gateway.paired_tokens`.
+        // set itself stays owned by `PairingGuard` and its persisted form,
+        // `gateway.paired_tokens` plus `gateway.paired_token_users`.
         match registry.reconcile_from_token_hashes(&pairing.tokens()) {
             Ok(0) => {}
             Ok(n) => ::zeroclaw_log::record!(

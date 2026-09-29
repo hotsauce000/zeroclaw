@@ -200,7 +200,8 @@ Examples:
         rotate: bool,
 
         /// Revoke a single device's bearer token by id, then issue a new code
-        /// that pairs as the device did (none if that cannot be determined)
+        /// that pairs as the device did (none when its token was already
+        /// revoked or its roster user is gone)
         #[arg(long, value_name = "DEVICE_ID", conflicts_with_all = ["new", "rotate"])]
         rotate_device: Option<String>,
 

@@ -12,9 +12,10 @@
 //! to that scoped roster principal. A bearer presented with the
 //! `X-ZeroClaw-Auth-Provider` header naming an `oidc.<alias>` provider is
 //! verified by that provider and resolved to a scoped principal. A scoped
-//! principal's Config grants gate the request. Provider selection is explicit, mirroring the RPC handshake's
-//! `auth_provider` field: the named provider's denial is authoritative,
-//! and there is no fallback between providers.
+//! principal's Config grants gate the request. Provider selection is
+//! explicit, mirroring the RPC handshake's `auth_provider` field: the named
+//! provider's denial is authoritative, and there is no fallback between
+//! providers.
 //!
 //! Grants are enforced in two places. The route layer applies a coarse
 //! floor per HTTP method (a read needs `Read`; anything else needs some
