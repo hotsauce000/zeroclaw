@@ -226,7 +226,6 @@ gated suite test grades every committed fixture against an empty run and
 requires at least one failed check, so a case that certifies no behavior cannot
 join the required gate.
 
-
 Report aggregation independently requires at least one grade, so an in-memory
 caller cannot manufacture a green case from an empty grade vector.
 
