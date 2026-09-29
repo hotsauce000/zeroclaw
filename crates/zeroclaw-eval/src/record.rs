@@ -31,17 +31,6 @@ pub fn duration_millis_saturating(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::duration_millis_saturating;
-    use std::time::Duration;
-
-    #[test]
-    fn duration_millis_saturates_at_u64_max() {
-        assert_eq!(duration_millis_saturating(Duration::MAX), u64::MAX);
-    }
-}
-
 impl RunRecord {
     /// Names of tools actually dispatched, in call order.
     pub fn tool_names(&self) -> Vec<&str> {
@@ -54,5 +43,16 @@ impl RunRecord {
     /// Whether every dispatched tool call succeeded (vacuously true if none).
     pub fn all_tools_succeeded(&self) -> bool {
         self.tool_calls.iter().all(|call| call.success)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::duration_millis_saturating;
+    use std::time::Duration;
+
+    #[test]
+    fn duration_millis_saturates_at_u64_max() {
+        assert_eq!(duration_millis_saturating(Duration::MAX), u64::MAX);
     }
 }
