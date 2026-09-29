@@ -48302,6 +48302,7 @@ thinking_display = "verbose"
                     ..Default::default()
                 },
                 server_fallback_models: vec!["claude-fable-5".to_string()],
+                ..Default::default()
             },
         );
 
@@ -48322,6 +48323,7 @@ thinking_display = "verbose"
                     ..Default::default()
                 },
                 server_fallback_models: vec!["claude-opus-4-8".to_string()],
+                ..Default::default()
             },
         );
 
