@@ -6747,6 +6747,7 @@ mod sop_step_reassembly_tests {
             max_tool_iterations,
             None,
             None,
+            None,
         )
         .await
     }
@@ -7027,6 +7028,7 @@ mod sop_step_reassembly_tests {
             CancellationToken::new(),
             10,
             Some(&security),
+            None,
             None,
         )
         .await;
