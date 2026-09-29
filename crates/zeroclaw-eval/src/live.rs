@@ -265,6 +265,7 @@ pub async fn run_live_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<R
         provider,
         provider_name,
         model_name,
+        model_route_resolver,
         finish_turn: _,
     } = (deps.provider)(trace)?;
     // Resolve the dispatcher from the provider's capabilities so XML-dialect
@@ -296,6 +297,9 @@ pub async fn run_live_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<R
     }
     if let Some(ptype) = provider_name {
         builder = builder.model_provider_name(ptype);
+    }
+    if let Some(resolver) = model_route_resolver {
+        builder = builder.model_route_resolver(resolver);
     }
     let mut agent = builder.build()?;
 
@@ -953,6 +957,7 @@ mod tests {
                     }),
                     provider_name: Some("testprov".to_string()),
                     model_name: Some("model-under-test".to_string()),
+                    model_route_resolver: None,
                     finish_turn: None,
                 })
             }),

@@ -35,6 +35,9 @@ pub struct CaseProvider {
     /// Sets `Agent::builder().model_name(..)` when present; this is the value
     /// passed to every `provider.chat` call for the built agent.
     pub model_name: Option<String>,
+    /// The factory-owned resolver shared with the provider. Forward the same
+    /// handle to the agent so route metadata comes from its dispatch owner.
+    pub model_route_resolver: Option<Arc<zeroclaw_providers::router::ModelRouteResolver>>,
     /// Replay-only per-turn exhaustion boundary; `None` for live.
     pub finish_turn: Option<FinishTurnFn>,
 }
@@ -46,6 +49,7 @@ impl CaseProvider {
             provider,
             provider_name: None,
             model_name: None,
+            model_route_resolver: None,
             finish_turn: None,
         }
     }
@@ -85,6 +89,7 @@ impl RunDeps {
                     provider: Box::new(provider),
                     provider_name: None,
                     model_name: None,
+                    model_route_resolver: None,
                     finish_turn: Some(Box::new(move |turn_index| handle.finish_turn(turn_index))),
                 })
             }),
