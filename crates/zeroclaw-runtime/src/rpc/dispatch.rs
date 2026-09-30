@@ -12284,6 +12284,18 @@ mod tests {
             peer.auth.is_none(),
             "a failed revalidation still drops the binding"
         );
+        let next = peer
+            .authorize(
+                Method::SessionList,
+                zeroclaw_api::grants::Resource::Sessions,
+                zeroclaw_api::grants::Verb::Read,
+            )
+            .expect_err("the connection must initialize again");
+        assert_eq!(
+            next.reason(),
+            crate::rpc::auth::RpcDenialReason::NotInitialized,
+            "later requests on the connection are refused as not initialized"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]

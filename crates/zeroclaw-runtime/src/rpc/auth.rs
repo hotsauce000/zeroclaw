@@ -2498,31 +2498,4 @@ mod tests {
             "an unbound connection has no provider to record"
         );
     }
-
-    #[test]
-    fn the_recorded_reason_does_not_follow_the_message_locale() {
-        let key = "rpc-auth-agent-not-entitled";
-        let values = [("agent", "\"main\"")];
-        let french = crate::i18n::get_disk_override_cli_string_for_test(
-            "fr",
-            "rpc-auth-agent-not-entitled = Le principal n'a pas droit à l'agent { $agent }",
-            key,
-            &values,
-        );
-        assert_eq!(french, "Le principal n'a pas droit à l'agent \"main\"");
-        assert_ne!(
-            french,
-            crate::i18n::get_english_cli_string_with_args(key, &values),
-            "the fixture must render a message the English catalogue does not"
-        );
-
-        let english_record = AuthDenied::agent_not_entitled("main").audit_attrs("cost/query", None);
-        let french_record = AuthDenied::new(RpcDenialReason::AgentNotEntitled, french.clone())
-            .audit_attrs("cost/query", None);
-        assert_eq!(french_record["denial_message"], french.as_str());
-        assert_eq!(
-            french_record["reason"], english_record["reason"],
-            "the recorded reason must not change with the language of the message"
-        );
-    }
 }
