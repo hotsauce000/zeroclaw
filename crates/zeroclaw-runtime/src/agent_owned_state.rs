@@ -217,6 +217,12 @@ async fn committed_residue_exists(
         return true;
     }
 
+    if crate::control_plane::SqliteTaskStore::count_existing_by_agent(&config.data_dir, alias)
+        .map_or(true, |count| count > 0)
+    {
+        return true;
+    }
+
     match AcpSessionStore::new(&config.data_dir) {
         Ok(store) => {
             if store
@@ -251,13 +257,21 @@ async fn committed_residue_exists(
 
     let knowledge_path = config.knowledge.resolved_db_path();
     match inspect_lifecycle_path(&knowledge_path).await {
-        PathPresence::Present => match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
-            &knowledge_path,
-            config.knowledge.max_nodes,
-        ) {
-            Ok(graph) if graph.count_owner(alias).unwrap_or(1) > 0 => return true,
+        // Recovery probes can run under config-writer serialization. Never
+        // initialize/migrate the graph here (live effects lock graph -> config).
+        PathPresence::Present => match prepare_knowledge_retirement(config, alias) {
+            Ok(Some(snapshot)) => {
+                if ["nodes", "edges"].iter().any(|key| {
+                    snapshot
+                        .get(key)
+                        .and_then(serde_json::Value::as_array)
+                        .is_none_or(|rows| !rows.is_empty())
+                }) {
+                    return true;
+                }
+            }
             Err(_) => return true,
-            Ok(_) => {}
+            Ok(None) => {}
         },
         PathPresence::Uninspectable(_) => return true,
         PathPresence::Absent => {}
@@ -465,6 +479,7 @@ pub struct OwnedStateReport {
     pub cron_removed: usize,
     pub acp_removed: usize,
     pub sessions_cleared: usize,
+    pub control_plane_tasks_removed: usize,
     pub archived_to: Option<String>,
     /// Surfaced failures (export / purge / delete errors). Non-empty means part
     /// of the cascade did NOT complete — those rows were not silently treated as
@@ -523,8 +538,37 @@ static KNOWLEDGE_ARCHIVE_PAUSES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
+pub(crate) fn pause_knowledge_archive_under(
+    root: PathBuf,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived, reached) = tokio::sync::oneshot::channel();
+    let (resume, wait) = tokio::sync::oneshot::channel();
+    assert!(
+        KNOWLEDGE_ARCHIVE_PAUSES
+            .lock()
+            .unwrap()
+            .insert(
+                root,
+                KnowledgeArchivePause {
+                    arrived,
+                    resume: wait
+                }
+            )
+            .is_none()
+    );
+    (reached, resume)
+}
+
+#[cfg(test)]
 async fn wait_at_knowledge_archive(path: &Path) {
-    let pause = KNOWLEDGE_ARCHIVE_PAUSES.lock().unwrap().remove(path);
+    let pause = {
+        let mut pauses = KNOWLEDGE_ARCHIVE_PAUSES.lock().unwrap();
+        let key = pauses.keys().find(|root| path.starts_with(root)).cloned();
+        key.and_then(|key| pauses.remove(&key))
+    };
     if let Some(pause) = pause {
         pause.arrived.send(()).unwrap();
         pause.resume.await.unwrap();
@@ -785,6 +829,30 @@ pub async fn cascade_owned_state_with_retirement(
         None => 0,
     };
 
+    let control_plane_tasks_removed = if config.data_dir.join("control_plane.db").exists() {
+        let data_dir = config.data_dir.clone();
+        let alias = alias.to_string();
+        match tokio::task::spawn_blocking(move || {
+            crate::control_plane::SqliteTaskStore::new(&data_dir)?
+                .delete_by_agent(&alias)
+                .map(|count| count as usize)
+        })
+        .await
+        {
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) => {
+                warnings.push(format!("control-plane task delete: {error}"));
+                0
+            }
+            Err(error) => {
+                warnings.push(format!("control-plane task delete task failed: {error}"));
+                0
+            }
+        }
+    } else {
+        0
+    };
+
     if !warnings.is_empty() {
         ::zeroclaw_log::record!(
             WARN,
@@ -802,6 +870,7 @@ pub async fn cascade_owned_state_with_retirement(
         cron_removed,
         acp_removed,
         sessions_cleared,
+        control_plane_tasks_removed,
         archived_to: Some(archive_dir.display().to_string()),
         warnings,
     };
@@ -815,6 +884,7 @@ pub async fn cascade_owned_state_with_retirement(
         "cron_jobs": report.cron_removed,
         "acp_sessions": report.acp_removed,
         "sessions_cleared": report.sessions_cleared,
+        "control_plane_tasks": report.control_plane_tasks_removed,
         "warnings": report.warnings,
     });
     match serde_json::to_vec_pretty(&manifest).context("serialize cascade manifest") {
@@ -1055,6 +1125,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn knowledge_residue_probe_under_writer_does_not_wait_for_sqlite_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = knowledge_lifecycle_config(&tmp);
+        config.memory.backend = "none".into();
+        let path = config.knowledge.resolved_db_path();
+        drop(zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(&path, 100).unwrap());
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let writer = authority.config_write_lock();
+        let _guard = writer.lock().await;
+        let before = std::time::Instant::now();
+        assert!(committed_delete_residue_exists(&config, None, None, "retired").await);
+        assert!(
+            before.elapsed() < std::time::Duration::from_secs(1),
+            "read-only probe must fail immediately on contention"
+        );
+        connection.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[tokio::test]
     async fn knowledge_old_schema_retirement_migrates_then_retry_converges() {
         use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1078,6 +1171,19 @@ mod tests {
             .unwrap();
         rusqlite::Connection::open(&path).unwrap().execute_batch("DROP TRIGGER edges_insertion_generation; ALTER TABLE edges DROP COLUMN generation;").unwrap();
         assert!(prepare_knowledge_retirement(&config, "retired").is_err());
+        assert!(committed_delete_residue_exists(&config, None, None, "retired").await);
+        let generation_columns: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('edges') WHERE name='generation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            generation_columns, 0,
+            "residue probe must not migrate under writer"
+        );
         // The cascade opens/migrates outside config locking, but cannot purge
         // from evidence that was unavailable before lifecycle serialization ended.
         let first =
@@ -1461,6 +1567,11 @@ mod tests {
             data_dir: tmp.path().join("data"),
             ..Default::default()
         };
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .into_owned();
         config.memory.backend = "none".to_string();
         config.gateway.session_persistence = false;
         config.channels.session_persistence = false;
@@ -1594,8 +1705,14 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = Config {
             data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
             ..Default::default()
         };
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .into_owned();
         config.memory.backend = "none".to_string();
         config.gateway.session_persistence = false;
         config.channels.session_persistence = false;
@@ -1632,6 +1749,11 @@ mod tests {
             data_dir: tmp.path().join("data"),
             ..Default::default()
         };
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .into_owned();
         config.memory.backend = "none".to_string();
         config.gateway.session_persistence = false;
         config.channels.session_persistence = false;

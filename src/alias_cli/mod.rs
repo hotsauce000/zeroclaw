@@ -355,12 +355,229 @@ async fn save(config: &mut Config) -> Result<()> {
         .context("failed to persist config")
 }
 
+#[cfg(feature = "agent-runtime")]
+pub(crate) enum AgentMutationRoute {
+    Daemon(serde_json::Value),
+    Offline(zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard),
+}
+
+#[cfg(feature = "agent-runtime")]
+pub(crate) async fn route_agent_mutation(
+    config: &mut Config,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<AgentMutationRoute> {
+    match zeroclaw_runtime::rpc::local::call_local(config, method, params).await {
+        Ok(result) => Ok(AgentMutationRoute::Daemon(result)),
+        Err(zeroclaw_runtime::rpc::local::LocalRpcCallError::Unavailable { path, source })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            let ownership =
+                zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(
+                    &config.data_dir,
+                )
+                .map_err(|error| {
+                    anyhow::Error::msg(format!(
+                        "daemon endpoint {} is unavailable, but offline config ownership could not be acquired: {error}",
+                        path.display()
+                    ))
+                })?;
+            let expected_path = config.config_path.clone();
+            let fresh = Box::pin(Config::load_or_init())
+                .await
+                .context("reload config after acquiring offline lifecycle ownership")?;
+            anyhow::ensure!(
+                fresh.config_path == expected_path,
+                "config path changed while acquiring lifecycle ownership ({} -> {})",
+                expected_path.display(),
+                fresh.config_path.display()
+            );
+            *config = fresh;
+            Ok(AgentMutationRoute::Offline(ownership))
+        }
+        Err(error) => Err(anyhow::Error::msg(format!(
+            "refusing offline agent mutation because daemon coordination failed: {error}"
+        ))),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn print_daemon_create(value: serde_json::Value) -> Result<()> {
+    let result: zeroclaw_runtime::rpc::types::ConfigMapKeyCreateResult =
+        serde_json::from_value(value).context("decode daemon agent-create response")?;
+    if result.created {
+        println!(
+            "{}",
+            mta(
+                "cli-alias-created",
+                &[
+                    ("section", result.path.as_str()),
+                    ("alias", result.key.as_str())
+                ],
+                "created {$section}.{$alias}"
+            )
+        );
+    } else {
+        println!(
+            "{}",
+            mta(
+                "cli-alias-exists",
+                &[
+                    ("section", result.path.as_str()),
+                    ("alias", result.key.as_str())
+                ],
+                "{$section}.{$alias} already exists (no change)"
+            )
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+fn print_daemon_rename(value: serde_json::Value) -> Result<()> {
+    let result: zeroclaw_runtime::rpc::types::ConfigMapKeyRenameResult =
+        serde_json::from_value(value).context("decode daemon agent-rename response")?;
+    let count = result.rewritten.to_string();
+    println!(
+        "{}",
+        mta(
+            "cli-alias-renamed",
+            &[
+                ("section", result.path.as_str()),
+                ("from", result.from.as_str()),
+                ("to", result.to.as_str()),
+                ("count", count.as_str())
+            ],
+            "renamed {$section}.{$from} -> {$section}.{$to} (rewrote {$count} reference path(s))"
+        )
+    );
+    for warning in result.warnings {
+        eprintln!(
+            "{}",
+            mta(
+                "cli-alias-warn",
+                &[("warning", warning.as_str())],
+                "warning: {$warning}"
+            )
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+fn print_daemon_delete_preview(value: serde_json::Value) -> Result<()> {
+    let result: zeroclaw_runtime::rpc::types::AgentDeletePreviewResult =
+        serde_json::from_value(value).context("decode daemon agent-delete preview")?;
+    if result.allowed {
+        let count = result.scrubs.len().to_string();
+        println!(
+            "{}",
+            mta(
+                "cli-alias-impact-scrub-header",
+                &[
+                    ("section", "agents"),
+                    ("alias", result.alias.as_str()),
+                    ("count", count.as_str())
+                ],
+                "deleting {$section}.{$alias} would scrub {$count} reference(s):"
+            )
+        );
+    } else {
+        let count = result.blockers.len().to_string();
+        println!(
+            "{}",
+            mta(
+                "cli-alias-impact-blocked-header",
+                &[
+                    ("section", "agents"),
+                    ("alias", result.alias.as_str()),
+                    ("count", count.as_str())
+                ],
+                "deleting {$section}.{$alias} is BLOCKED by {$count} hard reference(s):"
+            )
+        );
+        for blocker in result.blockers {
+            println!(
+                "  {}",
+                mta(
+                    "cli-alias-impact-blocker",
+                    &[("path", blocker.as_str())],
+                    "x {$path} (hard reference)"
+                )
+            );
+        }
+    }
+    for scrub in result.scrubs {
+        println!(
+            "  {}",
+            mta(
+                "cli-alias-impact-scrub",
+                &[("path", scrub.as_str())],
+                "- {$path} (would be scrubbed)"
+            )
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+fn print_daemon_delete(value: serde_json::Value) -> Result<()> {
+    let result: zeroclaw_runtime::rpc::types::AgentDeleteResult =
+        serde_json::from_value(value).context("decode daemon agent-delete response")?;
+    if !result.deleted {
+        bail!(
+            "{}",
+            result
+                .error
+                .unwrap_or_else(|| format!("agent `{}` was not deleted", result.alias))
+        );
+    }
+    let count = result.scrubbed.to_string();
+    println!(
+        "{}",
+        mta(
+            "cli-alias-deleted",
+            &[
+                ("section", "agents"),
+                ("alias", result.alias.as_str()),
+                ("count", count.as_str())
+            ],
+            "deleted {$section}.{$alias} (scrubbed {$count} reference(s))"
+        )
+    );
+    for warning in result.warnings {
+        eprintln!(
+            "{}",
+            mta(
+                "cli-alias-warn",
+                &[("warning", warning.as_str())],
+                "warning: {$warning}"
+            )
+        );
+    }
+    Ok(())
+}
+
 // ── agents ──────────────────────────────────────────────────────────────────
 
 pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<()> {
     match cmd {
         AgentsCommands::List => list_section(config, "agents"),
         AgentsCommands::Create { alias } => {
+            #[cfg(feature = "agent-runtime")]
+            let _offline_ownership = match route_agent_mutation(
+                config,
+                "config/map-key-create",
+                serde_json::json!({ "path": "agents", "key": alias }),
+            )
+            .await?
+            {
+                AgentMutationRoute::Daemon(value) => return print_daemon_create(value),
+                AgentMutationRoute::Offline(ownership) => ownership,
+            };
             create_entry(config, "agents", &alias)?;
             save(config).await
         }
@@ -390,6 +607,17 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
                     );
                 }
             }
+            #[cfg(feature = "agent-runtime")]
+            let _offline_ownership = match route_agent_mutation(
+                config,
+                "config/map-key-rename",
+                serde_json::json!({ "path": "agents", "from": from, "to": to }),
+            )
+            .await?
+            {
+                AgentMutationRoute::Daemon(value) => return print_daemon_rename(value),
+                AgentMutationRoute::Offline(ownership) => ownership,
+            };
             // Capture the workspace path while the `from` entry still exists
             // (custom paths are read off the entry, which the rename moves).
             let old_ws = config.agent_workspace_dir(&from);
@@ -424,6 +652,36 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
                     )
                 );
             }
+            #[cfg(feature = "agent-runtime")]
+            let _offline_ownership = {
+                let method = if dry_run || !yes {
+                    "agents/delete-preview"
+                } else {
+                    "agents/delete"
+                };
+                match route_agent_mutation(config, method, serde_json::json!({ "alias": alias }))
+                    .await?
+                {
+                    AgentMutationRoute::Daemon(value) => {
+                        if dry_run {
+                            return print_daemon_delete_preview(value);
+                        }
+                        if !yes {
+                            print_daemon_delete_preview(value)?;
+                            println!(
+                                "\n{}",
+                                mt(
+                                    "cli-alias-no-changes",
+                                    "No changes made. Re-run with --yes to apply (or --dry-run to preview)."
+                                )
+                            );
+                            return Ok(());
+                        }
+                        return print_daemon_delete(value);
+                    }
+                    AgentMutationRoute::Offline(ownership) => ownership,
+                }
+            };
             if dry_run {
                 print_impact(&AliasKind::Agent, &alias, config);
                 return Ok(());
@@ -452,7 +710,14 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             if config.agent(&alias).is_none() {
                 let workspace = config.agent_workspace_dir(&alias);
                 if agent_delete_residue_exists(config, &alias).await {
-                    return agent_delete_owned_state(config, &alias, &workspace, retirement).await;
+                    return agent_delete_owned_state(
+                        config,
+                        &alias,
+                        &workspace,
+                        retirement,
+                        build_owned_state_handles(config)?,
+                    )
+                    .await;
                 }
             }
             // Resolve the workspace dir while the entry still exists (a custom
@@ -460,9 +725,11 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             // change before any irreversible owned-state side effects — so a
             // later failure can't leave the config and owned state split.
             let workspace = config.agent_workspace_dir(&alias);
+            let owned_state_handles = build_owned_state_handles(config)?;
             apply_delete(config, &AliasKind::Agent, &alias)?;
             save(config).await?;
-            agent_delete_owned_state(config, &alias, &workspace, retirement).await
+            agent_delete_owned_state(config, &alias, &workspace, retirement, owned_state_handles)
+                .await
         }
     }
 }
@@ -498,6 +765,9 @@ type OwnedStateHandles = (
     Option<std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
 );
 
+#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+type OwnedStateHandles = ();
+
 #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
 fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
     use std::sync::Arc;
@@ -523,8 +793,22 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
     Ok((mem, session_backend))
 }
 
+#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+fn build_owned_state_handles(_config: &Config) -> Result<OwnedStateHandles> {
+    Ok(())
+}
+
 #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
 fn agent_delete_precheck(config: &Config, alias: &str) -> Result<()> {
+    if !alias_refs::plan_delete(config, &AliasKind::Agent, alias).allowed {
+        bail!(
+            "{}",
+            mt(
+                "cli-alias-delete-refused-hint",
+                "delete refused — resolve the hard references first"
+            )
+        );
+    }
     // Fail closed: refuse if live ACP sessions exist, or if the store can't be
     // read to verify (mirrors the gateway delete gate).
     let live = zeroclaw_runtime::agent_owned_state::live_acp_session_count(config, alias)
@@ -576,11 +860,11 @@ async fn run_agent_delete_cascade(
     alias: &str,
     workspace: &std::path::Path,
     retirement: Result<Option<serde_json::Value>, String>,
+    (mem, session_backend): OwnedStateHandles,
 ) -> Result<(
     zeroclaw_runtime::agent_owned_state::AgentDeletionArchive,
     zeroclaw_runtime::agent_owned_state::OwnedStateReport,
 )> {
-    let (mem, session_backend) = build_owned_state_handles(config)?;
     // Archive the workspace dir alongside the owned-state exports through the
     // shared runtime helper, so this surface gets the same exclusive archive
     // leaf as the gateway and RPC (a duplicate delete cannot truncate the first
@@ -609,8 +893,10 @@ async fn agent_delete_owned_state(
     alias: &str,
     workspace: &std::path::Path,
     retirement: Result<Option<serde_json::Value>, String>,
+    handles: OwnedStateHandles,
 ) -> Result<()> {
-    let (archive, report) = run_agent_delete_cascade(config, alias, workspace, retirement).await?;
+    let (archive, report) =
+        run_agent_delete_cascade(config, alias, workspace, retirement, handles).await?;
     let archive_dir = archive.path;
     for warning in &archive.warnings {
         eprintln!(
@@ -660,6 +946,7 @@ async fn agent_delete_owned_state(
     _alias: &str,
     _workspace: &std::path::Path,
     _retirement: Result<Option<serde_json::Value>, String>,
+    _handles: OwnedStateHandles,
 ) -> Result<()> {
     warn_agent_owned_state();
     Ok(())
@@ -1014,6 +1301,29 @@ mod tests {
         assert!(config.agents.contains_key("target"));
     }
 
+    #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+    fn isolated_cli_lifecycle_root(test_name: &str) -> Option<std::path::PathBuf> {
+        if std::env::var("ZEROCLAW_ALIAS_TEST_CHILD").ok().as_deref() == Some(test_name) {
+            return Some(std::path::PathBuf::from(
+                std::env::var_os("ZEROCLAW_CONFIG_DIR").unwrap(),
+            ));
+        }
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env("ZEROCLAW_ALIAS_TEST_CHILD", test_name)
+            .env("ZEROCLAW_CONFIG_DIR", root.path())
+            .env("ZEROCLAW_DATA_DIR", root.path().join("data"))
+            .env_remove("ZEROCLAW_WORKSPACE")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated canonical CLI config resolver failed"
+        );
+        None
+    }
+
     /// Committed-delete recovery, CLI surface. `zeroclaw agents delete` persists
     /// the config removal before running the owned-state cascade, and that
     /// cascade refuses to purge when its durable archive cannot be written. The
@@ -1024,18 +1334,23 @@ mod tests {
     #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
     #[tokio::test]
     async fn agent_delete_retry_after_cascade_failure_converges_on_the_cli() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(tmp) = isolated_cli_lifecycle_root(
+            "alias_cli::tests::agent_delete_retry_after_cascade_failure_converges_on_the_cli",
+        ) else {
+            return;
+        };
         let mut config = Config {
-            config_path: tmp.path().join("config.toml"),
-            data_dir: tmp.path().join("data"),
+            config_path: tmp.as_path().join("config.toml"),
+            data_dir: tmp.as_path().join("data"),
             ..Default::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config.knowledge.db_path = tmp
-            .path()
+            .as_path()
             .join("knowledge.db")
             .to_string_lossy()
             .to_string();
+        config.save().await.unwrap();
 
         // Block archive creation so the first cascade cannot cross the
         // export-then-purge gate.
@@ -1069,6 +1384,7 @@ mod tests {
             "victim",
             &workspace,
             prepare_knowledge_retirement(&config, "victim"),
+            build_owned_state_handles(&config).unwrap(),
         )
         .await
         .expect("a refused cascade is still a completed call");
@@ -1137,10 +1453,14 @@ mod tests {
     #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
     #[tokio::test]
     async fn agent_delete_retries_unreadable_workspace_before_alias_reuse_on_the_cli() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(tmp) = isolated_cli_lifecycle_root(
+            "alias_cli::tests::agent_delete_retries_unreadable_workspace_before_alias_reuse_on_the_cli",
+        ) else {
+            return;
+        };
         let mut config = Config {
-            config_path: tmp.path().join("config.toml"),
-            data_dir: tmp.path().join("data"),
+            config_path: tmp.as_path().join("config.toml"),
+            data_dir: tmp.as_path().join("data"),
             ..Default::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
@@ -1148,10 +1468,11 @@ mod tests {
         config.gateway.session_persistence = false;
         config.channels.session_persistence = false;
         config.knowledge.db_path = tmp
-            .path()
+            .as_path()
             .join("knowledge.db")
             .to_string_lossy()
             .to_string();
+        config.save().await.unwrap();
 
         // Committed-delete shape: `agents.victim` is already gone, only the
         // workspace still lags behind.
@@ -1179,6 +1500,7 @@ mod tests {
             "victim",
             &workspace,
             prepare_knowledge_retirement(&config, "victim"),
+            build_owned_state_handles(&config).unwrap(),
         )
         .await
         .expect("a refused archive is still a completed call");
@@ -1233,18 +1555,23 @@ mod tests {
     #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
     #[tokio::test]
     async fn agent_delete_without_residue_still_fails_on_the_cli() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(tmp) = isolated_cli_lifecycle_root(
+            "alias_cli::tests::agent_delete_without_residue_still_fails_on_the_cli",
+        ) else {
+            return;
+        };
         let mut config = Config {
-            config_path: tmp.path().join("config.toml"),
-            data_dir: tmp.path().join("data"),
+            config_path: tmp.as_path().join("config.toml"),
+            data_dir: tmp.as_path().join("data"),
             ..Default::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config.knowledge.db_path = tmp
-            .path()
+            .as_path()
             .join("knowledge.db")
             .to_string_lossy()
             .to_string();
+        config.save().await.unwrap();
 
         assert!(
             !agent_delete_residue_exists(&config, "ghost").await,
@@ -1263,6 +1590,89 @@ mod tests {
         assert!(
             err.to_string().contains("ghost"),
             "the localized failure must identify the requested alias, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn agent_mutation_fails_closed_when_owner_has_no_rpc_endpoint() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("data"),
+            ..Config::default()
+        };
+        let _owner = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone()).unwrap();
+
+        let error = route_agent_mutation(
+            &mut config,
+            "config/map-key-create",
+            serde_json::json!({ "path": "agents", "key": "blocked" }),
+        )
+        .await
+        .err()
+        .expect("offline mutation must not bypass a live owner");
+
+        assert!(
+            error
+                .to_string()
+                .contains("ownership could not be acquired")
+        );
+        assert!(!config.agents.contains_key("blocked"));
+    }
+
+    #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+    #[tokio::test]
+    async fn final_agent_delete_retains_the_predelete_memory_backend_for_cleanup() {
+        use std::sync::Arc;
+        use zeroclaw_api::memory_traits::{Memory, MemoryCategory};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("data"),
+            ..Config::default()
+        };
+        config.memory.backend = "sqlite".to_string();
+        config.agents.insert(
+            "victim".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+
+        let workspace = config.agent_workspace_dir("victim");
+        let handles = build_owned_state_handles(&config).unwrap();
+        let retained_memory = Arc::clone(&handles.0);
+        let agent_id = retained_memory.ensure_agent_uuid("victim").await.unwrap();
+        retained_memory
+            .store_with_agent(
+                "owned-row",
+                "must be purged",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&agent_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retained_memory.count().await.unwrap(), 1);
+
+        apply_delete(&mut config, &AliasKind::Agent, "victim").unwrap();
+        assert!(config.agents.is_empty());
+        agent_delete_owned_state(
+            &config,
+            "victim",
+            &workspace,
+            prepare_knowledge_retirement(&config, "victim"),
+            handles,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            retained_memory.count().await.unwrap(),
+            0,
+            "deleting the final configured agent must still purge its durable memory rows"
         );
     }
 }
