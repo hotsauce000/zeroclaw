@@ -255,7 +255,8 @@ pub enum RenameRecoveryError {
     /// `from` is configured again while its rename to `to` is unfinished: an
     /// agent brought back around the create guards (a hand edit, say) would
     /// take over whatever the rename still owes `to`, so nothing moves until
-    /// the operator removes it or abandons the rename.
+    /// the operator removes it or abandons the rename. Display leaves `to`
+    /// out: a request naming another target must not learn the pending one.
     SourceReconfigured { from: String, to: String },
     /// A store could not be read, so whether a rename is unfinished, or state
     /// is left under an alias, is unknown.
@@ -284,9 +285,9 @@ impl fmt::Display for RenameRecoveryError {
                 f,
                 "agent `{to}` is the target of an unfinished rename; re-run that rename first"
             ),
-            Self::SourceReconfigured { from, to } => write!(
+            Self::SourceReconfigured { from, .. } => write!(
                 f,
-                "agent `{from}` is configured again while its rename to `{to}` is unfinished; remove `[agents.{from}]` from the config by hand, or abandon the rename, then retry"
+                "agent `{from}` is configured again while an earlier rename of it is unfinished; remove `[agents.{from}]` from the config by hand, or abandon that rename, then retry"
             ),
             Self::Unreadable { store, detail } => write!(f, "{store} could not be read: {detail}"),
             Self::Busy { detail } => write!(
@@ -2942,7 +2943,12 @@ mod tests {
         }
         assert_eq!(
             refusals[0].to_string(),
-            "agent `scout` is configured again while its rename to `ranger` is unfinished; remove `[agents.scout]` from the config by hand, or abandon the rename, then retry"
+            "agent `scout` is configured again while an earlier rename of it is unfinished; remove `[agents.scout]` from the config by hand, or abandon that rename, then retry"
+        );
+        assert!(
+            !refusals[3].to_string().contains(TO),
+            "a request naming another target must not learn the pending one: {}",
+            refusals[3]
         );
         assert!(source.join("MEMORY.md").is_file(), "nothing moved");
         assert!(!after.default_agent_workspace_dir(TO).exists());
@@ -3576,7 +3582,7 @@ mod tests {
                 from: FROM.into(),
                 to: TO.into(),
             }),
-            "agent `scout` is configured again while its rename to `ranger` is unfinished; remove `[agents.scout]` from the config by hand, or abandon the rename, then retry"
+            "agent `scout` is configured again while an earlier rename of it is unfinished; remove `[agents.scout]` from the config by hand, or abandon that rename, then retry"
         );
         let conflict = FollowerIssue::conflict(FollowerKind::Memory, "taken".into());
         assert_eq!(conflict.to_string(), "taken");
