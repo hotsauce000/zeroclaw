@@ -12054,12 +12054,38 @@ mod tests {
     /// process-wide audit log binds a principal (`user:<user>`) that no
     /// concurrently running test emits records for.
     fn roster_config_as(user: &str, uid: u32) -> zeroclaw_config::schema::Config {
-        let mut config = roster_config(uid);
+        rename_alice_to(roster_config(uid), user)
+    }
+
+    /// `config` with its roster user `alice` renamed to `user`.
+    fn rename_alice_to(
+        mut config: zeroclaw_config::schema::Config,
+        user: &str,
+    ) -> zeroclaw_config::schema::Config {
         let entry = config
             .users
             .remove("alice")
-            .expect("roster_config binds alice");
+            .expect("the fixture roster binds alice");
         config.users.insert(user.to_string(), entry);
+        config
+    }
+
+    /// `roster_config_as` with the user's profile granting `resource:verb`
+    /// and nothing else.
+    fn roster_config_granting(
+        user: &str,
+        uid: u32,
+        resource: zeroclaw_api::grants::Resource,
+        verb: zeroclaw_api::grants::Verb,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = roster_config_as(user, uid);
+        config.permission_profiles.insert(
+            "reader".into(),
+            zeroclaw_config::schema::PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(resource, vec![verb])]),
+                ..zeroclaw_config::schema::PermissionProfileConfig::default()
+            },
+        );
         config
     }
 
@@ -12146,6 +12172,23 @@ mod tests {
         );
     }
 
+    /// Take the log writer and hook locks, then subscribe to the process-wide
+    /// log broadcast and drain its backlog. Keep all three for the whole
+    /// test: the locks stop another test from swapping the broadcast sender
+    /// while this one reads denial records from it.
+    fn capture_denials() -> (
+        impl Drop,
+        impl Drop,
+        tokio::sync::broadcast::Receiver<Value>,
+    ) {
+        let writer = zeroclaw_log::__private_test_writer_lock();
+        let hook = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut records = zeroclaw_log::subscribe_or_install();
+        while records.try_recv().is_ok() {}
+        (writer, hook, records)
+    }
+
     /// The attributes of the first "RPC authorization denied" record in
     /// `records` attributed to `principal` for `method`.
     ///
@@ -12192,17 +12235,28 @@ mod tests {
         }
     }
 
+    /// Assert that `response` refuses with `code`, and that `record`, its
+    /// audit record, carries `reason`, the same code and message, and the
+    /// peercred roster principal `principal`.
+    fn assert_refusal_audited(
+        response: &Value,
+        record: &Value,
+        code: i32,
+        reason: &str,
+        principal: &str,
+    ) {
+        assert_eq!(response["error"]["code"], json!(code), "{response}");
+        assert_eq!(record["reason"], reason, "{record}");
+        assert_eq!(record["code"], json!(code), "{record}");
+        assert_eq!(record["principal_id"], principal, "{record}");
+        assert_eq!(record["auth_provider"], "peercred", "{record}");
+        assert_eq!(record["message"], response["error"]["message"], "{record}");
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn denial_after_failed_revalidation_keeps_the_principal_it_dropped() {
-        // Hold the writer and hook locks for the whole test so no other test
-        // swaps the broadcast sender while this one reads from it.
-        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
-        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
-        zeroclaw_log::try_install_capture_subscriber();
-        let mut records = zeroclaw_log::subscribe_or_install();
-        while records.try_recv().is_ok() {}
-
+        let (_writer, _hook, mut records) = capture_denials();
         let ctx = enforcement_ctx(roster_config_as("revalidation-audit", 4242));
         let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
 
@@ -12212,23 +12266,154 @@ mod tests {
             .refresh_from_config(&zeroclaw_config::schema::Config::default())
             .expect("the default config is a valid refresh");
         let response = rpc(&mut peer, &mut rx, 1, "session/list", json!({})).await;
-        let error = &response["error"];
-        assert_eq!(error["code"], json!(AUTH_REQUIRED), "{response}");
 
         // The record names the principal whose binding was just dropped, not
         // the unbound connection left behind.
         let record = denial_record(&mut records, "user:revalidation-audit", "session/list");
-        assert_eq!(
-            record["principal_id"], "user:revalidation-audit",
-            "{record}"
+        assert_refusal_audited(
+            &response,
+            &record,
+            AUTH_REQUIRED,
+            "bad_credential",
+            "user:revalidation-audit",
         );
-        assert_eq!(record["auth_provider"], "peercred", "{record}");
-        assert_eq!(record["reason"], "bad_credential", "{record}");
-        assert_eq!(record["code"], json!(AUTH_REQUIRED), "{record}");
-        assert_eq!(record["message"], error["message"], "{record}");
         assert!(
             peer.auth.is_none(),
             "a failed revalidation still drops the binding"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn missing_grant_denial_is_audited_as_grant_missing() {
+        let (_writer, _hook, mut records) = capture_denials();
+        // A write the gate failed to refuse must land in the tempdir, not in
+        // the default config path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = roster_config_as("grant-missing-audit", 4242);
+        config.config_path = tmp.path().join("config.toml");
+        let ctx = enforcement_ctx(config);
+        let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let params = json!({"prop": "gateway.port", "value": 1});
+        let response = rpc(&mut peer, &mut rx, 1, "config/set", params).await;
+        let record = denial_record(&mut records, "user:grant-missing-audit", "config/set");
+        assert_refusal_audited(
+            &response,
+            &record,
+            FORBIDDEN,
+            "grant_missing",
+            "user:grant-missing-audit",
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn ungranted_config_path_denial_is_audited_as_config_path_not_granted() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let (_writer, _hook, mut records) = capture_denials();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config =
+            roster_config_granting("config-path-audit", 4242, Resource::Config, Verb::Update);
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .config_write_paths = vec!["cron.*".into()];
+        let ctx = enforcement_ctx(config);
+        let port = ctx.config.read().gateway.port;
+        let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let params = json!({"prop": "gateway.port", "value": 1});
+        let response = rpc(&mut peer, &mut rx, 1, "config/set", params).await;
+        let record = denial_record(&mut records, "user:config-path-audit", "config/set");
+        assert_refusal_audited(
+            &response,
+            &record,
+            FORBIDDEN,
+            "config_path_not_granted",
+            "user:config-path-audit",
+        );
+        assert_eq!(ctx.config.read().gateway.port, port, "nothing changed");
+        assert!(
+            !tmp.path().join("config.toml").exists(),
+            "nothing was persisted"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn unentitled_agent_denial_is_audited_as_agent_not_entitled() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let (_writer, _hook, mut records) = capture_denials();
+        let config = roster_config_granting("agent-audit", 4242, Resource::Cost, Verb::Read);
+        let ctx = enforcement_ctx(config);
+        let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let params = json!({"agent": "main"});
+        let response = rpc(&mut peer, &mut rx, 1, "cost/query", params).await;
+        let record = denial_record(&mut records, "user:agent-audit", "cost/query");
+        assert_refusal_audited(
+            &response,
+            &record,
+            FORBIDDEN,
+            "agent_not_entitled",
+            "user:agent-audit",
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn scoped_global_stream_denial_is_audited_as_global_stream_scoped() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let (_writer, _hook, mut records) = capture_denials();
+        let config =
+            roster_config_granting("global-stream-audit", 4242, Resource::Logs, Verb::Read);
+        let ctx = enforcement_ctx(config);
+        let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(&mut peer, &mut rx, 1, "logs/subscribe", json!({})).await;
+        let record = denial_record(&mut records, "user:global-stream-audit", "logs/subscribe");
+        assert_refusal_audited(
+            &response,
+            &record,
+            FORBIDDEN,
+            "global_stream_scoped",
+            "user:global-stream-audit",
+        );
+    }
+
+    /// The client is answered exactly as for a missing job, so the refusal is
+    /// no existence oracle; only the audit record names the owning agent.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn foreign_cron_job_denial_is_audited_with_its_owner_but_answered_as_not_found() {
+        let (_writer, _hook, mut records) = capture_denials();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = rename_alice_to(cron_roster_config_in(&tmp, 4242), "cron-owner-audit");
+        let beta = seed_cron_job(&config, "beta", "beta-job");
+        let ctx = enforcement_ctx(config.clone());
+        let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let refused = rpc(&mut peer, &mut rx, 1, "cron/get", json!({"id": beta.id})).await;
+        crate::cron::remove_job(&config, &beta.id).expect("the fixture job is removable");
+        let missing = rpc(&mut peer, &mut rx, 2, "cron/get", json!({"id": beta.id})).await;
+        assert_eq!(refused["error"]["code"], json!(INVALID_PARAMS), "{refused}");
+        assert_eq!(refused["error"], missing["error"], "{refused} vs {missing}");
+
+        let record = denial_record(&mut records, "user:cron-owner-audit", "cron/get");
+        assert_eq!(record["reason"], "cron_job_agent_not_entitled", "{record}");
+        assert_eq!(record["code"], json!(INVALID_PARAMS), "{record}");
+        assert_eq!(record["principal_id"], "user:cron-owner-audit", "{record}");
+        assert_eq!(record["auth_provider"], "peercred", "{record}");
+        assert_ne!(record["message"], refused["error"]["message"], "{record}");
+        assert!(
+            record["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("beta")),
+            "the record names the owning agent: {record}"
         );
     }
 
