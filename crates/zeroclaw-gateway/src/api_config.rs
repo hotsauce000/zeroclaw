@@ -1471,6 +1471,30 @@ pub async fn handle_delete_map_key(
     .into_response()
 }
 
+/// Why an unfinished rename refuses deleting `alias`, if it does. The rename
+/// still owes state moves into its target and out of its retired alias, and
+/// deleting either agent now would purge that state before it has moved. A
+/// journal that cannot be read may hold such a rename, so that refuses too.
+/// Only a configured alias is checked: one that is not configured is refused
+/// as missing. The delete and its plan both report this refusal.
+async fn agent_delete_recovery_refusal(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+) -> Option<zeroclaw_runtime::agent_rename_recovery::RenameRecoveryError> {
+    use zeroclaw_runtime::agent_rename_recovery::{
+        ensure_alias_not_retired, ensure_not_pending_target,
+    };
+    if !config.agents.contains_key(alias) {
+        return None;
+    }
+    if let Err(e) = Box::pin(ensure_not_pending_target(config, alias)).await {
+        return Some(e);
+    }
+    Box::pin(ensure_alias_not_retired(config, alias))
+        .await
+        .err()
+}
+
 /// Agent-deletion cascade: refuse an agent an unfinished rename still owes
 /// state to or from, and refuse on HARD references (enabled `heartbeat.agent`
 /// or live ACP sessions), else scrub config refs + remove the entry via
@@ -1483,9 +1507,6 @@ async fn delete_agent_cascade(
     mut lifecycle_lease: zeroclaw_runtime::live_config_authority::AgentDeleteLease,
 ) -> Response {
     use zeroclaw_config::alias_refs::{self, AliasKind, CascadePolicy};
-    use zeroclaw_runtime::agent_rename_recovery::{
-        ensure_alias_not_retired, ensure_not_pending_target,
-    };
 
     let preflight_config = state.config.read().clone();
     let preflight_alias = alias.to_string();
@@ -1498,18 +1519,9 @@ async fn delete_agent_cascade(
     let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let mut working = state.config.read().clone();
 
-    // An unfinished rename still owes state moves into its target and out of
-    // its retired alias, and deleting either agent now would purge that state
-    // before it has moved. A journal that cannot be read may hold such a
-    // rename, so that refuses too. An alias that is not configured is left to
-    // the preflight below to report.
-    if working.agents.contains_key(alias) {
-        if let Err(e) = Box::pin(ensure_not_pending_target(&working, alias)).await {
-            return agent_recovery_error_response("agents", alias, &e);
-        }
-        if let Err(e) = Box::pin(ensure_alias_not_retired(&working, alias)).await {
-            return agent_recovery_error_response("agents", alias, &e);
-        }
+    // Refused before the preflight below and before any side effect.
+    if let Some(e) = agent_delete_recovery_refusal(&working, alias).await {
+        return agent_recovery_error_response("agents", alias, &e);
     }
 
     let preflight = zeroclaw_runtime::agent_lifecycle::plan_agent_delete_with_acp_count(
@@ -1881,7 +1893,8 @@ pub async fn handle_delete_plan(
     State(state): State<AppState>,
     Query(q): Query<MapKeyQuery>,
 ) -> Response {
-    let config = state.config.read().clone();
+    // Boxed: the snapshot is held across the recovery check's await below.
+    let config = Box::new(state.config.read().clone());
     let to_dto = |s: &zeroclaw_config::alias_refs::RefSite| RefSiteDto {
         path: s.path.clone(),
         raw_value: s.raw_value.clone(),
@@ -1918,12 +1931,28 @@ pub async fn handle_delete_plan(
     let lifecycle_blocker = is_agent
         .then(|| state.agent_lifecycle.delete_blocker(&q.key))
         .flatten();
-    let allowed = plan.allowed && (!is_agent || live_acp == Some(0)) && lifecycle_blocker.is_none();
+    // The same refusal the delete makes for an agent an unfinished rename
+    // still owes state to or from.
+    let recovery_blocker = if is_agent {
+        agent_delete_recovery_refusal(&config, &q.key).await
+    } else {
+        None
+    };
+    let allowed = plan.allowed
+        && (!is_agent || live_acp == Some(0))
+        && lifecycle_blocker.is_none()
+        && recovery_blocker.is_none();
     let mut blockers: Vec<RefSiteDto> = plan.blockers.iter().map(to_dto).collect();
     if let Some(blocker) = lifecycle_blocker {
         blockers.push(RefSiteDto {
             path: format!("agents.{}", q.key),
             raw_value: blocker.to_string(),
+        });
+    }
+    if let Some(refusal) = recovery_blocker {
+        blockers.push(RefSiteDto {
+            path: format!("agents.{}", q.key),
+            raw_value: refusal.to_string(),
         });
     }
     axum::Json(DeletePlanResponse {
@@ -2230,9 +2259,10 @@ fn agent_recovery_error_response(
 /// record; a rename whose commit already landed resumes without writing the
 /// config again. Either way the state kept under the old alias then converges
 /// with the config write lock released, and the record closes only once
-/// nothing is left behind. State that has not followed yet comes back as
-/// warnings on a successful response: the config commit stands, the old alias
-/// stays retired, and re-issuing the same rename finishes the move.
+/// nothing is left behind. State that has not followed yet, or a converge
+/// that failed outright, comes back as warnings on a successful response: the
+/// config commit stands, the old alias stays retired, and re-issuing the same
+/// rename finishes the move.
 async fn rename_agent_cascade(
     state: &AppState,
     principal: &RequestPrincipal,
@@ -2386,10 +2416,31 @@ async fn rename_agent_cascade(
     let outcome = match job.await {
         Ok(Ok(Ok(outcome))) => outcome,
         Ok(Ok(Err(e))) => {
-            return error_response(
-                ConfigApiError::new(ConfigApiCode::InternalError, e.to_string())
-                    .with_path(format!("{}.{from}", body.path)),
+            // The config commit stands, now or from an earlier run, so the
+            // rename happened: only its followers could not converge. The
+            // failure is reported as the rename's warning, and re-issuing the
+            // same rename resumes it.
+            let warning = e.to_string();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "from": from,
+                        "to": to,
+                        "dirty_paths": dirty_count,
+                        "error": warning,
+                    })),
+                "agent rename committed but its owned state could not converge; re-issue the same rename to converge"
             );
+            return axum::Json(RenameMapKeyResponse {
+                path: body.path.clone(),
+                from: from.clone(),
+                to: to.clone(),
+                renamed: true,
+                warnings: vec![warning],
+            })
+            .into_response();
         }
         Ok(Err(error)) => return error,
         Err(error) => {
@@ -4566,6 +4617,68 @@ mod tests {
                 .is_some(),
             "the old alias stays retired until the workspace converges"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_rename_converge_failure_after_the_commit_is_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.agents.insert(
+            "from".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.entry("default".into()).or_default();
+        config.runtime_profiles.entry("default".into()).or_default();
+        let journal =
+            zeroclaw_config::agent_recovery_journal::AgentRecoveryJournal::for_config(&config);
+
+        let state = crate::api::test_state(config.clone());
+        let gate = test_pre_save_pause_gate::arm(config.config_path.clone());
+        let task_state = state.clone();
+        let request = zeroclaw_spawn::spawn!(handle_rename_map_key(
+            State(task_state),
+            None,
+            axum::Json(RenameMapKeyBody {
+                path: "agents".to_string(),
+                from: "from".to_string(),
+                to: "to".to_string(),
+            }),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_paused())
+            .await
+            .expect("the rename reaches its persist with the record armed");
+        // The commit is about to land; a journal that can no longer be read
+        // fails the converge that follows it.
+        std::fs::write(journal.path(), b"not a recovery journal").unwrap();
+        gate.release();
+        let response = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .expect("the rename finishes")
+            .expect("the rename task joins");
+        let (status, json) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::OK, "the config commit stands: {json}");
+        assert_eq!(json["renamed"], true, "{json}");
+        let warnings: Vec<&str> = json["warnings"]
+            .as_array()
+            .expect("the converge failure is reported as a warning")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            warnings.iter().any(|w| w.contains("could not be read")),
+            "{warnings:?}"
+        );
+        assert!(state.config.read().agents.contains_key("to"));
+        assert!(!state.config.read().agents.contains_key("from"));
     }
 
     #[tokio::test]

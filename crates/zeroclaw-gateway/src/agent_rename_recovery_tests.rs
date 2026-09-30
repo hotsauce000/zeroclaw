@@ -18,7 +18,8 @@ use zeroclaw_runtime::rpc::transport::{RpcTransport, TransportKind};
 
 use crate::api::test_state;
 use crate::api_config::{
-    MapKeyQuery, RenameMapKeyBody, handle_delete_map_key, handle_map_key, handle_rename_map_key,
+    MapKeyQuery, RenameMapKeyBody, handle_delete_map_key, handle_delete_plan, handle_map_key,
+    handle_rename_map_key,
 };
 
 fn fixture(dir: &std::path::Path, alias: &str) -> Config {
@@ -102,8 +103,50 @@ async fn delete_agent(state: &crate::AppState, alias: &str) -> (StatusCode, serd
     response_json(response).await
 }
 
+async fn delete_plan(state: &crate::AppState, alias: &str) -> (StatusCode, serde_json::Value) {
+    let response = Box::pin(handle_delete_plan(
+        State(state.clone()),
+        Query(MapKeyQuery {
+            path: "agents".into(),
+            key: alias.into(),
+        }),
+    ))
+    .await;
+    response_json(response).await
+}
+
+/// Bring the alias a rename retired back into the live config, as a hand edit
+/// would, around the create guards.
+fn configure_again(state: &crate::AppState, alias: &str) {
+    state.config.write().agents.insert(
+        alias.to_string(),
+        AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        },
+    );
+}
+
 fn message_of(json: &serde_json::Value) -> String {
     json["message"].as_str().unwrap_or("").to_string()
+}
+
+/// Whether a refusal says an unfinished rename is why: the alias is retired,
+/// or a rename is still converging into it.
+fn names_the_unfinished_rename(message: &str) -> bool {
+    message.contains("retired") || message.contains("unfinished rename")
+}
+
+/// Assert an RPC response is the refusal an unfinished rename makes: invalid
+/// params, with a message that says why.
+fn assert_rpc_rename_refusal(response: &serde_json::Value) {
+    assert_eq!(
+        response["error"]["code"],
+        zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS,
+        "{response}"
+    );
+    let message = response["error"]["message"].as_str().unwrap_or("");
+    assert!(names_the_unfinished_rename(message), "{response}");
 }
 
 struct PipeTransport {
@@ -581,6 +624,12 @@ async fn deleting_the_target_of_an_unfinished_rename_is_refused() {
         zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS,
         "rpc refuses the same delete: {deleted}"
     );
+    assert!(
+        deleted["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("target of an unfinished rename")),
+        "rpc names the same refusal: {deleted}"
+    );
 }
 
 #[tokio::test]
@@ -632,6 +681,12 @@ async fn deleting_a_retired_alias_re_added_by_hand_is_refused() {
         zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS,
         "rpc refuses the same delete: {deleted}"
     );
+    assert!(
+        deleted["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("retired by an unfinished agent rename")),
+        "rpc names the same refusal: {deleted}"
+    );
 }
 
 #[tokio::test]
@@ -646,12 +701,15 @@ async fn refusals_of_a_retired_alias_never_name_the_pending_target() {
     let hidden = "agent_b";
     let (status, json) = create_agent(&state, "agent_a").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert!(names_the_unfinished_rename(&message_of(&json)), "{json}");
     assert!(!json.to_string().contains(hidden), "create: {json}");
     let (status, json) = rename(&state, "agent_c", "agent_a").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert!(names_the_unfinished_rename(&message_of(&json)), "{json}");
     assert!(!json.to_string().contains(hidden), "rename onto: {json}");
     let (status, json) = rename(&state, "agent_a", "agent_d").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert!(names_the_unfinished_rename(&message_of(&json)), "{json}");
     assert!(!json.to_string().contains(hidden), "rename away: {json}");
 
     let live = state.config.read().clone();
@@ -678,7 +736,134 @@ async fn refusals_of_a_retired_alias_never_name_the_pending_target() {
     .await;
     for id in [2, 3, 4] {
         let refused = rpc_by_id(&messages, id);
-        assert!(refused.get("error").is_some(), "{refused}");
+        assert_rpc_rename_refusal(&refused);
         assert!(!refused.to_string().contains(hidden), "rpc {id}: {refused}");
     }
+}
+
+#[tokio::test]
+async fn a_rename_whose_old_alias_is_configured_again_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, old_ws, _blocker) = blocked_rename(tmp.path()).await;
+    configure_again(&state, "agent_a");
+
+    let (status, json) = rename(&state, "agent_a", "agent_b").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(json["code"], "validation_failed", "{json}");
+    assert!(message_of(&json).contains("configured again"), "{json}");
+    assert!(
+        old_ws.join("marker").is_file(),
+        "nothing moves while the old alias is configured again"
+    );
+    {
+        let live = state.config.read();
+        assert!(live.agents.contains_key("agent_a"));
+        assert!(live.agents.contains_key("agent_b"));
+    }
+
+    let live = state.config.read().clone();
+    let messages = rpc_roundtrip(
+        live,
+        vec![(
+            2,
+            "config/map-key-rename".into(),
+            serde_json::json!({"path": "agents", "from": "agent_a", "to": "agent_b"}),
+        )],
+    )
+    .await;
+    let refused = rpc_by_id(&messages, 2);
+    assert_eq!(
+        refused["error"]["code"],
+        zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS,
+        "{refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("configured again")),
+        "{refused}"
+    );
+    assert!(old_ws.join("marker").is_file());
+}
+
+/// An unfinished rename of `agent_a` to `agent_b` with `agent_a` configured
+/// again by hand, next to `agent_c`, which no rename owns.
+async fn previewed_rename(dir: &std::path::Path) -> crate::AppState {
+    let (state, _old_ws, _blocker) = blocked_rename(dir).await;
+    configure_again(&state, "agent_a");
+    let (created_status, created_json) = create_agent(&state, "agent_c").await;
+    assert!(created_status.is_success(), "{created_json}");
+    state
+}
+
+#[tokio::test]
+async fn the_delete_plan_reports_the_refusal_the_delete_makes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = previewed_rename(tmp.path()).await;
+
+    // The pending target and the retired alias configured again are both
+    // refused by the delete, so the plan reports each as blocked.
+    for alias in ["agent_b", "agent_a"] {
+        let (status, json) = delete_plan(&state, alias).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["allowed"], false, "{alias}: {json}");
+        let blockers = json["blockers"].as_array().cloned().unwrap_or_default();
+        assert!(
+            blockers.iter().any(|blocker| blocker["raw_value"]
+                .as_str()
+                .is_some_and(names_the_unfinished_rename)),
+            "{alias}: the plan names the refusal: {json}"
+        );
+    }
+    // An agent no unfinished rename owns stays deletable.
+    let (status, json) = delete_plan(&state, "agent_c").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["allowed"], true, "{json}");
+}
+
+#[tokio::test]
+async fn the_rpc_delete_preview_reports_the_refusal_the_delete_makes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = previewed_rename(tmp.path()).await;
+
+    // The daemon's preview blocks the pending target and the retired alias
+    // configured again, and still allows the agent no rename owns.
+    let live = state.config.read().clone();
+    let messages = rpc_roundtrip(
+        live,
+        vec![
+            (
+                2,
+                "agents/delete-preview".into(),
+                serde_json::json!({"alias": "agent_b"}),
+            ),
+            (
+                3,
+                "agents/delete-preview".into(),
+                serde_json::json!({"alias": "agent_a"}),
+            ),
+            (
+                4,
+                "agents/delete-preview".into(),
+                serde_json::json!({"alias": "agent_c"}),
+            ),
+        ],
+    )
+    .await;
+    for id in [2, 3] {
+        let preview = rpc_by_id(&messages, id);
+        assert_eq!(preview["result"]["allowed"], false, "{preview}");
+        let blockers = preview["result"]["blockers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.as_str().is_some_and(names_the_unfinished_rename)),
+            "the rpc preview names the refusal: {preview}"
+        );
+    }
+    let preview = rpc_by_id(&messages, 4);
+    assert_eq!(preview["result"]["allowed"], true, "{preview}");
 }

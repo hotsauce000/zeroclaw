@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use zeroclaw_config::agent_recovery_journal::AgentRecoveryJournal;
 use zeroclaw_config::alias_refs::{self, AliasKind};
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::{Memory, SqliteMemory};
@@ -454,6 +455,122 @@ async fn agents_create_of_a_retired_alias_names_the_rename_to_rerun() {
         !configured_agents(tmp.path()).contains(&"agent_a".to_string()),
         "a refused create writes nothing"
     );
+}
+
+/// Whether the recovery journal under `dir` holds the rename of `agent_a` to
+/// `agent_b`.
+fn rename_is_recorded(dir: &Path) -> bool {
+    AgentRecoveryJournal::for_data_dir(&dir.join("data"))
+        .load()
+        .unwrap()
+        .iter()
+        .any(|record| record.from == "agent_a" && record.to == "agent_b")
+}
+
+#[tokio::test]
+async fn agents_rename_abandon_drops_the_record_and_frees_the_old_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (old_ws, _blocker) = leave_rename_unfinished(tmp.path()).await;
+    assert!(
+        rename_is_recorded(tmp.path()),
+        "the unfinished rename leaves its recovery record"
+    );
+
+    let abandoned = run_agents(tmp.path(), &["rename", "agent_a", "agent_b", "--abandon"]);
+    let abandoned_text = text_of(&abandoned);
+    assert!(abandoned.status.success(), "{abandoned_text}");
+    assert!(
+        abandoned_text.contains("the old default workspace of `agent_a`"),
+        "the state still kept under the old alias is listed: {abandoned_text}"
+    );
+    assert!(
+        abandoned_text.contains("dropped the unfinished rename of agent_a to agent_b"),
+        "{abandoned_text}"
+    );
+    assert!(!rename_is_recorded(tmp.path()), "the record is gone");
+    assert!(old_ws.join("marker").is_file(), "abandoning moves nothing");
+
+    let created = run_agents(tmp.path(), &["create", "agent_a"]);
+    assert!(
+        created.status.success(),
+        "the old alias can be created again: {}",
+        text_of(&created)
+    );
+    assert!(configured_agents(tmp.path()).contains(&"agent_a".to_string()));
+
+    let again = run_agents(tmp.path(), &["rename", "agent_a", "agent_b", "--abandon"]);
+    let again_text = text_of(&again);
+    assert!(!again.status.success(), "{again_text}");
+    assert!(
+        again_text.contains("there is no unfinished rename of `agent_a` to `agent_b` to abandon"),
+        "{again_text}"
+    );
+}
+
+#[tokio::test]
+async fn agents_rename_of_an_old_alias_configured_again_points_at_abandon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (old_ws, _blocker) = leave_rename_unfinished(tmp.path()).await;
+    // A hand edit brings the retired alias back around the create guards.
+    let config_path = tmp.path().join("config.toml");
+    let mut saved = std::fs::read_to_string(&config_path).unwrap();
+    saved.push_str("\n[agents.agent_a]\nrisk_profile = \"default\"\n");
+    std::fs::write(&config_path, saved).unwrap();
+    assert!(configured_agents(tmp.path()).contains(&"agent_a".to_string()));
+
+    let refused = run_agents(tmp.path(), &["rename", "agent_a", "agent_b"]);
+    let refused_text = text_of(&refused);
+    assert!(!refused.status.success(), "{refused_text}");
+    assert!(
+        refused_text.contains("zeroclaw agents rename agent_a agent_b --abandon"),
+        "the refusal names the way out: {refused_text}"
+    );
+    assert!(
+        old_ws.join("marker").is_file(),
+        "nothing moves while the old alias is configured again"
+    );
+
+    let abandoned = run_agents(tmp.path(), &["rename", "agent_a", "agent_b", "--abandon"]);
+    assert!(
+        abandoned.status.success(),
+        "the record is dropped even while the old alias is configured again: {}",
+        text_of(&abandoned)
+    );
+    assert!(!rename_is_recorded(tmp.path()));
+}
+
+#[tokio::test]
+async fn agents_delete_previews_report_the_refusal_the_delete_makes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (old_ws, _blocker) = leave_rename_unfinished(tmp.path()).await;
+
+    for args in [
+        &["delete", "agent_b", "--dry-run"][..],
+        &["delete", "agent_b"][..],
+        &["delete", "agent_a", "--dry-run"][..],
+    ] {
+        let preview = run_agents(tmp.path(), args);
+        let text = text_of(&preview);
+        let command = args.join(" ");
+        assert!(preview.status.success(), "`{command}` previews: {text}");
+        assert!(
+            text.contains("is BLOCKED"),
+            "`{command}` reports the delete as blocked: {text}"
+        );
+        assert!(
+            text.contains("zeroclaw agents rename agent_a agent_b"),
+            "`{command}` names the rename to finish first: {text}"
+        );
+        assert!(
+            !text.contains("would scrub"),
+            "`{command}` does not preview an allowed delete: {text}"
+        );
+    }
+    assert!(
+        configured_agents(tmp.path()).contains(&"agent_b".to_string()),
+        "a preview changes nothing"
+    );
+    assert!(old_ws.join("marker").is_file());
 }
 
 /// A gateway `AppState` over `config`, with no provider or store handles

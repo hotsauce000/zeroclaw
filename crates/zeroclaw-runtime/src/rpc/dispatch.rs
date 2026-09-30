@@ -913,6 +913,33 @@ fn agent_recovery_error_to_rpc(
     }
 }
 
+/// Why an unfinished rename refuses deleting `alias`, if it does. The rename
+/// still owes state moves into its target and out of its retired alias, and
+/// deleting either agent now would strand that state. A journal that cannot
+/// be read may hold such a rename, so that refuses too. Only a configured
+/// alias is checked: the delete preflight reports one that is not configured.
+/// The delete and its preview both report this refusal.
+async fn agent_delete_recovery_refusal(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+) -> Option<crate::agent_rename_recovery::RenameRecoveryError> {
+    if !config.agents.contains_key(alias) {
+        return None;
+    }
+    if let Err(e) = Box::pin(crate::agent_rename_recovery::ensure_not_pending_target(
+        config, alias,
+    ))
+    .await
+    {
+        return Some(e);
+    }
+    Box::pin(crate::agent_rename_recovery::ensure_alias_not_retired(
+        config, alias,
+    ))
+    .await
+    .err()
+}
+
 fn session_should_initialize_mcp(chat_mode: &crate::rpc::types::ChatMode) -> bool {
     !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
 }
@@ -9389,9 +9416,9 @@ impl RpcDispatcher {
     /// writing the config again. Either way the state kept under the old
     /// alias then converges with the config write lock released, and the
     /// record closes only once nothing is left behind. State that has not
-    /// followed yet comes back as warnings on a successful result: the config
-    /// commit stands, the old alias stays retired, and re-issuing the same
-    /// rename finishes the move.
+    /// followed yet, or a converge that failed outright, comes back as
+    /// warnings on a successful result: the config commit stands, the old
+    /// alias stays retired, and re-issuing the same rename finishes the move.
     fn rename_agent_alias(
         &self,
         req: ConfigMapKeyRenameParams,
@@ -9551,53 +9578,80 @@ impl RpcDispatcher {
                     Ok(outcome)
                 }));
 
-            let outcome = job
-                .await
-                .map_err(|error| {
-                    rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Agent rename cleanup task failed: {error}"),
-                    )
-                })??
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("{path}.{from}: {e}")))?;
-            let report = outcome.report();
-            let warnings = outcome.warnings();
-            if outcome.is_converged() {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                        .with_attrs(::serde_json::json!({
-                            "from": from,
-                            "to": to,
-                            "memory_rows": report.memory_rows,
-                            "cron_jobs": report.cron_jobs,
-                            "acp_sessions": report.acp_sessions,
-                            "acp_workspaces": report.acp_workspaces,
-                            "sessions_repointed": report.sessions_repointed,
-                            "workspace_moved": report.workspace_moved,
-                        })),
-                    "agent renamed over RPC; its owned state converged onto the new alias"
-                );
-            } else {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "from": from,
-                            "to": to,
-                            "memory_rows": report.memory_rows,
-                            "cron_jobs": report.cron_jobs,
-                            "acp_sessions": report.acp_sessions,
-                            "acp_workspaces": report.acp_workspaces,
-                            "sessions_repointed": report.sessions_repointed,
-                            "workspace_moved": report.workspace_moved,
-                            "warnings": warnings,
-                        })),
-                    "agent rename over RPC committed but some owned state has not followed; re-issue the same rename to converge"
-                );
-            }
+            let converged = job.await.map_err(|error| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Agent rename cleanup task failed: {error}"),
+                )
+            })??;
+            let warnings = match converged {
+                Ok(outcome) => {
+                    let report = outcome.report();
+                    let warnings = outcome.warnings();
+                    if outcome.is_converged() {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "from": from,
+                                "to": to,
+                                "memory_rows": report.memory_rows,
+                                "cron_jobs": report.cron_jobs,
+                                "acp_sessions": report.acp_sessions,
+                                "acp_workspaces": report.acp_workspaces,
+                                "sessions_repointed": report.sessions_repointed,
+                                "workspace_moved": report.workspace_moved,
+                            })),
+                            "agent renamed over RPC; its owned state converged onto the new alias"
+                        );
+                    } else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "from": from,
+                                "to": to,
+                                "memory_rows": report.memory_rows,
+                                "cron_jobs": report.cron_jobs,
+                                "acp_sessions": report.acp_sessions,
+                                "acp_workspaces": report.acp_workspaces,
+                                "sessions_repointed": report.sessions_repointed,
+                                "workspace_moved": report.workspace_moved,
+                                "warnings": warnings,
+                            })),
+                            "agent rename over RPC committed but some owned state has not followed; re-issue the same rename to converge"
+                        );
+                    }
+                    warnings
+                }
+                // The config commit stands, now or from an earlier run, so
+                // the rename happened: only its followers could not
+                // converge. The failure is reported as the rename's warning,
+                // and re-issuing the same rename resumes it.
+                Err(e) => {
+                    let warning = e.to_string();
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "from": from,
+                                "to": to,
+                                "error": warning,
+                            })),
+                        "agent rename over RPC committed but its owned state could not converge; re-issue the same rename to converge"
+                    );
+                    vec![warning]
+                }
+            };
 
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
@@ -9676,7 +9730,12 @@ impl RpcDispatcher {
 
     async fn handle_agent_delete_preview(&self, params: &Value) -> RpcResult {
         let req: AgentDeleteParams = parse_params(params)?;
-        let config = self.ctx.config.read().clone();
+        // Boxed: this handler runs inline in `process_line`, and the snapshot
+        // is held across the recovery check's await.
+        let config = Box::new(self.ctx.config.read().clone());
+        // The same refusal the delete makes for an agent an unfinished rename
+        // still owes state to or from.
+        let recovery_refusal = agent_delete_recovery_refusal(&config, &req.alias).await;
         let store = self.ctx.acp_session_store.clone();
         let alias = req.alias;
         let lifecycle_alias = alias.clone();
@@ -9701,6 +9760,10 @@ impl RpcDispatcher {
         if let Some(blocker) = self.ctx.agent_lifecycle.delete_blocker(&lifecycle_alias) {
             preview.allowed = false;
             preview.blockers.push(blocker.to_string());
+        }
+        if let Some(refusal) = recovery_refusal {
+            preview.allowed = false;
+            preview.blockers.push(refusal.to_string());
         }
         to_result(AgentDeletePreviewResult {
             alias: preview.alias,
@@ -9740,24 +9803,10 @@ impl RpcDispatcher {
 
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         let mut working = self.ctx.config.read().clone();
-        // An unfinished rename still owes state moves into its target and out
-        // of its retired alias, and deleting either agent now would strand
-        // that state. A journal that cannot be read may hold such a rename,
-        // so that refuses too. Checked under the config write lock, which a
-        // rename holds while it records and commits, and before any side
-        // effect; an alias that is not configured is left to the preflight
-        // below to report.
-        if working.agents.contains_key(&alias) {
-            Box::pin(crate::agent_rename_recovery::ensure_not_pending_target(
-                &working, &alias,
-            ))
-            .await
-            .map_err(|e| agent_recovery_error_to_rpc("agents", &alias, &e))?;
-            Box::pin(crate::agent_rename_recovery::ensure_alias_not_retired(
-                &working, &alias,
-            ))
-            .await
-            .map_err(|e| agent_recovery_error_to_rpc("agents", &alias, &e))?;
+        // Checked under the config write lock, which a rename holds while it
+        // records and commits, and before any side effect.
+        if let Some(e) = agent_delete_recovery_refusal(&working, &alias).await {
+            return Err(agent_recovery_error_to_rpc("agents", &alias, &e));
         }
         let channel_generation_revocation =
             self.prepare_channel_generation_revocation(self.ctx.reload_tx.is_some(), &working)?;
@@ -33605,6 +33654,64 @@ mod tests {
                 .reserve_turn_at("rename_from", from_generation)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn agent_rename_converge_failure_after_the_commit_is_a_warning() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(4 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("four-megabyte-stack Tokio runtime");
+
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_secret_test_config(&tmp);
+            config.create_map_key("agents", "converge_from").unwrap();
+            config.save().await.unwrap();
+            let journal =
+                zeroclaw_config::agent_recovery_journal::AgentRecoveryJournal::for_config(&config);
+            let save_gate = zeroclaw_config::schema::test_post_replace_pause_gate::arm(
+                config.config_path.clone(),
+            );
+            let dispatcher = make_config_set_test_dispatcher(config);
+            let handle = dispatcher.spawn_handle();
+            let rename = zeroclaw_spawn::spawn!(async move {
+                let params = json!({
+                    "path": "agents",
+                    "from": "converge_from",
+                    "to": "converge_to",
+                });
+                handle.handle_config_map_key_rename(&params).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), save_gate.wait_paused())
+                .await
+                .expect("the rename pauses inside its config save with the record armed");
+            // The commit is about to land; a journal that can no longer be
+            // read fails the converge that follows it.
+            std::fs::write(journal.path(), b"not a recovery journal").unwrap();
+            save_gate.release();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), rename)
+                .await
+                .expect("the rename finishes")
+                .expect("the rename task joins")
+                .expect("a committed rename is not a request failure");
+
+            assert_eq!(result["renamed"], true, "{result}");
+            let warnings = result["warnings"]
+                .as_array()
+                .expect("the converge failure is reported as a warning");
+            assert!(
+                warnings.iter().any(|warning| warning
+                    .as_str()
+                    .is_some_and(|w| w.contains("could not be read"))),
+                "{result}"
+            );
+            let live = dispatcher.ctx.config.read().clone();
+            assert!(live.agents.contains_key("converge_to"));
+            assert!(!live.agents.contains_key("converge_from"));
+        });
     }
 
     #[tokio::test]

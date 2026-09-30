@@ -164,11 +164,26 @@ fn create_entry(config: &mut Config, section: &str, alias: &str) -> Result<()> {
     Ok(())
 }
 
-/// Print the dry-run impact (blockers + scrubs) for a delete.
-fn print_impact(kind: &AliasKind, alias: &str, config: &Config) {
+/// Print the dry-run impact (blockers + scrubs) for a delete. `refusal` is why
+/// the delete would be refused before it looks at references at all, and is
+/// reported as its first blocker.
+fn print_impact(kind: &AliasKind, alias: &str, config: &Config, refusal: Option<&str>) {
     let report = alias_refs::plan_delete(config, kind, alias);
     let section = section_path(kind);
-    if report.blockers.is_empty() {
+    if let Some(reason) = refusal {
+        println!(
+            "{}",
+            mta(
+                "cli-alias-impact-refused",
+                &[
+                    ("section", section.as_str()),
+                    ("alias", alias),
+                    ("reason", reason)
+                ],
+                "deleting {$section}.{$alias} is BLOCKED: {$reason}"
+            )
+        );
+    } else if report.blockers.is_empty() {
         let count = report.scrubs.len().to_string();
         println!(
             "{}",
@@ -182,7 +197,8 @@ fn print_impact(kind: &AliasKind, alias: &str, config: &Config) {
                 "deleting {$section}.{$alias} would scrub {$count} reference(s):"
             )
         );
-    } else {
+    }
+    if !report.blockers.is_empty() {
         let count = report.blockers.len().to_string();
         println!(
             "{}",
@@ -229,11 +245,11 @@ fn delete_config(
 ) -> Result<()> {
     let section = section_path(kind);
     if dry_run {
-        print_impact(kind, alias, config);
+        print_impact(kind, alias, config, None);
         return Ok(());
     }
     if !yes {
-        print_impact(kind, alias, config);
+        print_impact(kind, alias, config, None);
         println!(
             "\n{}",
             mt(
@@ -620,7 +636,13 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
         AgentsCommands::Export { alias, out, force } => {
             export::run(config, &alias, &out, force).await
         }
-        AgentsCommands::Rename { from, to } => {
+        AgentsCommands::Rename { from, to, abandon } => {
+            // Abandoning changes no config, only the recovery journal, whose
+            // own lock serializes it with a running daemon: it needs neither
+            // the daemon route nor config ownership.
+            if abandon {
+                return Box::pin(abandon_agent_rename(config, &from, &to)).await;
+            }
             #[cfg(feature = "agent-runtime")]
             let _offline_ownership = match route_agent_mutation(
                 config,
@@ -680,19 +702,20 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
                     AgentMutationRoute::Offline(ownership) => ownership,
                 }
             };
-            if dry_run {
-                print_impact(&AliasKind::Agent, &alias, config);
-                return Ok(());
-            }
-            if !yes {
-                print_impact(&AliasKind::Agent, &alias, config);
-                println!(
-                    "\n{}",
-                    mt(
-                        "cli-alias-no-changes",
-                        "No changes made. Re-run with --yes to apply (or --dry-run to preview)."
-                    )
-                );
+            if dry_run || !yes {
+                // The preview reports the refusal the delete itself would make
+                // for an alias an unfinished rename still owns.
+                let refusal = agent_delete_recovery_refusal(config, &alias).await;
+                print_impact(&AliasKind::Agent, &alias, config, refusal.as_deref());
+                if !dry_run {
+                    println!(
+                        "\n{}",
+                        mt(
+                            "cli-alias-no-changes",
+                            "No changes made. Re-run with --yes to apply (or --dry-run to preview)."
+                        )
+                    );
+                }
                 return Ok(());
             }
             // Owned-state HARD gate (live ACP sessions) runs BEFORE the config
@@ -701,8 +724,9 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             // An unfinished rename still owes state moves out of its old alias
             // and into its target. Deleting either would strand that state, so
             // both refuse until the rename converges.
-            #[cfg(feature = "agent-runtime")]
-            agent_delete_recovery_guard(config, &alias).await?;
+            if let Some(refusal) = agent_delete_recovery_refusal(config, &alias).await {
+                return Err(anyhow::Error::msg(refusal));
+            }
             // Resolve the workspace dir while the entry still exists (a custom
             // `workspace.path` is read off it), then apply + PERSIST the config
             // change before any irreversible owned-state side effects — so a
@@ -864,7 +888,11 @@ fn rename_refused(error: RenameRecoveryError) -> anyhow::Error {
             &[("from", from.as_str()), ("to", to.as_str())],
             "agent `{$to}` is the target of an unfinished rename from `{$from}`; run `zeroclaw agents rename {$from} {$to}` first",
         ),
-        RenameRecoveryError::SourceReconfigured { .. } => error.to_string(),
+        RenameRecoveryError::SourceReconfigured { from, to } => mta(
+            "cli-alias-rename-source-reconfigured",
+            &[("from", from.as_str()), ("to", to.as_str())],
+            "agent `{$from}` is configured again while its rename to `{$to}` is unfinished; remove `[agents.{$from}]` from the config by hand, or run `zeroclaw agents rename {$from} {$to} --abandon`",
+        ),
         RenameRecoveryError::Unreadable { .. }
         | RenameRecoveryError::Busy { .. }
         | RenameRecoveryError::Persist { .. } => return rename_recovery_failed(&error),
@@ -884,27 +912,86 @@ fn rename_recovery_failed(error: &RenameRecoveryError) -> anyhow::Error {
     ))
 }
 
-/// Refuse to delete an alias an unfinished rename retired, or one it is still
-/// converging into.
+/// Why deleting `alias` is refused because of an unfinished rename, localized:
+/// the rename retired `alias`, or is still converging into it. A recovery
+/// journal that cannot be read refuses too. The delete and its preview both
+/// report this.
 #[cfg(feature = "agent-runtime")]
-async fn agent_delete_recovery_guard(config: &Config, alias: &str) -> Result<()> {
+async fn agent_delete_recovery_refusal(config: &Config, alias: &str) -> Option<String> {
     let checked = match rename_recovery::ensure_alias_not_retired(config, alias).await {
         Ok(()) => rename_recovery::ensure_not_pending_target(config, alias).await,
         Err(e) => Err(e),
     };
-    match checked {
-        Ok(()) => Ok(()),
-        Err(RenameRecoveryError::AliasRetired { alias, pending_to }) => bail!(
+    let refusal = match checked.err()? {
+        RenameRecoveryError::AliasRetired { alias, pending_to } => mta(
+            "cli-alias-delete-retired",
+            &[("alias", alias.as_str()), ("to", pending_to.as_str())],
+            "alias `{$alias}` is retired by an unfinished rename to `{$to}`; run `zeroclaw agents rename {$alias} {$to}` before deleting anything",
+        ),
+        e @ RenameRecoveryError::RecoveryPending { .. } => rename_refused(e).to_string(),
+        e => rename_recovery_failed(&e).to_string(),
+    };
+    Some(refusal)
+}
+
+/// Without the agent runtime the delete runs no recovery guard, so nothing
+/// refuses it here.
+#[cfg(not(feature = "agent-runtime"))]
+async fn agent_delete_recovery_refusal(_config: &Config, _alias: &str) -> Option<String> {
+    None
+}
+
+/// Drop the recovery record of the unfinished rename of `from` to `to`
+/// without moving anything, after listing the state still kept under `from`,
+/// which an agent created under it adopts.
+#[cfg(feature = "agent-runtime")]
+async fn abandon_agent_rename(config: &Config, from: &str, to: &str) -> Result<()> {
+    let abandoned = match rename_recovery::abandon_rename(config, from, to).await {
+        Ok(abandoned) => abandoned,
+        // For an abandon, nothing to rename means no record to drop.
+        Err(RenameRecoveryError::NotConfigured { .. }) => bail!(
             "{}",
             mta(
-                "cli-alias-delete-retired",
-                &[("alias", alias.as_str()), ("to", pending_to.as_str())],
-                "alias `{$alias}` is retired by an unfinished rename to `{$to}`; run `zeroclaw agents rename {$alias} {$to}` before deleting anything"
+                "cli-alias-rename-abandon-none",
+                &[("from", from), ("to", to)],
+                "there is no unfinished rename of `{$from}` to `{$to}` to abandon"
             )
         ),
-        Err(e @ RenameRecoveryError::RecoveryPending { .. }) => Err(rename_refused(e)),
-        Err(e) => Err(rename_recovery_failed(&e)),
+        Err(e) => return Err(rename_refused(e)),
+    };
+    for issue in &abandoned.residue {
+        let warning = issue.to_string();
+        eprintln!(
+            "{}",
+            mta(
+                "cli-alias-warn",
+                &[("warning", warning.as_str())],
+                "warning: {$warning}"
+            )
+        );
     }
+    println!(
+        "{}",
+        mta(
+            "cli-alias-rename-abandoned",
+            &[("from", from), ("to", to)],
+            "dropped the unfinished rename of {$from} to {$to}; `{$from}` can be created again and will adopt any state still listed above"
+        )
+    );
+    Ok(())
+}
+
+/// Without the agent runtime there is no recovery contract to abandon a
+/// rename through.
+#[cfg(not(feature = "agent-runtime"))]
+async fn abandon_agent_rename(_config: &Config, _from: &str, _to: &str) -> Result<()> {
+    bail!(
+        "{}",
+        mt(
+            "cli-alias-rename-abandon-unavailable",
+            "abandoning an unfinished agent rename needs a build with the agent runtime"
+        )
+    )
 }
 
 /// Memory + optional session-backend handles opened from `data_dir` for the
@@ -1294,6 +1381,49 @@ mod tests {
             assert!(!message.contains("is not configured"), "{message}");
             assert_ne!(message, missing);
         }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn a_source_configured_again_names_both_ways_out() {
+        let message = rename_refused(RenameRecoveryError::SourceReconfigured {
+            from: "scout".to_string(),
+            to: "ranger".to_string(),
+        })
+        .to_string();
+        assert!(message.contains("[agents.scout]"), "{message}");
+        assert!(
+            message.contains("zeroclaw agents rename scout ranger --abandon"),
+            "{message}"
+        );
+        assert!(!message.contains("{cli-"), "missing Fluent key: {message}");
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn a_daemon_rename_that_reports_unfinished_work_fails() {
+        let result = |warnings: &[&str]| {
+            serde_json::json!({
+                "path": "agents",
+                "from": "scout",
+                "to": "ranger",
+                "renamed": true,
+                "rewritten": 1,
+                "warnings": warnings,
+            })
+        };
+        assert!(print_daemon_rename(result(&[])).is_ok());
+
+        let error = print_daemon_rename(result(&[
+            "the old default workspace of `scout` still exists at /tmp/scout",
+        ]))
+        .expect_err("unfinished rename work fails the command")
+        .to_string();
+        assert!(
+            error.contains("zeroclaw agents rename scout ranger"),
+            "{error}"
+        );
+        assert!(!error.contains("{cli-"), "missing Fluent key: {error}");
     }
 
     #[cfg(feature = "agent-runtime")]
