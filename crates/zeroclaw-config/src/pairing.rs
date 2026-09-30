@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -409,6 +409,23 @@ fn take_live(slot: &mut Option<PendingCode>) -> Option<PendingCode> {
     slot.clone()
 }
 
+/// The paired-token set held by [`PairingGuard::hold_paired_tokens`].
+pub struct HeldPairedTokens<'a>(RwLockReadGuard<'a, HashMap<String, PairedTokenSubject>>);
+
+impl HeldPairedTokens<'_> {
+    /// Whether `token_hash` is paired, as of this hold.
+    pub fn contains_hash(&self, token_hash: &str) -> bool {
+        self.0.contains_key(token_hash)
+    }
+
+    /// Who `token_hash` authenticates as, as of this hold, or `None` when it
+    /// is not paired. Revalidation under the hold rebuilds a roster-bound
+    /// connection's identity from this, as it does outside one.
+    pub fn subject_of_hash(&self, token_hash: &str) -> Option<PairedTokenSubject> {
+        self.0.get(token_hash).cloned()
+    }
+}
+
 // TODO: I've just made this work with parking_lot but it should use either flume or tokio's async mutexes
 #[derive(Debug, Clone)]
 pub struct PairingGuard {
@@ -418,8 +435,11 @@ pub struct PairingGuard {
     pairing_code: Arc<Mutex<Option<PendingCode>>>,
     /// SHA-256 hashed bearer tokens and who each authenticates as (persisted
     /// across restarts). One map, so membership and subject are always read
-    /// together: a revocation can never land between the two.
-    paired_tokens: Arc<Mutex<HashMap<String, PairedTokenSubject>>>,
+    /// together: a revocation can never land between the two. A
+    /// reader-writer lock so that a caller holding it across an effect (see
+    /// [`PairingGuard::hold_paired_tokens`]) delays only pairing and
+    /// revocation, not other liveness checks.
+    paired_tokens: Arc<RwLock<HashMap<String, PairedTokenSubject>>>,
     /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
     failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
     /// The admin token this gateway run accepts on the pairing-code admin
@@ -462,7 +482,7 @@ impl PairingReservation {
         let token = self.token.clone();
         self.guard
             .paired_tokens
-            .lock()
+            .write()
             .insert(hash_token(&token), self.subject.clone());
         self.committed = true;
         token
@@ -598,7 +618,7 @@ impl PairingGuard {
         Self {
             require_pairing,
             pairing_code: Arc::new(Mutex::new(code)),
-            paired_tokens: Arc::new(Mutex::new(tokens)),
+            paired_tokens: Arc::new(RwLock::new(tokens)),
             failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
             admin_token: Arc::new(Mutex::new(None)),
         }
@@ -826,7 +846,7 @@ impl PairingGuard {
         }
         let hashed = hash_token(token);
         matches!(
-            self.paired_tokens.lock().get(&hashed),
+            self.paired_tokens.read().get(&hashed),
             Some(PairedTokenSubject::SharedOperator)
         )
     }
@@ -841,14 +861,14 @@ impl PairingGuard {
     /// know who the token authenticates as uses [`Self::subject_for_token`].
     pub fn token_is_paired(&self, token: &str) -> bool {
         let hashed = hash_token(token);
-        self.paired_tokens.lock().contains_key(&hashed)
+        self.paired_tokens.read().contains_key(&hashed)
     }
 
     /// Strict membership check by pre-computed SHA-256 hash (see
     /// [`Self::token_is_paired`]). Lets an established connection re-check
     /// liveness of its pairing without retaining the bearer itself.
     pub fn token_hash_is_paired(&self, token_hash: &str) -> bool {
-        self.paired_tokens.lock().contains_key(token_hash)
+        self.paired_tokens.read().contains_key(token_hash)
     }
 
     /// Who `token` authenticates as, when it is currently paired: the strict
@@ -861,26 +881,49 @@ impl PairingGuard {
     /// [`Self::subject_for_token`] by pre-computed SHA-256 hash, for an
     /// established connection that kept only its token's hash.
     pub fn subject_for_hash(&self, token_hash: &str) -> Option<PairedTokenSubject> {
-        self.paired_tokens.lock().get(token_hash).cloned()
+        self.paired_tokens.read().get(token_hash).cloned()
+    }
+
+    /// Hold the paired-token set still: no token can be paired or revoked
+    /// until the returned guard is dropped, while other readers proceed.
+    ///
+    /// For a caller that must keep a liveness decision true through the
+    /// effect it guards. Keep the hold short, and do not call this guard's
+    /// other methods while holding it: a pairing or revocation queued behind
+    /// the hold makes a second read on the same thread wait forever.
+    pub fn hold_paired_tokens(&self) -> HeldPairedTokens<'_> {
+        HeldPairedTokens(self.paired_tokens.read())
+    }
+
+    /// Whether a pairing or revocation has claimed the paired-token set and
+    /// is waiting behind a reader that still holds it (see
+    /// [`Self::hold_paired_tokens`]). False once no reader holds it, whether
+    /// the writer is then running, finished, or never came. A diagnostic for
+    /// tests that must observe a writer queued behind a hold; it keeps no
+    /// lock.
+    #[doc(hidden)]
+    pub fn token_write_queued_behind_a_hold(&self) -> bool {
+        self.paired_tokens.is_locked_exclusive()
+            && self.paired_tokens.try_read_recursive().is_some()
     }
 
     /// Returns true if the gateway is already paired (has at least one token).
     pub fn is_paired(&self) -> bool {
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         !tokens.is_empty()
     }
 
     /// Every paired token hash, shared-operator and roster-bound alike.
     /// Persistence uses [`Self::persisted_tokens`], which keeps the two apart.
     pub fn tokens(&self) -> Vec<String> {
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         tokens.keys().cloned().collect()
     }
 
     /// The paired-token set split the way `[gateway]` persists it, read in one
     /// step so the two fields always describe the same set.
     pub fn persisted_tokens(&self) -> PersistedPairedTokens {
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         let mut persisted = PersistedPairedTokens::default();
         for (hash, subject) in tokens.iter() {
             match subject {
@@ -911,11 +954,11 @@ impl PairingGuard {
     /// here, in the same step as the revocation, so the replacement code can
     /// carry the same binding.
     pub fn revoke_token_hash_subject(&self, token_hash: &str) -> Option<PairedTokenSubject> {
-        self.paired_tokens.lock().remove(token_hash)
+        self.paired_tokens.write().remove(token_hash)
     }
 
     pub fn revoke_all_tokens(&self) -> usize {
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         let count = tokens.len();
         tokens.clear();
         count

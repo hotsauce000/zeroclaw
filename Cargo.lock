@@ -14020,6 +14020,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.12.28",
+ "ring",
  "rusqlite",
  "rustls",
  "schemars 1.2.2",
@@ -14236,6 +14237,7 @@ dependencies = [
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-macros",
+ "zeroclaw-spawn",
 ]
 
 [[package]]
