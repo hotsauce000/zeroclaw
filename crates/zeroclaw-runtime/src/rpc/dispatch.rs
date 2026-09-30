@@ -1070,18 +1070,14 @@ impl RpcDispatcher {
             .as_secs();
         {
             let Some(auth) = self.auth.as_ref() else {
-                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
-                    "rpc-auth-first-call-initialize",
-                ));
+                let denied = AuthDenied::not_initialized();
                 self.audit_auth_denial(method, &denied);
                 return Err(denied);
             };
             if let Some(expires_at) = auth.principal.expires_at
                 && expires_at <= now
             {
-                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
-                    "rpc-auth-credential-expired",
-                ));
+                let denied = AuthDenied::token_expired();
                 self.audit_auth_denial(method, &denied);
                 return Err(denied);
             }
@@ -1091,18 +1087,14 @@ impl RpcDispatcher {
                 // Fail closed at the revalidation deadline. The client
                 // holds the credential and revalidates by re-initializing,
                 // which re-verifies against the live authority.
-                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
-                    "rpc-auth-revalidation-due",
-                ));
+                let denied = AuthDenied::revalidation_due();
                 self.audit_auth_denial(method, &denied);
                 return Err(denied);
             }
             if let Some(hash) = auth.native_token_hash.as_deref()
                 && !self.ctx.auth.pairing().token_hash_is_paired(hash)
             {
-                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
-                    "rpc-auth-pairing-revoked",
-                ));
+                let denied = AuthDenied::pairing_revoked();
                 self.audit_auth_denial(method, &denied);
                 return Err(denied);
             }
@@ -1137,17 +1129,12 @@ impl RpcDispatcher {
             }
         }
         let Some(auth) = self.auth.as_ref() else {
-            let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
-                "rpc-auth-first-call-initialize",
-            ));
+            let denied = AuthDenied::not_initialized();
             self.audit_auth_denial(method, &denied);
             return Err(denied);
         };
         if !auth.grants.permits(resource, verb) {
-            let denied = AuthDenied::forbidden(format!(
-                "Principal is not granted {resource}:{verb} (required by {})",
-                method.wire_name()
-            ));
+            let denied = AuthDenied::grant_missing(resource, verb, method.wire_name());
             self.audit_auth_denial(method, &denied);
             return Err(denied);
         }
@@ -1157,6 +1144,13 @@ impl RpcDispatcher {
     fn audit_auth_denial(&self, method: Method, denied: &crate::rpc::auth::AuthDenied) {
         audit_denial(self.auth.as_ref(), method, denied);
     }
+
+    /// Audit `denied` against this connection and turn it into the error the
+    /// client receives.
+    fn refuse(&self, method: Method, denied: crate::rpc::auth::AuthDenied) -> JsonRpcError {
+        self.audit_auth_denial(method, &denied);
+        rpc_err(denied.code, denied.message)
+    }
 }
 
 /// Record one authorization denial for the connection bound to `auth`.
@@ -1165,25 +1159,11 @@ fn audit_denial(
     method: Method,
     denied: &crate::rpc::auth::AuthDenied,
 ) {
-    let (principal_id, auth_provider) = auth
-        .map(|auth| {
-            (
-                Some(auth.principal.id.as_str()),
-                Some(auth.principal.auth_provider_label()),
-            )
-        })
-        .unwrap_or((None, None));
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
             .with_category(::zeroclaw_log::EventCategory::System)
-            .with_attrs(::serde_json::json!({
-                "method": method.wire_name(),
-                "reason": denied.message,
-                "code": denied.code,
-                "principal_id": principal_id,
-                "auth_provider": auth_provider,
-            })),
+            .with_attrs(denied.audit_attrs(method.wire_name(), auth)),
         "RPC authorization denied"
     );
 }
@@ -1211,10 +1191,11 @@ fn current_authority(
     if let MethodAuthz::Requires(resource, verb) = method.authz()
         && !grants.permits(resource, verb)
     {
-        return Err(AuthDenied::forbidden(format!(
-            "Principal is not granted {resource}:{verb} (required by {})",
-            method.wire_name()
-        )));
+        return Err(AuthDenied::grant_missing(
+            resource,
+            verb,
+            method.wire_name(),
+        ));
     }
     Ok(grants)
 }
@@ -1224,23 +1205,15 @@ impl RpcDispatcher {
     /// `Config` grant the gate already enforced: both are required.
     fn selector_config_write(&self, method: Method, path: &str) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
-            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            return Err(self.refuse(method, crate::rpc::auth::AuthDenied::not_initialized()));
         };
         if auth.grants.may_write_config(path) {
             Ok(())
         } else {
-            let denied = rpc_err(
-                FORBIDDEN,
-                format!("Principal is not granted config write access to {path:?}"),
-            );
-            self.audit_auth_denial(
+            Err(self.refuse(
                 method,
-                &crate::rpc::auth::AuthDenied {
-                    code: denied.code,
-                    message: denied.message.clone(),
-                },
-            );
-            Err(denied)
+                crate::rpc::auth::AuthDenied::config_path_not_granted(path),
+            ))
         }
     }
 
@@ -1249,7 +1222,7 @@ impl RpcDispatcher {
     /// [`Self::principal_tool_narrowing`] at agent assembly.
     fn selector_session_agent(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
         let Some(grants) = self.stamped_grants() else {
-            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            return Err(self.refuse(method, crate::rpc::auth::AuthDenied::not_initialized()));
         };
         self.selector_session_agent_with_grants(method, grants, alias)
     }
@@ -1271,18 +1244,10 @@ impl RpcDispatcher {
         alias: &str,
     ) -> Result<(), JsonRpcError> {
         if !grants.may_use_agent(alias) {
-            let denied = rpc_err(
-                FORBIDDEN,
-                format!("Principal is not entitled to agent {alias:?}"),
-            );
-            self.audit_auth_denial(
+            return Err(self.refuse(
                 method,
-                &crate::rpc::auth::AuthDenied {
-                    code: denied.code,
-                    message: denied.message.clone(),
-                },
-            );
-            return Err(denied);
+                crate::rpc::auth::AuthDenied::agent_not_entitled(alias),
+            ));
         }
         Ok(())
     }
@@ -1344,10 +1309,7 @@ impl RpcDispatcher {
         };
         current_authority(&self.ctx.auth, auth, method)
             .map(Some)
-            .map_err(|denied| {
-                self.audit_auth_denial(method, &denied);
-                rpc_err(denied.code, denied.message)
-            })
+            .map_err(|denied| self.refuse(method, denied))
     }
 
     /// Re-establish the caller's authority to write `path` after the config
@@ -1373,21 +1335,13 @@ impl RpcDispatcher {
     ) -> Result<(), JsonRpcError> {
         use crate::rpc::auth::AuthDenied;
 
-        let refuse = |denied: AuthDenied| -> JsonRpcError {
-            self.audit_auth_denial(method, &denied);
-            rpc_err(denied.code, denied.message)
-        };
         let Some(grants) = self.recheck_authority_after_admission(method)? else {
-            return Err(refuse(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
-            )));
+            return Err(self.refuse(method, AuthDenied::not_initialized()));
         };
         if let Some(path) = path
             && !grants.may_write_config(path)
         {
-            return Err(refuse(AuthDenied::forbidden(format!(
-                "Principal is not granted config write access to {path:?}"
-            ))));
+            return Err(self.refuse(method, AuthDenied::config_path_not_granted(path)));
         }
         Ok(())
     }
@@ -1426,7 +1380,7 @@ impl RpcDispatcher {
         require_configured: bool,
     ) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
-            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            return Err(self.refuse(method, crate::rpc::auth::AuthDenied::not_initialized()));
         };
         let configured = !require_configured
             || auth.grants.admin
@@ -1434,18 +1388,10 @@ impl RpcDispatcher {
         if configured && auth.grants.may_use_agent(alias) {
             return Ok(());
         }
-        let denied = rpc_err(
-            FORBIDDEN,
-            format!("Principal is not entitled to agent {alias:?}"),
-        );
-        self.audit_auth_denial(
+        Err(self.refuse(
             method,
-            &crate::rpc::auth::AuthDenied {
-                code: denied.code,
-                message: denied.message.clone(),
-            },
-        );
-        Err(denied)
+            crate::rpc::auth::AuthDenied::agent_not_entitled(alias),
+        ))
     }
 
     /// Resolve a cron job and confirm the caller is entitled to its owning
@@ -1465,28 +1411,21 @@ impl RpcDispatcher {
         id: &str,
     ) -> Result<crate::cron::CronJob, JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
-            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            return Err(self.refuse(method, crate::rpc::auth::AuthDenied::not_initialized()));
         };
         let job = crate::cron::get_job(config, id)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
         if auth.grants.may_use_agent(&job.agent_alias) {
             return Ok(job);
         }
-        let denied = rpc_err(
-            INVALID_PARAMS,
-            format!("Cron job not found: {}", crate::cron::job_not_found(id)),
-        );
         self.audit_auth_denial(
             method,
-            &crate::rpc::auth::AuthDenied {
-                code: denied.code,
-                message: format!(
-                    "Principal is not entitled to agent {:?}, which owns cron job {id:?}",
-                    job.agent_alias
-                ),
-            },
+            &crate::rpc::auth::AuthDenied::cron_job_agent_not_entitled(&job.agent_alias, id),
         );
-        Err(denied)
+        Err(rpc_err(
+            INVALID_PARAMS,
+            format!("Cron job not found: {}", crate::cron::job_not_found(id)),
+        ))
     }
 
     /// Confine a session workspace to a directory the agent's own policy lets
@@ -1566,22 +1505,10 @@ impl RpcDispatcher {
         alias: &str,
         workspace: &str,
     ) -> JsonRpcError {
-        let denied = rpc_err(
-            FORBIDDEN,
-            format!(
-                "Session workspace {workspace:?} is not an existing directory agent {alias:?} \
-                 may both read and write; add it to the agent's risk profile allowed_roots to \
-                 authorize it",
-            ),
-        );
-        self.audit_auth_denial(
+        self.refuse(
             method,
-            &crate::rpc::auth::AuthDenied {
-                code: denied.code,
-                message: denied.message.clone(),
-            },
-        );
-        denied
+            crate::rpc::auth::AuthDenied::session_workspace_not_authorized(workspace, alias),
+        )
     }
 
     /// Hold one session binding, its agent and its workspace, to `grants`:
@@ -1668,7 +1595,10 @@ impl RpcDispatcher {
         params: &Value,
     ) -> Result<super::fs::ListingAuthorization, JsonRpcError> {
         let Some(grants) = self.stamped_grants() else {
-            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            return Err(self.refuse(
+                Method::FsListDir,
+                crate::rpc::auth::AuthDenied::not_initialized(),
+            ));
         };
         let req: zeroclaw_api::jsonrpc::FsListDirRequest = parse_params(params)?;
         let requested = std::path::Path::new(&req.path);
@@ -1694,13 +1624,10 @@ impl RpcDispatcher {
         if let Some(auth) = allowed {
             return Ok(auth);
         }
-        let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
-            "Principal is not granted a listing of {:?}: only absolute local paths that an \
-             enabled agent it may use can read can be listed",
-            req.path
-        ));
-        self.audit_auth_denial(Method::FsListDir, &denied);
-        Err(rpc_err(denied.code, denied.message))
+        Err(self.refuse(
+            Method::FsListDir,
+            crate::rpc::auth::AuthDenied::fs_listing_not_granted(&req.path),
+        ))
     }
 
     /// Hold path-mode attachment sources to the destination agent's policy.
@@ -1768,12 +1695,10 @@ impl RpcDispatcher {
                 }
             });
             if !allowed {
-                let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
-                    "Principal is not granted attachment source {raw:?}: only an absolute local \
-                     path that agent {alias:?} may read can be attached by path"
+                return Err(self.refuse(
+                    method,
+                    crate::rpc::auth::AuthDenied::attachment_source_not_granted(raw, alias),
                 ));
-                self.audit_auth_denial(method, &denied);
-                return Err(rpc_err(denied.code, denied.message));
             }
         }
         Ok(resolved)
@@ -1878,18 +1803,10 @@ impl RpcDispatcher {
         has_forwarded_environment: bool,
     ) -> Result<(), JsonRpcError> {
         if has_forwarded_environment && !self.may_use_forwarded_environment(grants) {
-            let denied = rpc_err(
-                FORBIDDEN,
-                "Session retains a local operator environment; create a new session on this connection",
-            );
-            self.audit_auth_denial(
+            return Err(self.refuse(
                 method,
-                &crate::rpc::auth::AuthDenied {
-                    code: denied.code,
-                    message: denied.message.clone(),
-                },
-            );
-            return Err(denied);
+                crate::rpc::auth::AuthDenied::session_environment_retained(),
+            ));
         }
         Ok(())
     }
@@ -1913,18 +1830,10 @@ impl RpcDispatcher {
             .filter(|env| !env.is_empty());
         let current = current.as_ref().filter(|env| !env.is_empty());
         if retained != current {
-            let denied = rpc_err(
-                FORBIDDEN,
-                "Session environment differs from this connection; create a new session",
-            );
-            self.audit_auth_denial(
+            return Err(self.refuse(
                 Method::SessionNew,
-                &crate::rpc::auth::AuthDenied {
-                    code: denied.code,
-                    message: denied.message.clone(),
-                },
-            );
-            return Err(denied);
+                crate::rpc::auth::AuthDenied::session_environment_mismatch(),
+            ));
         }
         Ok(())
     }
@@ -9216,11 +9125,10 @@ impl RpcDispatcher {
         };
         let denied = match current_authority(&self.ctx.auth, auth, method) {
             Ok(grants) if sees_every_principal(auth, &grants) => return Ok(()),
-            Ok(_) => crate::rpc::auth::AuthDenied::forbidden(GLOBAL_STREAM_SCOPED_DENIAL),
+            Ok(_) => crate::rpc::auth::AuthDenied::global_stream_scoped(),
             Err(denied) => denied,
         };
-        audit_denial(Some(auth), method, &denied);
-        Err(rpc_err(denied.code, denied.message))
+        Err(self.refuse(method, denied))
     }
 
     fn open_subscription(
@@ -9621,19 +9529,10 @@ impl RpcDispatcher {
         {
             return Ok(());
         }
-        let denied = rpc_err(
-            FORBIDDEN,
-            "Principal has a constrained tool selector; procedures run outside per-session tool \
-             narrowing and are refused to it",
-        );
-        self.audit_auth_denial(
+        Err(self.refuse(
             method,
-            &crate::rpc::auth::AuthDenied {
-                code: denied.code,
-                message: denied.message.clone(),
-            },
-        );
-        Err(denied)
+            crate::rpc::auth::AuthDenied::sop_tool_selector_constrained(),
+        ))
     }
 
     /// The procedure as the engine will load it once `save_sop` has written it.
@@ -9682,12 +9581,10 @@ impl RpcDispatcher {
                 if !exists || grants.admin {
                     return Ok(());
                 }
-                let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
-                    "Principal may not replace or delete procedure {name:?}: its definition \
-                     cannot be loaded to check which agents it runs as"
-                ));
-                self.audit_auth_denial(method, &denied);
-                Err(rpc_err(denied.code, denied.message))
+                Err(self.refuse(
+                    method,
+                    crate::rpc::auth::AuthDenied::sop_definition_unreadable(name),
+                ))
             }
         }
     }
@@ -10663,10 +10560,6 @@ fn sees_every_principal(
     grants.admin || !auth.principal.is_authenticated()
 }
 
-const GLOBAL_STREAM_SCOPED_DENIAL: &str = "Scoped principals cannot read the daemon-wide log \
-     and event streams: their frames are not attributed to an owning principal, so these \
-     streams and the event history are limited to administrators and the shared operator";
-
 /// Hold one delivery (a frame or a `lagged` notice) to the connection's
 /// authority. The credential must still be live, and whenever the accepted
 /// policy generation has moved, the principal is resolved again against
@@ -10692,9 +10585,7 @@ fn still_authorized(
             if sees_every_principal(auth, &grants) {
                 Ok(())
             } else {
-                Err(crate::rpc::auth::AuthDenied::forbidden(
-                    GLOBAL_STREAM_SCOPED_DENIAL,
-                ))
+                Err(crate::rpc::auth::AuthDenied::global_stream_scoped())
             }
         })
     };
