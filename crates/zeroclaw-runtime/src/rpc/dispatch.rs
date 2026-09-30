@@ -12250,7 +12250,10 @@ mod tests {
         assert_eq!(record["code"], json!(code), "{record}");
         assert_eq!(record["principal_id"], principal, "{record}");
         assert_eq!(record["auth_provider"], "peercred", "{record}");
-        assert_eq!(record["message"], response["error"]["message"], "{record}");
+        assert_eq!(
+            record["denial_message"], response["error"]["message"],
+            "{record}"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -12408,9 +12411,12 @@ mod tests {
         assert_eq!(record["code"], json!(INVALID_PARAMS), "{record}");
         assert_eq!(record["principal_id"], "user:cron-owner-audit", "{record}");
         assert_eq!(record["auth_provider"], "peercred", "{record}");
-        assert_ne!(record["message"], refused["error"]["message"], "{record}");
+        assert_ne!(
+            record["denial_message"], refused["error"]["message"],
+            "{record}"
+        );
         assert!(
-            record["message"]
+            record["denial_message"]
                 .as_str()
                 .is_some_and(|message| message.contains("beta")),
             "the record names the owning agent: {record}"

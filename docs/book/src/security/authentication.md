@@ -540,12 +540,12 @@ record with the message `RPC authorization denied` and these attributes:
 |---|---|
 | `method` | The JSON-RPC method refused. |
 | `reason` | A stable identifier for the refusal, from the table below. |
-| `message` | The refusal text, rendered in the daemon's locale. |
+| `denial_message` | The refusal text, rendered in the daemon's locale. |
 | `code` | The JSON-RPC error code of the refusal: `-32010` (`AUTH_REQUIRED`), `-32012` (`FORBIDDEN`), or `-32602` (`INVALID_PARAMS`). |
 | `principal_id` | The principal the connection was bound to, or `null` when it was not bound. |
 | `auth_provider` | The provider that verified that principal, such as `peercred` or `oidc.<alias>`, or `null` when the connection was not bound. |
 
-Group and alert on `reason`, not `message`. The identifier does not change
+Group and alert on `reason`, not `denial_message`. The identifier does not change
 with wording or locale, while a message names the path, agent, or grant
 involved, so one cause yields many texts and two causes can share one
 (`policy_generation_moved` carries the `revalidation_due` text).
@@ -554,7 +554,7 @@ Four cases read differently:
 
 - `cron_job_agent_not_entitled` is recorded while the client is told the job
   was not found, the answer a missing job gets, so the refusal does not
-  confirm that the job exists. The record's `message` names the owning agent
+  confirm that the job exists. The record's `denial_message` names the owning agent
   and the job, and its `code` is the `-32602` the client received.
 - When a policy change leaves an established connection unable to re-resolve,
   as when its credential no longer verifies, it loses its binding and must

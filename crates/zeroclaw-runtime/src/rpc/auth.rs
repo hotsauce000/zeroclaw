@@ -326,6 +326,10 @@ impl AuthDenied {
     /// The attributes of this denial's audit record: the method refused, the
     /// stable reason apart from the message, the code, and the principal and
     /// provider the connection was bound to, if any.
+    ///
+    /// The text goes in `denial_message`, not `message`: log exporters copy
+    /// attributes out flat, and log backends reserve `message` for the
+    /// record's own message.
     pub(crate) fn audit_attrs(
         &self,
         method: &str,
@@ -334,7 +338,7 @@ impl AuthDenied {
         serde_json::json!({
             "method": method,
             "reason": self.reason.as_str(),
-            "message": self.message,
+            "denial_message": self.message,
             "code": self.code,
             "principal_id": auth.map(|auth| auth.principal.id.as_str()),
             "auth_provider": auth.map(|auth| auth.principal.auth_provider_label()),
@@ -2478,7 +2482,7 @@ mod tests {
         let record = denied.audit_attrs("cost/query", Some(&conn));
         assert_eq!(record["method"], "cost/query");
         assert_eq!(record["reason"], "agent_not_entitled");
-        assert_eq!(record["message"], denied.message.as_str());
+        assert_eq!(record["denial_message"], denied.message.as_str());
         assert_eq!(record["code"], FORBIDDEN);
         assert_eq!(record["principal_id"], "user:alice");
         assert_eq!(record["auth_provider"], "peercred");
@@ -2515,7 +2519,7 @@ mod tests {
         let english_record = AuthDenied::agent_not_entitled("main").audit_attrs("cost/query", None);
         let french_record = AuthDenied::new(RpcDenialReason::AgentNotEntitled, french.clone())
             .audit_attrs("cost/query", None);
-        assert_eq!(french_record["message"], french.as_str());
+        assert_eq!(french_record["denial_message"], french.as_str());
         assert_eq!(
             french_record["reason"], english_record["reason"],
             "the recorded reason must not change with the language of the message"
