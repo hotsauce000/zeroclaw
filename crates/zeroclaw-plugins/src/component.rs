@@ -368,6 +368,12 @@ impl PluginState {
             return Err(EgressError::AuthorizationScopeMismatch);
         }
         let profile = authorized.tls_profile();
+        if profile.is_some_and(|profile| {
+            profile.custom_ca().is_some() || profile.client_identity().is_some()
+        }) {
+            self.with_call_config(|config| config.ensure_tls_authorization(authorized))
+                .map_err(|_| EgressError::TlsConfigMismatch)??;
+        }
         // A profile that keeps no system roots never reads them, so it neither
         // waits on nor depends on the machine-store assembly.
         let roots = if crate::egress::trusts_system_roots(profile) {
@@ -381,19 +387,14 @@ impl PluginState {
         } else {
             Arc::new(rustls::RootCertStore::empty())
         };
-        let profile_name = profile
-            .map(|profile| profile.name().as_str())
-            .unwrap_or("system-roots")
-            .to_string();
-        build_tls_client_config(profile, &roots, |reference| {
-            let unavailable = || EgressError::TlsSecretUnavailable {
-                profile: profile_name.clone(),
-                property: reference.as_str().to_string(),
-            };
-            self.with_call_config(|config| config.secret(reference.as_str()).map(ToOwned::to_owned))
-                .map_err(|_| unavailable())?
-                .ok_or_else(unavailable)
-        })
+        if profile.is_some_and(|profile| {
+            profile.custom_ca().is_some() || profile.client_identity().is_some()
+        }) {
+            self.with_call_config(|config| config.tls_client_config(authorized, &roots))
+                .map_err(|_| EgressError::TlsConfigMismatch)?
+        } else {
+            build_tls_client_config(profile, &roots, |_| Err(EgressError::TlsConfigMismatch))
+        }
     }
 
     fn start_call(&mut self, phase: PluginCallPhase) {
@@ -1216,15 +1217,20 @@ mod tests {
 
         EgressHostService::with_private_connection_accounting(EgressPolicyResolver::new(|_| {
             let hosts = ["service.example".to_string()];
-            EgressPolicy::new(&hosts, &[], &[], 4)?.with_tls_profiles([TlsProfile::new(
-                TlsProfileName::new("private-ca")?,
-                &hosts,
-                false,
-                Some(
-                    zeroclaw_api::plugin_key::SecretPropertyRef::parse("ca_pem").expect("portable"),
-                ),
-                None,
-            )?])
+            EgressPolicy::new(&hosts, &[], &[], 4)?
+                .with_tls_profiles([TlsProfile::new(
+                    TlsProfileName::new("private-ca")?,
+                    &hosts,
+                    false,
+                    Some(
+                        zeroclaw_api::plugin_key::SecretPropertyRef::parse("ca_pem")
+                            .expect("portable"),
+                    ),
+                    None,
+                )?])
+                .map(|policy| {
+                    policy.with_tls_config_witness(crate::egress::TlsConfigWitness::new([0; 32]))
+                })
         }))
     }
 
@@ -1356,7 +1362,9 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .clone();
             let values = HashMap::from([("ca_pem".to_string(), ca_pem)]);
-            resolve_plugin_config(&resolver_manifest, scope, Some(&values))
+            resolve_plugin_config(&resolver_manifest, scope, Some(&values)).map(|config| {
+                config.with_tls_config_witness(crate::egress::TlsConfigWitness::new([0; 32]))
+            })
         }));
         let mut state = PluginState::new(PluginStoreSpec::new(
             scope.clone(),
@@ -1402,6 +1410,120 @@ mod tests {
             !first_ca.verifies(second).await,
             "the replaced CA is no longer trusted by the next connection"
         );
+    }
+
+    #[tokio::test]
+    async fn tls_unresolved_frame_rejects_policy_captured_before_dns_wait() {
+        use crate::egress::{
+            EgressPolicy, EgressPolicyResolver, EgressRequest, EgressTransport, TlsConfigWitness,
+            TlsProfile, TlsProfileName,
+        };
+        let manifest = Arc::new(tls_manifest());
+        let scope = tls_scope(
+            &manifest,
+            [PluginPermission::ConfigRead, PluginPermission::SocketClient],
+        );
+        let ca = TestCa::new("dns-race");
+        // One canonical test config supplies both views; change it at the DNS wait.
+        let source = Arc::new(std::sync::RwLock::new((0_u8, ca.pem.clone())));
+        let policy_source = source.clone();
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let egress = EgressHostService::with_test_resolver(
+            EgressPolicyResolver::new(move |_| {
+                let source = policy_source.read().unwrap();
+                let hosts = ["service.example".to_string()];
+                EgressPolicy::new(&hosts, &[], &[], 4)?
+                    .with_tls_profiles([TlsProfile::new(
+                        TlsProfileName::new("private-ca")?,
+                        &hosts,
+                        false,
+                        Some(zeroclaw_api::plugin_key::SecretPropertyRef::parse("ca_pem").unwrap()),
+                        None,
+                    )?])
+                    .map(|policy| {
+                        policy.with_tls_config_witness(TlsConfigWitness::new([source.0; 32]))
+                    })
+            }),
+            |_, port| vec![std::net::SocketAddr::from(([1, 1, 1, 1], port))],
+        )
+        .with_test_dns_pause(arrived.clone(), release.clone());
+        let config_source = source.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config_calls = calls.clone();
+        let services = crate::services::test_services(PluginConfigResolver::new(move |scope| {
+            config_calls.fetch_add(1, Ordering::SeqCst);
+            let source = config_source.read().unwrap();
+            resolve_plugin_config(
+                &manifest,
+                scope,
+                Some(&HashMap::from([("ca_pem".into(), source.1.clone())])),
+            )
+            .map(|config| config.with_tls_config_witness(TlsConfigWitness::new([source.0; 32])))
+        }));
+        let mut state = PluginState::new(PluginStoreSpec::new(
+            scope.clone(),
+            services,
+            test_limits(1_000),
+        ));
+        state.start_call(PluginCallPhase::ToolExecute);
+        let request =
+            EgressRequest::new(scope.clone(), EgressTransport::Tls, "service.example", 443)
+                .unwrap()
+                .with_tls_profile("private-ca")
+                .unwrap();
+        let authorization = egress.authorize(request.clone());
+        tokio::pin!(authorization);
+        tokio::select! { biased;
+            result = &mut authorization => panic!("DNS must be paused: {result:?}"),
+            () = arrived.notified() => {}
+        }
+        source.write().unwrap().0 = 1;
+        release.notify_one();
+        let old = authorization.await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "frame was still unresolved at the DNS wait"
+        );
+        assert!(matches!(
+            state.tls_client_config(&old).await,
+            Err(EgressError::TlsConfigMismatch)
+        ));
+        drop(old);
+        // Denied authorization relinquishes its budget; a coherent request succeeds.
+        let current = egress
+            .authorize_addresses(
+                request.clone(),
+                [std::net::SocketAddr::from(([1, 1, 1, 1], 443))],
+            )
+            .unwrap();
+        assert!(
+            ca.verifies(state.tls_client_config(&current).await.unwrap())
+                .await
+        );
+        drop(current);
+        state.finish_call();
+        // Cancellation while DNS is queued must not reserve a connection lease.
+        {
+            let pending = egress.authorize(request.clone());
+            tokio::pin!(pending);
+            tokio::select! { biased;
+                result = &mut pending => panic!("DNS must be paused: {result:?}"),
+                () = arrived.notified() => {}
+            }
+        }
+        let leases = (0..4)
+            .map(|_| {
+                egress
+                    .authorize_addresses(
+                        request.clone(),
+                        [std::net::SocketAddr::from(([1, 1, 1, 1], 443))],
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(leases.len(), 4);
     }
 
     #[test]

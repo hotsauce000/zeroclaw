@@ -371,6 +371,28 @@ impl fmt::Display for EgressTransport {
     }
 }
 
+/// Opaque, transient witness derived from the canonical configuration inputs.
+///
+/// Hosts derive this from policy, profile references and material under the
+/// same read as each view. It is not a policy cache or a mutable revision counter.
+/// Never expose the witness to guests or persist it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TlsConfigWitness([u8; 32]);
+
+impl TlsConfigWitness {
+    /// Construct a host-derived keyed content witness (not a guest value).
+    #[must_use]
+    pub fn new(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+}
+
+impl std::fmt::Debug for TlsConfigWitness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TlsConfigWitness([redacted])")
+    }
+}
+
 /// One materialized view of canonical operator egress policy.
 ///
 /// Construct this inside an [`EgressPolicyResolver`] call. Long-lived stores
@@ -383,6 +405,7 @@ impl fmt::Display for EgressTransport {
 /// granted it, and no manifest, permission, or default adds to that.
 #[derive(Clone, Debug)]
 pub struct EgressPolicy {
+    tls_config_witness: Option<TlsConfigWitness>,
     hosts: Vec<String>,
     allow_private: Vec<String>,
     tls_profiles: HashMap<TlsProfileName, TlsProfile>,
@@ -437,9 +460,17 @@ impl EgressPolicy {
             hosts,
             allow_private,
             tls_profiles: HashMap::new(),
+            tls_config_witness: None,
             nat64_prefixes,
             max_connections_per_instance,
         })
+    }
+
+    /// Bind this policy to the same canonical inputs as frame TLS material.
+    #[must_use]
+    pub fn with_tls_config_witness(mut self, witness: TlsConfigWitness) -> Self {
+        self.tls_config_witness = Some(witness);
+        self
     }
 
     /// Attach the instance's TLS profiles (`plugins.entries[].tls_profiles`).
@@ -598,7 +629,7 @@ impl EgressRequest {
 
     /// The scope this request was made under.
     #[must_use]
-    #[cfg(feature = "plugins-wasmtime")]
+    #[cfg(any(feature = "plugins-wasmtime", test))]
     pub(crate) fn scope(&self) -> &PluginInstanceScope {
         &self.scope
     }
@@ -777,6 +808,8 @@ impl Drop for ConnectionLease {
 /// against one budget lease.
 #[derive(Debug)]
 pub struct AuthorizedEgress {
+    #[cfg(any(feature = "plugins-wasmtime", test))]
+    tls_config_witness: Option<TlsConfigWitness>,
     request: EgressRequest,
     destination: ResolvedDestination,
     tls_profile: Option<TlsProfile>,
@@ -784,6 +817,11 @@ pub struct AuthorizedEgress {
 }
 
 impl AuthorizedEgress {
+    #[cfg(any(feature = "plugins-wasmtime", test))]
+    pub(crate) fn tls_config_witness(&self) -> Option<&TlsConfigWitness> {
+        self.tls_config_witness.as_ref()
+    }
+
     /// Original canonical request.
     #[must_use]
     pub fn request(&self) -> &EgressRequest {
@@ -831,6 +869,8 @@ pub struct EgressHostService {
     /// `lookup_host` call.
     #[cfg(test)]
     resolver_override: Option<TestAddressResolver>,
+    #[cfg(test)]
+    dns_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl fmt::Debug for EgressHostService {
@@ -852,6 +892,8 @@ impl EgressHostService {
             connections: ConnectionRegistry::shared(),
             #[cfg(test)]
             resolver_override: None,
+            #[cfg(test)]
+            dns_pause: None,
         }
     }
 
@@ -870,6 +912,8 @@ impl EgressHostService {
             resolver,
             connections: ConnectionRegistry::default(),
             resolver_override: None,
+            #[cfg(test)]
+            dns_pause: None,
         }
     }
 
@@ -896,7 +940,18 @@ impl EgressHostService {
             resolver,
             connections: ConnectionRegistry::default(),
             resolver_override: Some(Arc::new(addresses)),
+            dns_pause: None,
         }
+    }
+
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    pub(crate) fn with_test_dns_pause(
+        mut self,
+        arrived: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.dns_pause = Some((arrived, release));
+        self
     }
 
     /// Resolve DNS, apply current policy, pin the checked addresses, and reserve
@@ -911,6 +966,11 @@ impl EgressHostService {
     /// or connection-budget acquisition fails.
     pub async fn authorize(&self, request: EgressRequest) -> Result<AuthorizedEgress, EgressError> {
         let policy = self.resolve_policy(&request)?;
+        #[cfg(test)]
+        if let Some((arrived, release)) = &self.dns_pause {
+            arrived.notify_one();
+            release.notified().await;
+        }
         // Test-only DNS override. Production never installs one, so under
         // `not(test)` this block compiles to nothing and the resolution below is
         // exactly the shipped `lookup_host` path. Under test it lets a case pin
@@ -1037,6 +1097,8 @@ impl EgressHostService {
             .and_then(|name| policy.tls_profiles.get(name))
             .cloned();
         Ok(AuthorizedEgress {
+            #[cfg(any(feature = "plugins-wasmtime", test))]
+            tls_config_witness: policy.tls_config_witness.clone(),
             request,
             destination,
             tls_profile,
@@ -1209,6 +1271,9 @@ pub enum EgressError {
     /// A selected TLS profile names a secret this instance cannot resolve.
     #[error("plugin TLS profile {profile:?} cannot resolve secret property {property:?}")]
     TlsSecretUnavailable { profile: String, property: String },
+    /// Frame material and request authorization do not describe one config view.
+    #[error("plugin TLS policy and frame material are not coherent")]
+    TlsConfigMismatch,
     /// DNS resolution failed before policy could pin an address set.
     #[error("DNS resolution for {host}:{port} failed: {reason}")]
     DnsFailed {

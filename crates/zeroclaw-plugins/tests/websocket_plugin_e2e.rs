@@ -214,13 +214,20 @@ fn egress(hosts: &[&str], with_profile: bool) -> EgressHostService {
         if !with_profile {
             return Ok(policy);
         }
-        policy.with_tls_profiles([TlsProfile::new(
-            TlsProfileName::new("corp")?,
-            &["localhost".to_string()],
-            false,
-            Some(SecretPropertyRef::parse("ca_pem".to_string()).expect("ca_pem reference")),
-            None,
-        )?])
+        policy
+            .with_tls_profiles([TlsProfile::new(
+                TlsProfileName::new("corp")?,
+                &["localhost".to_string()],
+                false,
+                Some(SecretPropertyRef::parse("ca_pem".to_string()).expect("ca_pem reference")),
+                None,
+            )?])
+            .map(|policy| {
+                policy.with_tls_config_witness(
+                    // This fixture's policy and config are immutable for the invocation.
+                    zeroclaw_plugins::egress::TlsConfigWitness::new([0; 32]),
+                )
+            })
     }))
 }
 
@@ -255,7 +262,11 @@ async fn run(run: Run<'_>) -> Result<String, String> {
     let resolver_manifest = manifest.clone();
     let services = PluginHostServices::new(
         PluginConfigResolver::new(move |scope| {
-            resolve_plugin_config(&resolver_manifest, scope, Some(&configured))
+            resolve_plugin_config(&resolver_manifest, scope, Some(&configured)).map(|config| {
+                config.with_tls_config_witness(zeroclaw_plugins::egress::TlsConfigWitness::new(
+                    [0; 32],
+                ))
+            })
         }),
         state_service(),
     );
