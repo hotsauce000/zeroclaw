@@ -1103,13 +1103,12 @@ impl RpcDispatcher {
         // the retained identity so profile/mapping/roster changes reach
         // this established connection now, not at reconnect.
         let current_generation = self.ctx.auth.generation();
-        let stale_identity = self
+        let stale_auth = self
             .auth
             .as_ref()
             .filter(|auth| auth.generation != current_generation)
-            .map(|auth| auth.identity.clone());
-        if stale_identity.is_some() {
-            let stale_auth = self.auth.as_ref().expect("stale auth exists").clone();
+            .cloned();
+        if let Some(stale_auth) = stale_auth {
             match self.ctx.auth.revalidate_and_resolve(&stale_auth) {
                 Ok(resolved) => {
                     if let Some(auth) = self.auth.as_mut() {
@@ -1119,11 +1118,12 @@ impl RpcDispatcher {
                     }
                 }
                 Err(reason) => {
-                    // The current policy grants this identity nothing:
-                    // drop the binding entirely.
+                    // The current policy grants this identity nothing: drop the
+                    // binding entirely, but attribute the denial to the principal
+                    // that held it.
                     self.auth = None;
                     let denied = AuthDenied::from_deny_reason(reason);
-                    self.audit_auth_denial(method, &denied);
+                    audit_denial(Some(&stale_auth), method, &denied);
                     return Err(denied);
                 }
             }
@@ -12050,6 +12050,19 @@ mod tests {
         config
     }
 
+    /// `roster_config` with its user renamed, so a test that reads the
+    /// process-wide audit log binds a principal (`user:<user>`) that no
+    /// concurrently running test emits records for.
+    fn roster_config_as(user: &str, uid: u32) -> zeroclaw_config::schema::Config {
+        let mut config = roster_config(uid);
+        let entry = config
+            .users
+            .remove("alice")
+            .expect("roster_config binds alice");
+        config.users.insert(user.to_string(), entry);
+        config
+    }
+
     #[tokio::test]
     async fn wss_initialize_without_a_token_is_denied() {
         let ctx = enforcement_ctx(zeroclaw_config::schema::Config::default());
@@ -12130,6 +12143,92 @@ mod tests {
         assert_eq!(
             denied.code,
             zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED
+        );
+    }
+
+    /// The attributes of the first "RPC authorization denied" record in
+    /// `records` attributed to `principal` for `method`.
+    ///
+    /// Other tests in this binary emit denial records into the same
+    /// process-wide broadcast concurrently, so every other frame is skipped.
+    /// The gate emits its record synchronously, so the frame is already
+    /// buffered once the dispatch that produced it has returned.
+    fn denial_record(
+        records: &mut tokio::sync::broadcast::Receiver<Value>,
+        principal: &str,
+        method: &str,
+    ) -> Value {
+        use tokio::sync::broadcast::error::TryRecvError;
+        // Who the skipped denials of `method` were attributed to, so a failure
+        // tells a misattributed record apart from a missing one.
+        let mut skipped = Vec::new();
+        loop {
+            match records.try_recv() {
+                Ok(mut frame) => {
+                    if frame["message"] != "RPC authorization denied" {
+                        continue;
+                    }
+                    let attributes = &mut frame["attributes"];
+                    if attributes["method"] != method {
+                        continue;
+                    }
+                    if attributes["principal_id"] == principal {
+                        return attributes.take();
+                    }
+                    skipped.push(attributes["principal_id"].take());
+                }
+                Err(TryRecvError::Lagged(_)) => {}
+                Err(TryRecvError::Empty) => panic!(
+                    "no \"RPC authorization denied\" record attributed to {principal} \
+                     for {method} reached the log broadcast; its other denials of \
+                     {method} were attributed to {}",
+                    Value::Array(skipped)
+                ),
+                Err(TryRecvError::Closed) => panic!(
+                    "the log broadcast closed before a denial record attributed to \
+                     {principal} for {method} arrived"
+                ),
+            }
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn denial_after_failed_revalidation_keeps_the_principal_it_dropped() {
+        // Hold the writer and hook locks for the whole test so no other test
+        // swaps the broadcast sender while this one reads from it.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut records = zeroclaw_log::subscribe_or_install();
+        while records.try_recv().is_ok() {}
+
+        let ctx = enforcement_ctx(roster_config_as("revalidation-audit", 4242));
+        let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // Removing the roster moves the generation; the gate's revalidation
+        // of the stale binding then fails and drops it.
+        ctx.auth
+            .refresh_from_config(&zeroclaw_config::schema::Config::default())
+            .expect("the default config is a valid refresh");
+        let response = rpc(&mut peer, &mut rx, 1, "session/list", json!({})).await;
+        let error = &response["error"];
+        assert_eq!(error["code"], json!(AUTH_REQUIRED), "{response}");
+
+        // The record names the principal whose binding was just dropped, not
+        // the unbound connection left behind.
+        let record = denial_record(&mut records, "user:revalidation-audit", "session/list");
+        assert_eq!(
+            record["principal_id"], "user:revalidation-audit",
+            "{record}"
+        );
+        assert_eq!(record["auth_provider"], "peercred", "{record}");
+        assert_eq!(record["reason"], "bad_credential", "{record}");
+        assert_eq!(record["code"], json!(AUTH_REQUIRED), "{record}");
+        assert_eq!(record["message"], error["message"], "{record}");
+        assert!(
+            peer.auth.is_none(),
+            "a failed revalidation still drops the binding"
         );
     }
 
