@@ -7854,6 +7854,7 @@ mod tests {
         _tmp: TempDir,
         tool: Arc<dyn Tool>,
         cancellation: CancellationToken,
+        authority: crate::LiveConfigAuthority,
     }
 
     fn factory_cancellation_fixture(model_uri: String) -> FactoryCancellationFixture {
@@ -7921,6 +7922,7 @@ mod tests {
             },
         );
 
+        let authority = crate::LiveConfigAuthority::new(config.clone());
         let config = Arc::new(config);
         let security =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
@@ -7931,7 +7933,7 @@ mod tests {
             .clone();
         let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
         let cancellation = CancellationToken::new();
-        let built = crate::tools::all_tools_with_runtime(
+        let built = crate::tools::all_tools_with_runtime_and_execution_capability(
             Arc::clone(&config),
             &security,
             &risk_profile,
@@ -7952,7 +7954,8 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some(authority.config()),
+            Some(authority.execution_capability()),
             Some(cancellation.clone()),
         );
         let tool = built
@@ -7966,6 +7969,7 @@ mod tests {
             _tmp: tmp,
             tool,
             cancellation,
+            authority,
         }
     }
 
@@ -8035,6 +8039,17 @@ mod tests {
         });
 
         wait_for_request_count(&requests, 1).await;
+        assert_eq!(
+            fixture
+                .authority
+                .agent_lifecycle()
+                .active_turn_count("target"),
+            1
+        );
+        assert!(matches!(
+            fixture.authority.agent_lifecycle().begin_delete("target"),
+            Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
+        ));
         fixture.cancellation.cancel();
         let result = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
@@ -8046,6 +8061,20 @@ mod tests {
             "cancelled parallel delegation succeeded: {result:?}"
         );
 
+        assert_eq!(
+            fixture
+                .authority
+                .agent_lifecycle()
+                .active_turn_count("target"),
+            0
+        );
+        assert!(
+            fixture
+                .authority
+                .agent_lifecycle()
+                .begin_delete("target")
+                .is_ok()
+        );
         let settled_requests = requests.load(std::sync::atomic::Ordering::SeqCst);
         sleep(Duration::from_millis(200)).await;
         assert_eq!(

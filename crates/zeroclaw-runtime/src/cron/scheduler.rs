@@ -151,6 +151,7 @@ tokio::task_local! {
 #[cfg(test)]
 tokio::task_local! {
     static TEST_PERSISTENCE_WORKER_POOL: Arc<tokio::sync::Semaphore>;
+    static TEST_RETAINED_RESULT_SLOTS: Arc<tokio::sync::Semaphore>;
 }
 
 #[cfg(test)]
@@ -219,6 +220,10 @@ fn best_effort_worker_pool() -> Arc<tokio::sync::Semaphore> {
 }
 
 fn retained_result_slots() -> Arc<tokio::sync::Semaphore> {
+    #[cfg(test)]
+    if let Ok(pool) = TEST_RETAINED_RESULT_SLOTS.try_with(Arc::clone) {
+        return pool;
+    }
     static POOL: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     Arc::clone(
         POOL.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_RETAINED_RESULT_OWNERS))),
@@ -1710,15 +1715,15 @@ async fn execute_and_persist_claimed_job(
     component: &str,
     execution_admission: Option<AgentExecutionAdmission>,
 ) -> (String, bool, String) {
-    if let Some(admission) = execution_admission.as_ref() {
-        if let Err(error) = admission.revalidate() {
-            let _ = release_claim(config, &job.id, claim);
-            return (
-                job.id.clone(),
-                false,
-                format!("cron target admission failed: {error}"),
-            );
-        }
+    if let Some(admission) = execution_admission.as_ref()
+        && let Err(error) = admission.revalidate()
+    {
+        let _ = release_claim(config, &job.id, claim);
+        return (
+            job.id.clone(),
+            false,
+            format!("cron target admission failed: {error}"),
+        );
     }
     let effective_config = execution_admission
         .as_ref()
@@ -2057,6 +2062,7 @@ async fn run_agent_job_with_timeout(
             let post_pre_run_marker = TEST_POST_PRE_RUN_MARKER.try_with(Arc::clone).ok();
             #[cfg(test)]
             let active_pre_run_workers = TEST_ACTIVE_PRE_RUN_WORKERS.try_with(Arc::clone).ok();
+            let cron_config = config.clone();
             let run_alias = agent_alias.to_string();
             let run_temperature = config
                 .model_provider_for_agent(agent_alias)
@@ -2382,13 +2388,14 @@ async fn persist_claimed_job_result(
     // Read the pool inside this task: the test seam is a task-local, and the
     // retained-result owner below runs on a task that does not inherit it.
     let persistence_pool = persistence_worker_pool();
+    let retention_pool = retained_result_slots();
     // The result owner exists before cancellable admission. Dropping the
     // caller only drops its JoinHandle: this owner retains both the claim and
     // tracker registration until admission and the actual write have settled.
     let writer_job_id = job.id.clone();
     let worker = zeroclaw_spawn::spawn!(async move {
         let result = async {
-            let _retention = retained_result_slots()
+            let _retention = retention_pool
                 .acquire_owned()
                 .await
                 .map_err(|error| anyhow::Error::msg(error.to_string()))?;
@@ -5536,7 +5543,7 @@ mod tests {
         let security = test_security(&config);
 
         let (success, output) = Box::pin(execute_job_with_retry(
-            &config, &security, TEST_AGENT, &job, None, false,
+            &config, &security, TEST_AGENT, &job, None, false, None,
         ))
         .await;
 
@@ -5710,7 +5717,8 @@ mod tests {
             } else {
                 let claimed = claim_due_jobs(&config, vec![selected_job]);
                 assert_eq!(claimed.len(), 1);
-                process_due_jobs(&config, claimed, "stale-cron", &events, Some(selection)).await;
+                process_claimed_jobs(&config, claimed, "stale-cron", &events, Some(selection))
+                    .await;
                 assert!(
                     claim_job(&config, &job.id, Utc::now()).unwrap(),
                     "stale rejection releases claim"
@@ -7826,7 +7834,8 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn completed_persistence_survives_timeout_drop_and_replacement_recovery() {
-        for block_write in [false, true] {
+        for boundary in ["retention", "admission", "write"] {
+            let block_write = boundary == "write";
             for drop_caller in [false, true] {
                 let tmp = TempDir::new().unwrap();
                 let config = test_config(&tmp).await;
@@ -7840,12 +7849,25 @@ mod tests {
                 let claim = claim_job_with_token(&config, &job.id, Utc::now())
                     .unwrap()
                     .unwrap();
+                let authority = Arc::new(crate::LiveConfigAuthority::new(config.clone()));
+                let lifecycle = authority.agent_lifecycle();
+                let admission = authority.execution_capability().admit(TEST_AGENT).unwrap();
                 let expected_token = claim.as_str().to_string();
                 let pool = Arc::new(tokio::sync::Semaphore::new(1));
+                let retention = Arc::new(tokio::sync::Semaphore::new(1));
                 let held = if block_write {
                     None
                 } else {
-                    Some(pool.clone().acquire_owned().await.unwrap())
+                    Some(
+                        if boundary == "retention" {
+                            retention.clone()
+                        } else {
+                            pool.clone()
+                        }
+                        .acquire_owned()
+                        .await
+                        .unwrap(),
+                    )
                 };
                 let gate = Arc::new(TestPersistenceGate::default());
                 let _gate_release = TestGateRelease(gate.clone());
@@ -7866,28 +7888,33 @@ mod tests {
                             now,
                             now,
                             &claim,
-                            None,
+                            Some(admission),
                         )
                         .await
                     };
-                    TEST_PERSIST_OWNER_READY
+                    TEST_RETAINED_RESULT_SLOTS
                         .scope(
-                            caller_ready,
-                            TEST_PERSISTENCE_WORKER_POOL.scope(
-                                pool,
-                                TEST_PERSIST_TIMEOUT.scope(
-                                    if drop_caller {
-                                        Duration::from_secs(30)
-                                    } else {
-                                        Duration::from_millis(50)
-                                    },
-                                    async {
-                                        if block_write {
-                                            TEST_PERSIST_BARRIER.scope(caller_gate, operation).await
+                            retention,
+                            TEST_PERSIST_OWNER_READY.scope(
+                                caller_ready,
+                                TEST_PERSISTENCE_WORKER_POOL.scope(
+                                    pool,
+                                    TEST_PERSIST_TIMEOUT.scope(
+                                        if drop_caller {
+                                            Duration::from_secs(30)
                                         } else {
-                                            operation.await
-                                        }
-                                    },
+                                            Duration::from_millis(50)
+                                        },
+                                        async {
+                                            if block_write {
+                                                TEST_PERSIST_BARRIER
+                                                    .scope(caller_gate, operation)
+                                                    .await
+                                            } else {
+                                                operation.await
+                                            }
+                                        },
+                                    ),
                                 ),
                             ),
                         )
@@ -7910,6 +7937,20 @@ mod tests {
                 } else {
                     assert!(!caller.await.unwrap().success);
                 }
+                assert_eq!(lifecycle.active_turn_count(TEST_AGENT), 1);
+                assert!(matches!(
+                    lifecycle.begin_delete(TEST_AGENT),
+                    Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
+                ));
+                // A produced result must finish even after admission closes. Its
+                // retained lease makes reload wait, rather than discarding history.
+                authority.close_agent_lifecycle();
+                let draining_authority = authority.clone();
+                let drain = zeroclaw_spawn::spawn!(async move {
+                    draining_authority.drain_agent_lifecycle().await;
+                });
+                tokio::task::yield_now().await;
+                assert!(!drain.is_finished());
                 assert_eq!(
                     clear_stale_locks(&config).unwrap(),
                     0,
@@ -7972,11 +8013,113 @@ mod tests {
                         job_name: job.name.clone()
                     })
                 );
+                time::timeout(Duration::from_secs(10), drain)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(lifecycle.active_turn_count(TEST_AGENT), 0);
                 assert_eq!(tracker.active_count(), 0);
                 assert!(crate::cron::store::current_claim_for_test(&config, &job.id).is_err());
             }
         }
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_worker_deadline_and_completion_retain_claim_and_alias_until_stop() {
+        for deadline_expires in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp).await;
+            let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo owned").unwrap();
+            let claim = claim_job_with_token(&config, &job.id, Utc::now())
+                .unwrap()
+                .unwrap();
+            let expected_token = claim.as_str().to_owned();
+            let authority = Arc::new(crate::LiveConfigAuthority::new(config.clone()));
+            let lifecycle = authority.agent_lifecycle();
+            let admission = authority.execution_capability().admit(TEST_AGENT).unwrap();
+            let tracker = OwnedWorkerTracker::for_config(&config);
+            let worker_tracker = tracker.clone();
+            let gate = Arc::new(TestPersistenceGate::default());
+            let _release = TestGateRelease(gate.clone());
+            let worker_gate = gate.clone();
+            let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+            let caller = zeroclaw_spawn::spawn!(super::super::store::claim_scope::scope(
+                claim,
+                async move {
+                    supervise_owned(
+                        if deadline_expires {
+                            Duration::from_millis(50)
+                        } else {
+                            Duration::from_secs(30)
+                        },
+                        worker_tracker,
+                        Box::new(move |cancellation| {
+                            Box::pin(async move {
+                                token_tx.send(cancellation).unwrap();
+                                worker_gate.block();
+                                7
+                            })
+                        }),
+                        Some(admission),
+                    )
+                    .await
+                }
+            ));
+            let token = time::timeout(Duration::from_secs(10), token_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            time::timeout(Duration::from_secs(10), gate.entered.notified())
+                .await
+                .unwrap();
+            if deadline_expires {
+                time::timeout(Duration::from_secs(10), token.cancelled())
+                    .await
+                    .unwrap();
+            }
+            assert!(!caller.is_finished());
+            assert_eq!(lifecycle.active_turn_count(TEST_AGENT), 1);
+            assert!(matches!(
+                lifecycle.begin_delete(TEST_AGENT),
+                Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
+            ));
+            assert_eq!(clear_stale_locks(&config).unwrap(), 0);
+            assert_eq!(
+                crate::cron::store::current_claim_for_test(&config, &job.id)
+                    .unwrap()
+                    .as_str(),
+                expected_token
+            );
+            assert!(
+                claim_job_with_token(&config, &job.id, Utc::now())
+                    .unwrap()
+                    .is_none()
+            );
+            gate.unblock();
+            let result = time::timeout(Duration::from_secs(10), caller)
+                .await
+                .unwrap()
+                .unwrap();
+            if deadline_expires {
+                assert!(matches!(
+                    result,
+                    Err(OwnedSupervisionError::DeadlineExceeded)
+                ));
+            } else {
+                assert_eq!(result.unwrap(), 7);
+            }
+            time::timeout(Duration::from_secs(10), tracker.wait_for_drain())
+                .await
+                .unwrap();
+            assert_eq!(lifecycle.active_turn_count(TEST_AGENT), 0);
+            // Scheduled claims are persisted/released by their caller after worker
+            // acknowledgement; this control ends that exact claim explicitly.
+            let settled = crate::cron::store::current_claim_for_test(&config, &job.id).unwrap();
+            assert_eq!(settled.as_str(), expected_token);
+            release_claim(&config, &job.id, &settled).unwrap();
+            assert!(lifecycle.begin_delete(TEST_AGENT).is_ok());
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_manual_owner_keeps_claim_until_owned_side_effect_settles() {
         let tmp = TempDir::new().unwrap();
@@ -7985,6 +8128,9 @@ mod tests {
         let raw = cron::claim_job_for_agent_with_token(&config, &job.id, TEST_AGENT, Utc::now())
             .unwrap()
             .unwrap();
+        let authority = Arc::new(crate::LiveConfigAuthority::new(config.clone()));
+        let lifecycle = authority.agent_lifecycle();
+        let admission = authority.execution_capability().admit(TEST_AGENT).unwrap();
         let owner = CronClaimToken::manual(&config, &job.id, raw);
         let gate = Arc::new(TestPersistenceGate::default());
         let _gate_release = TestGateRelease(gate.clone());
@@ -8001,7 +8147,7 @@ mod tests {
                             worker_gate.block();
                         })
                     }),
-                    None,
+                    Some(admission),
                 )
                 .await
             }));
@@ -8010,6 +8156,18 @@ mod tests {
             .unwrap();
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(lifecycle.active_turn_count(TEST_AGENT), 1);
+        assert!(matches!(
+            lifecycle.begin_delete(TEST_AGENT),
+            Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
+        ));
+        authority.close_agent_lifecycle();
+        let draining_authority = authority.clone();
+        let drain = zeroclaw_spawn::spawn!(async move {
+            draining_authority.drain_agent_lifecycle().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
         assert_eq!(clear_stale_locks(&config).unwrap(), 0);
         assert!(
             cron::claim_job_for_agent_with_token(&config, &job.id, TEST_AGENT, Utc::now())
@@ -8020,6 +8178,11 @@ mod tests {
         time::timeout(Duration::from_secs(10), tracker.wait_for_drain())
             .await
             .unwrap();
+        time::timeout(Duration::from_secs(10), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lifecycle.active_turn_count(TEST_AGENT), 0);
         assert!(crate::cron::store::current_claim_for_test(&config, &job.id).is_err());
         let next = cron::claim_job_for_agent_with_token(&config, &job.id, TEST_AGENT, Utc::now())
             .unwrap()

@@ -287,28 +287,16 @@ impl Tool for SendMessageToPeerTool {
                             sender_alias: sender,
                         });
                         let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
-                            if let Some(live_config) = live_config {
-                                Box::pin(
-                                    crate::agent::loop_::process_message_shared_with_live_config(
-                                        cfg,
-                                        live_config,
-                                        &recipient_alias,
-                                        &body,
-                                        None,
-                                        zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                                        principal,
-                                    ),
-                                )
-                            } else {
-                                Box::pin(crate::agent::loop_::process_message_shared(
-                                    cfg,
-                                    &recipient_alias,
-                                    &body,
-                                    None,
-                                    zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                                    principal,
-                                ))
-                            };
+                            Box::pin(crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
+                                cfg,
+                                live_config,
+                                &recipient_alias,
+                                &body,
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                                admission,
+                                principal,
+                            ));
                         deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
                     })
                     .await
@@ -1388,8 +1376,14 @@ mod tests {
             .insert("default".to_string(), RiskProfileConfig::default());
 
         let run_token = CancellationToken::new();
-        let tool = SendMessageToPeerTool::new(Arc::new(config), "sender")
-            .with_run_owned_cancellation_token(run_token);
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+            Arc::new(config),
+            "sender",
+            Some(authority.config()),
+            Some(authority.execution_capability()),
+        )
+        .with_run_owned_cancellation_token(run_token);
 
         let result = tokio::task::spawn_blocking(move || {
             // A stand-in for the scheduler's private runtime: an owned thread
@@ -1434,6 +1428,16 @@ mod tests {
              a detached recipient would have been aborted with the send already accepted"
         );
 
+        assert_eq!(
+            authority.agent_lifecycle().active_turn_count("recipient"),
+            0
+        );
+        assert!(
+            authority
+                .agent_lifecycle()
+                .begin_delete("recipient")
+                .is_ok()
+        );
         server.abort();
     }
     /// The test above proves the run-owned send waits for the recipient's own
@@ -1577,8 +1581,14 @@ mod tests {
         );
 
         let run_token = CancellationToken::new();
-        let tool = SendMessageToPeerTool::new(Arc::new(config), "sender")
-            .with_run_owned_cancellation_token(run_token);
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+            Arc::new(config),
+            "sender",
+            Some(authority.config()),
+            Some(authority.execution_capability()),
+        )
+        .with_run_owned_cancellation_token(run_token);
 
         let result = tool
             .execute(json!({
@@ -1613,6 +1623,16 @@ mod tests {
             requests[1]
         );
 
+        assert_eq!(
+            authority.agent_lifecycle().active_turn_count("recipient"),
+            0
+        );
+        assert!(
+            authority
+                .agent_lifecycle()
+                .begin_delete("recipient")
+                .is_ok()
+        );
         server.abort();
     }
 }

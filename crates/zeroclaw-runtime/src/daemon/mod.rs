@@ -4968,11 +4968,12 @@ mod tests {
             move |_host,
                   _port,
                   _config,
+                  _live_config_authority,
                   _event_tx,
                   reload_controls,
                   _tui_reg,
-                  _ready_tx,
-                  _relay_claim| {
+                  _inbound_authority,
+                  _ready_tx| {
                 let reload_control_tx = Arc::clone(&reload_control_tx);
                 Box::pin(async move {
                     let reload_tx = reload_controls
