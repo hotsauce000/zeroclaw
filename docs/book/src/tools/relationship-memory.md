@@ -31,6 +31,12 @@ read_knowledge_from = ["agent_b"]
 
 The grant is directional and read-only: `agent_a` can read (and privately annotate) `agent_b`'s entries, while `agent_b` learns nothing about `agent_a`'s. Writes always attribute to the caller. A node another agent owns behaves exactly like a node that does not exist, including in `relate` errors. A configured but disabled sibling remains a valid source so an active agent can deliberately read its retained knowledge; the disabled sibling does not run or receive reciprocal access.
 
+Live sessions retain the caller identity, not a grant snapshot. Each graph
+operation resolves the current allowlist after storage waits; revocation applies
+to an already registered tool, including rows written after revocation. Missing
+or disabled callers are refused. The config read guard remains held only through
+the synchronous storage operation, never across an asynchronous wait.
+
 Scoping is a confidentiality boundary, not a resource boundary. The `knowledge.max_nodes` budget stays install-wide, so one agent sitting at the cap stops `capture` for every agent on the install even though none of them can see each other's rows.
 
 ### Assign pre-attribution rows during upgrade
@@ -56,6 +62,13 @@ is assigned to that alias on the next startup. Assigned rows obey the same
 directional `read_knowledge_from` rules as newly captured knowledge.
 
 Agent rename moves knowledge ownership, while delete archives and purges it.
+Deletion captures its row and affected-edge set before asynchronous archive work.
+After the archive is durable, purge verifies that exact set inside its write
+transaction. Changed or additional rows or edges are retained with a retry warning;
+retry produces a fresh archive. Creating or renaming an alias onto remaining
+knowledge is refused, including when that residue cannot be inspected. A stale
+retirement cannot purge a later incarnation's new rows.
+
 Initial rename works through the supported gateway or CLI lifecycle surfaces.
 After a partially committed rename, the gateway can retry through its local
 residue probe and the RPC lifecycle path can resume the shared owned-state
@@ -277,3 +290,10 @@ Relationship memory is durable. Treat it like any other public or shared knowled
 - [Skills](./skills.md)
 - [Using relationship memory from skills](./relationship-memory-skill-template.md)
 - [Privacy & PII discipline](../contributing/privacy.md)
+
+Retirement evidence includes durable insertion identities for edges, so deleting
+and recreating an identical relation cannot authorize an older purge. Existing
+stores gain these identities on normal graph open. If a standalone deletion
+first encounters the older schema, it retains the rows with a warning while the
+cascade upgrades the store; repeating deletion archives the upgraded identities
+and completes cleanup. Read-only config lifecycle probes never run migrations.

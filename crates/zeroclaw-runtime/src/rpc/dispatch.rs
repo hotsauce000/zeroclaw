@@ -8534,6 +8534,8 @@ impl RpcDispatcher {
         }
 
         let workspace = working.agent_workspace_dir(&req.key);
+        let knowledge_retirement =
+            crate::agent_owned_state::prepare_knowledge_retirement(&working, &req.key);
         if configured {
             let plan =
                 zeroclaw_config::alias_refs::plan_delete(&working, &AliasKind::Agent, &req.key);
@@ -8584,12 +8586,13 @@ impl RpcDispatcher {
         let archive =
             crate::agent_owned_state::archive_agent_workspace(&committed, &req.key, &workspace)
                 .await;
-        let mut owned = crate::agent_owned_state::cascade_owned_state(
+        let mut owned = crate::agent_owned_state::cascade_owned_state_with_retirement(
             &committed,
             self.ctx.memory.as_ref(),
             self.ctx.session_backend.as_ref(),
             &req.key,
             &archive.path,
+            knowledge_retirement,
         )
         .await;
         if !archive.warnings.is_empty() {
@@ -26925,6 +26928,7 @@ mod tests {
             config,
             Arc::clone(&sessions),
             None,
+            None,
             Some(Arc::clone(&acp_store)),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -29147,6 +29151,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_session_knowledge_observes_config_set_revocation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config.knowledge.enabled = true;
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .into_owned();
+        config.agents.insert("sibling".into(), Default::default());
+        config
+            .agents
+            .get_mut("test-agent")
+            .unwrap()
+            .workspace
+            .read_knowledge_from = vec!["sibling".into()];
+        let first = seed_agent_knowledge(&config, "sibling", "retained scope proof");
+        let own = seed_agent_knowledge(&config, "test-agent", "caller owned node");
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.handle_session_new(&json!({"agent_alias":"test-agent", "session_id":"knowledge-live", "chat_mode":"chat"})).await.unwrap();
+        let retained = sessions.get_agent("knowledge-live").await.unwrap();
+        async fn search(agent: &Arc<tokio::sync::Mutex<crate::agent::Agent>>) -> serde_json::Value {
+            let result = agent
+                .lock()
+                .await
+                .execute_tool_for_test(
+                    "knowledge",
+                    json!({"action":"search", "query":"retained scope proof"}),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.success, "{}", result.output);
+            serde_json::from_str(&result.output).unwrap()
+        }
+        assert_eq!(search(&retained).await["count"], 1);
+        // Relate reads visible endpoints after acquiring its write transaction.
+        // Another WAL connection parks that actual authorization boundary.
+        let blocker =
+            rusqlite::Connection::open(dispatcher.ctx.config.read().knowledge.resolved_db_path())
+                .unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let queued_args =
+            json!({"action":"relate", "from_id":own, "to_id":first, "relation":"uses"});
+        let queued_agent = Arc::clone(&retained);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let parked = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                started_tx.send(()).unwrap();
+                queued_agent
+                    .lock()
+                    .await
+                    .execute_tool_for_test("knowledge", queued_args)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+        });
+        started_rx.await.unwrap();
+        dispatcher
+            .handle_config_set(
+                &json!({"prop":"agents.test-agent.workspace.read_knowledge_from", "value":"[]"}),
+            )
+            .await
+            .unwrap();
+        blocker.execute_batch("COMMIT").unwrap();
+        let parked_result = parked.await.unwrap();
+        assert!(
+            !parked_result.success,
+            "queued endpoint read spent a revoked grant"
+        );
+        assert!(parked_result.error.unwrap().contains("not found"));
+        seed_agent_knowledge(
+            &dispatcher.ctx.config.read(),
+            "sibling",
+            "retained scope proof later",
+        );
+        assert!(Arc::ptr_eq(
+            &retained,
+            &sessions.get_agent("knowledge-live").await.unwrap()
+        ));
+        let output = search(&retained).await;
+        assert_eq!(output["count"], 0);
+        assert!(!output.to_string().contains(&first));
+        for args in [
+            json!({"action":"graph_neighbors", "node_id":first}),
+            json!({"action":"client_network", "client_id":first}),
+        ] {
+            let result = retained
+                .lock()
+                .await
+                .execute_tool_for_test("knowledge", args)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!result.success);
+            assert!(result.error.unwrap().contains("not found"));
+        }
+        let stats = retained
+            .lock()
+            .await
+            .execute_tool_for_test("knowledge", json!({"action":"graph_stats"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stats.success);
+        let stats: serde_json::Value = serde_json::from_str(&stats.output).unwrap();
+        assert_eq!(stats["total_nodes"], 1);
+
+        dispatcher.handle_config_set(&json!({"prop":"agents.test-agent.workspace.read_knowledge_from", "value":"[\"sibling\"]"})).await.unwrap();
+        assert_eq!(search(&retained).await["count"], 2);
+    }
+
+    #[tokio::test]
     async fn config_map_key_delete_archives_and_purges_agent_knowledge() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_agent_delete_test_config(&tmp);
@@ -30859,6 +30977,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             config,
             Arc::clone(&sessions),
+            None,
             Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
             Some(Arc::clone(&acp_store)),
         );

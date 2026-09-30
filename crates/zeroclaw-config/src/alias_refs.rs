@@ -578,7 +578,51 @@ pub fn create_map_key_checked(
     if path == "agents" && is_reserved_agent_alias(key) {
         return Err(CreateError::Reserved(RESERVED_DEFAULT_AGENT.to_string()));
     }
+    if path == "agents" && !cfg.agents.contains_key(key) {
+        ensure_knowledge_owner_retired(cfg, key).map_err(CreateError::Invalid)?;
+    }
     cfg.create_map_key(path, key).map_err(CreateError::Invalid)
+}
+
+/// Creation cannot adopt an old alias's graph residue. Read the canonical
+/// database without creating it or waiting for its writer: callers may hold
+/// config serialization, while graph operations resolve live config only after
+/// their SQLite wait. Busy or uninspectable storage therefore refuses creation.
+fn ensure_knowledge_owner_retired(cfg: &Config, alias: &str) -> Result<(), String> {
+    let path = cfg.knowledge.resolved_db_path();
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect retired knowledge: {error}")),
+        Ok(_) => {}
+    }
+    let inspect = || -> rusqlite::Result<bool> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        let attributed: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name = 'owner_agent')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !attributed {
+            // Legacy unowned rows cannot be inherited by an alias. Keep the
+            // existing explicit/sole-enabled-owner migration path available.
+            return Ok(false);
+        }
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE owner_agent = ?1) OR EXISTS(SELECT 1 FROM edges WHERE owner_agent = ?1)",
+            [alias], |row| row.get(0),
+        )
+    };
+    match inspect() {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(format!(
+            "agent `{alias}` still owns knowledge; finish its retirement before reusing the alias"
+        )),
+        Err(error) => Err(format!("cannot inspect retired knowledge: {error}")),
+    }
 }
 
 /// Outcome of a successful [`rename_with_cascade`].
@@ -644,6 +688,9 @@ pub fn rename_with_cascade(
         return Err(RenameError::Reserved(RESERVED_DEFAULT_AGENT.to_string()));
     }
 
+    if matches!(kind, AliasKind::Agent) {
+        ensure_knowledge_owner_retired(cfg, new_alias).map_err(RenameError::InvalidName)?;
+    }
     let section = section_path(kind);
     // `rename_map_key` validates `new_alias` via `validate_alias_key` (whose
     // leading-underscore rule also blocks the `_deleted` marker) and refuses a
@@ -1356,6 +1403,27 @@ mod tests {
             category: ProviderCategory::Models,
             family: family.to_string(),
         }
+    }
+
+    #[test]
+    fn create_agent_refuses_knowledge_residue_and_uninspectable_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = Config::default();
+        let path = tmp.path().join("graph.db");
+        cfg.knowledge.db_path = path.to_string_lossy().into_owned();
+        assert!(create_map_key_checked(&mut cfg, "agents", "fresh").unwrap());
+        assert!(!path.exists(), "creation must not initialize knowledge");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE nodes (owner_agent TEXT); CREATE TABLE edges (owner_agent TEXT); INSERT INTO edges VALUES ('retired');").unwrap();
+        assert!(create_map_key_checked(&mut cfg, "agents", "retired").is_err());
+        assert!(!cfg.agents.contains_key("retired"));
+        conn.execute("DELETE FROM edges", []).unwrap();
+        assert!(create_map_key_checked(&mut cfg, "agents", "retired").unwrap());
+        drop(conn);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(create_map_key_checked(&mut cfg, "agents", "blocked").is_err());
+        assert!(!cfg.agents.contains_key("blocked"));
     }
 
     #[test]

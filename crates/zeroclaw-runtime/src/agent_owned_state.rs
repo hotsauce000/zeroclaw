@@ -511,6 +511,26 @@ async fn write_json(path: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+struct KnowledgeArchivePause {
+    arrived: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static KNOWLEDGE_ARCHIVE_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, KnowledgeArchivePause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+async fn wait_at_knowledge_archive(path: &Path) {
+    let pause = KNOWLEDGE_ARCHIVE_PAUSES.lock().unwrap().remove(path);
+    if let Some(pause) = pause {
+        pause.arrived.send(()).unwrap();
+        pause.resume.await.unwrap();
+    }
+}
+
 fn archive_warning(kind: &str, err: &anyhow::Error) -> String {
     format!("{kind} archive: {err}")
 }
@@ -523,12 +543,50 @@ fn knowledge_purge_skipped_warning(err: &anyhow::Error) -> String {
     )
 }
 
+/// Capture retirement evidence before releasing lifecycle serialization or
+/// awaiting archive work. It is immutable evidence, never a live grant.
+pub fn prepare_knowledge_retirement(
+    config: &Config,
+    alias: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let path = config.knowledge.resolved_db_path();
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("knowledge graph inspection: {error}")),
+        Ok(_) => {
+            zeroclaw_memory::knowledge_graph::KnowledgeGraph::export_existing_owner(&path, alias)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
 pub async fn cascade_owned_state(
     config: &Config,
     mem: Option<&Arc<dyn Memory>>,
     session_backend: Option<&Arc<dyn SessionBackend>>,
     alias: &str,
     archive_dir: &Path,
+) -> OwnedStateReport {
+    let retirement = prepare_knowledge_retirement(config, alias);
+    cascade_owned_state_with_retirement(
+        config,
+        mem,
+        session_backend,
+        alias,
+        archive_dir,
+        retirement,
+    )
+    .await
+}
+
+pub async fn cascade_owned_state_with_retirement(
+    config: &Config,
+    mem: Option<&Arc<dyn Memory>>,
+    session_backend: Option<&Arc<dyn SessionBackend>>,
+    alias: &str,
+    archive_dir: &Path,
+    retirement: Result<Option<serde_json::Value>, String>,
 ) -> OwnedStateReport {
     let cascade_dir = archive_dir.join("cascade");
     let mut warnings: Vec<String> = Vec::new();
@@ -596,27 +654,36 @@ pub async fn cascade_owned_state(
             &knowledge_path,
             config.knowledge.max_nodes,
         ) {
-            Ok(graph) => match graph
-                .export_owner(alias)
-                .context("export owned knowledge")
-                .and_then(|rows| {
-                    serde_json::to_vec_pretty(&rows).context("serialize owned knowledge export")
-                }) {
-                Ok(bytes) => match write_json(&cascade_dir.join("knowledge.json"), bytes).await {
-                    Ok(()) => match graph.purge_owner_with_report(alias) {
-                        Ok(report) => report,
-                        Err(e) => {
-                            warnings.push(format!("knowledge purge: {e}"));
+            Ok(graph) => match retirement {
+                Ok(Some(snapshot)) => match serde_json::to_vec_pretty(&snapshot)
+                    .context("serialize owned knowledge export")
+                {
+                    Ok(bytes) => match write_json(&cascade_dir.join("knowledge.json"), bytes).await
+                    {
+                        Ok(()) => {
+                            #[cfg(test)]
+                            wait_at_knowledge_archive(&cascade_dir).await;
+                            match graph.purge_archived_owner(alias, &snapshot) {
+                                Ok(report) => report,
+                                Err(error) => {
+                                    warnings.push(knowledge_purge_skipped_warning(&error));
+                                    Default::default()
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warnings.push(knowledge_purge_skipped_warning(&error));
                             Default::default()
                         }
                     },
-                    Err(err) => {
-                        warnings.push(knowledge_purge_skipped_warning(&err));
+                    Err(error) => {
+                        warnings.push(knowledge_purge_skipped_warning(&error));
                         Default::default()
                     }
                 },
-                Err(err) => {
-                    warnings.push(knowledge_purge_skipped_warning(&err));
+                Ok(None) => Default::default(),
+                Err(error) => {
+                    warnings.push(knowledge_purge_skipped_warning(&anyhow::Error::msg(error)));
                     Default::default()
                 }
             },
@@ -902,6 +969,211 @@ mod tests {
     /// Windows returns an ordinary `Ok(false)`; both are driven explicitly here
     /// so the contract is proven on a single host rather than only on the
     /// platform this suite happens to run on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn knowledge_archive_barrier_keeps_unarchived_foreign_edges() {
+        use zeroclaw_memory::knowledge_graph::{
+            KnowledgeGraph, KnowledgeScope, NodeType, Relation,
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let mut config = config;
+        config.knowledge.db_path = tmp.path().join("graph.db").to_string_lossy().into_owned();
+        let graph = KnowledgeGraph::new(&config.knowledge.resolved_db_path(), 100).unwrap();
+        let retired = KnowledgeScope::for_agent("retired", Vec::new());
+        let peer = KnowledgeScope::for_agent("peer", vec!["retired".into()]);
+        let node = graph
+            .add_node(&retired, NodeType::Pattern, "old", "keep", &[], None)
+            .unwrap();
+        let other = graph
+            .add_node(&peer, NodeType::Expert, "peer", "keep", &[], None)
+            .unwrap();
+        let retirement = prepare_knowledge_retirement(&config, "retired");
+        let archive = tmp.path().join("archive");
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        KNOWLEDGE_ARCHIVE_PAUSES.lock().unwrap().insert(
+            archive.join("cascade"),
+            KnowledgeArchivePause {
+                arrived: arrived_tx,
+                resume: resume_rx,
+            },
+        );
+        let worker_config = config.clone();
+        let worker_archive = archive.clone();
+        let task = zeroclaw_spawn::spawn!(async move {
+            cascade_owned_state_with_retirement(
+                &worker_config,
+                None,
+                None,
+                "retired",
+                &worker_archive,
+                retirement,
+            )
+            .await
+        });
+        arrived_rx.await.unwrap();
+        let archived: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(archive.join("cascade/knowledge.json")).unwrap())
+                .unwrap();
+        assert!(
+            archived["affected_foreign_edges"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            zeroclaw_config::alias_refs::create_map_key_checked(&mut config, "agents", "retired")
+                .is_err()
+        );
+        let writer = KnowledgeGraph::new(&config.knowledge.resolved_db_path(), 100).unwrap();
+        writer
+            .add_edge(&peer, &other, &node, Relation::Uses)
+            .unwrap();
+        resume_tx.send(()).unwrap();
+        let report = task.await.unwrap();
+        assert_eq!(report.knowledge_purged, 0);
+        assert_eq!(report.knowledge_foreign_edges_purged, 0);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("changed after retirement snapshot"))
+        );
+        assert!(graph.get_node(&retired, &node).unwrap().is_some());
+        assert_eq!(graph.find_outbound(&peer, &other, 10).unwrap().len(), 1);
+        let retry =
+            cascade_owned_state(&config, None, None, "retired", &tmp.path().join("retry")).await;
+        assert_eq!(
+            retry.knowledge_purged, 2,
+            "one owned node and its foreign edge"
+        );
+        assert_eq!(retry.knowledge_foreign_edges_purged, 1);
+    }
+
+    #[tokio::test]
+    async fn knowledge_old_schema_retirement_migrates_then_retry_converges() {
+        use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.knowledge.db_path = tmp.path().join("graph.db").to_string_lossy().into_owned();
+        let path = config.knowledge.resolved_db_path();
+        let graph = KnowledgeGraph::new(&path, 100).unwrap();
+        let id = graph
+            .add_node(
+                &KnowledgeScope::for_agent("retired", Vec::new()),
+                NodeType::Pattern,
+                "retained",
+                "payload",
+                &[],
+                None,
+            )
+            .unwrap();
+        rusqlite::Connection::open(&path).unwrap().execute_batch("DROP TRIGGER edges_insertion_generation; ALTER TABLE edges DROP COLUMN generation;").unwrap();
+        assert!(prepare_knowledge_retirement(&config, "retired").is_err());
+        // The cascade opens/migrates outside config locking, but cannot purge
+        // from evidence that was unavailable before lifecycle serialization ended.
+        let first =
+            cascade_owned_state(&config, None, None, "retired", &tmp.path().join("first")).await;
+        assert_eq!(first.knowledge_purged, 0);
+        assert!(!first.warnings.is_empty());
+        assert_eq!(graph.count_owner("retired").unwrap(), 1);
+        let retry_path = tmp.path().join("retry");
+        let retry = cascade_owned_state(&config, None, None, "retired", &retry_path).await;
+        assert_eq!(retry.knowledge_purged, 1, "{:?}", retry.warnings);
+        assert!(retry.warnings.is_empty());
+        let archive: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(retry_path.join("cascade/knowledge.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archive["nodes"][0]["id"], id);
+        assert_eq!(graph.count_owner("retired").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn knowledge_retirement_fences_recreation_and_preserves_new_rows() {
+        use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .into_owned();
+        let graph = KnowledgeGraph::new(&config.knowledge.resolved_db_path(), 100).unwrap();
+        let scope = KnowledgeScope::for_agent("retired", Vec::new());
+        let id = graph
+            .add_node(
+                &scope,
+                NodeType::Pattern,
+                "retired",
+                "archived bytes",
+                &[],
+                None,
+            )
+            .unwrap();
+        let retirement = prepare_knowledge_retirement(&config, "retired");
+        assert!(
+            zeroclaw_config::alias_refs::create_map_key_checked(&mut config, "agents", "retired")
+                .is_err()
+        );
+        let first = tmp.path().join("first");
+        let report = cascade_owned_state_with_retirement(
+            &config,
+            None,
+            None,
+            "retired",
+            &first,
+            retirement.clone(),
+        )
+        .await;
+        assert_eq!(report.knowledge_purged, 1, "{:?}", report.warnings);
+        let archived: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(first.join("cascade/knowledge.json")).unwrap())
+                .unwrap();
+        assert_eq!(archived["nodes"][0]["id"], id);
+        assert!(
+            zeroclaw_config::alias_refs::create_map_key_checked(&mut config, "agents", "retired")
+                .unwrap()
+        );
+        let new_id = graph
+            .add_node(
+                &scope,
+                NodeType::Pattern,
+                "new incarnation",
+                "must survive",
+                &[],
+                None,
+            )
+            .unwrap();
+        let retry = cascade_owned_state_with_retirement(
+            &config,
+            None,
+            None,
+            "retired",
+            &tmp.path().join("stale"),
+            retirement,
+        )
+        .await;
+        assert_eq!(retry.knowledge_purged, 0);
+        assert!(!retry.warnings.is_empty());
+        assert_eq!(
+            graph.get_node(&scope, &new_id).unwrap().unwrap().content,
+            "must survive"
+        );
+    }
+
     #[tokio::test]
     async fn a_blocked_path_is_uninspectable_in_both_probe_shapes() {
         let tmp = tempfile::TempDir::new().unwrap();

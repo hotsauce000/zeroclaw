@@ -7,12 +7,14 @@
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use uuid::Uuid;
+use zeroclaw_config::schema::Config;
 
 // ── Domain types ────────────────────────────────────────────────
 
@@ -152,10 +154,11 @@ pub struct GraphStats {
 
 /// Trusted caller identity for knowledge graph operations.
 ///
-/// The scope is bound at construction time by the runtime (from the
-/// configured agent alias), never taken from tool arguments. Reads are
-/// filtered to rows the scope may see; writes are stamped with the
-/// scope's identity.
+/// Caller identity is bound by the runtime, never by tool arguments. Live
+/// registration retains the canonical config handle; every storage effect
+/// resolves its current grants after the SQLite wait. Lock order is graph
+/// connection, SQLite transaction, then live config read. The config guard
+/// never crosses an await. Static scopes serve one-shot and maintenance callers.
 #[derive(Debug, Clone)]
 pub enum KnowledgeScope {
     /// Operations run as one configured agent. Reads see rows owned by
@@ -172,9 +175,65 @@ pub enum KnowledgeScope {
     /// Not wired to any agent-facing tool; intended for migrations and
     /// tests. Unowned rows are fail-closed to every agent scope.
     Unrestricted,
+    /// Trusted identity plus the canonical live policy handle. No grants are
+    /// retained here: storage resolves them after acquiring its transaction.
+    LiveAgent {
+        alias: String,
+        config: Arc<RwLock<Config>>,
+    },
+}
+
+struct ResolvedKnowledgeScope<'a> {
+    scope: std::borrow::Cow<'a, KnowledgeScope>,
+    // Keeps authorization coherent through the synchronous storage effect.
+    _config_guard: Option<RwLockReadGuard<'a, Config>>,
+}
+
+impl std::ops::Deref for ResolvedKnowledgeScope<'_> {
+    type Target = KnowledgeScope;
+    fn deref(&self) -> &Self::Target {
+        &self.scope
+    }
 }
 
 impl KnowledgeScope {
+    pub fn live_agent(alias: impl Into<String>, config: Arc<RwLock<Config>>) -> Self {
+        Self::LiveAgent {
+            alias: alias.into(),
+            config,
+        }
+    }
+
+    fn resolve(&self) -> anyhow::Result<ResolvedKnowledgeScope<'_>> {
+        if let Self::LiveAgent { alias, config } = self {
+            let guard = config.read();
+            anyhow::ensure!(guard.knowledge.enabled, "knowledge is disabled");
+            let agent = guard
+                .agents
+                .get(alias.as_str())
+                .filter(|agent| agent.enabled)
+                .context("knowledge caller is absent or disabled")?;
+            let scope = Self::for_agent(
+                alias.clone(),
+                agent
+                    .workspace
+                    .read_knowledge_from
+                    .iter()
+                    .filter(|target| guard.agents.contains_key(target.as_str()))
+                    .map(|target| target.as_str().to_string()),
+            );
+            Ok(ResolvedKnowledgeScope {
+                scope: std::borrow::Cow::Owned(scope),
+                _config_guard: Some(guard),
+            })
+        } else {
+            Ok(ResolvedKnowledgeScope {
+                scope: std::borrow::Cow::Borrowed(self),
+                _config_guard: None,
+            })
+        }
+    }
+
     pub fn for_agent(
         alias: impl Into<String>,
         read_from: impl IntoIterator<Item = String>,
@@ -192,7 +251,7 @@ impl KnowledgeScope {
     /// Owner stamped on writes made through this scope.
     fn write_owner(&self) -> Option<&str> {
         match self {
-            Self::Agent { alias, .. } => Some(alias.as_str()),
+            Self::Agent { alias, .. } | Self::LiveAgent { alias, .. } => Some(alias.as_str()),
             Self::Unrestricted => None,
         }
     }
@@ -202,6 +261,7 @@ impl KnowledgeScope {
     fn visible_owners(&self) -> Option<Vec<&str>> {
         match self {
             Self::Unrestricted => None,
+            Self::LiveAgent { .. } => Some(Vec::new()),
             Self::Agent { alias, read_from } => {
                 let mut owners: Vec<&str> = Vec::with_capacity(1 + read_from.len());
                 for candidate in
@@ -313,6 +373,7 @@ impl KnowledgeGraph {
         )?;
 
         Self::migrate_owner_attribution(&mut conn)?;
+        Self::migrate_edge_generations(&mut conn)?;
 
         // Indexes are created after the migration so the owner columns
         // exist on legacy databases, and so the edges indexes dropped by
@@ -460,9 +521,25 @@ impl KnowledgeGraph {
         Ok(nodes + edges)
     }
 
+    /// Capture lifecycle evidence without initializing or modifying a store.
+    /// Config mutation callers may serialize this read with alias changes; a
+    /// busy database refuses immediately instead of introducing a config to
+    /// SQLite-writer wait opposite the live tool's SQLite to config order.
+    pub fn export_existing_owner(db_path: &Path, alias: &str) -> anyhow::Result<serde_json::Value> {
+        let mut conn =
+            Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        Self::export_owner_from(&tx, alias)
+    }
+
     /// Export the rows owned by an agent for the deletion archive.
     pub fn export_owner(&self, alias: &str) -> anyhow::Result<serde_json::Value> {
         let conn = self.conn.lock();
+        Self::export_owner_from(&conn, alias)
+    }
+
+    fn export_owner_from(conn: &Connection, alias: &str) -> anyhow::Result<serde_json::Value> {
         let mut node_stmt = conn.prepare(
             "SELECT id, node_type, title, content, tags, created_at, updated_at, source_project, owner_agent
              FROM nodes WHERE owner_agent = ?1 ORDER BY id",
@@ -502,10 +579,32 @@ impl KnowledgeGraph {
                 }))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        // Include insertion identities for both owned and incident foreign
+        // edges. An identical tuple recreated by a later alias incarnation
+        // must not satisfy an older retirement snapshot.
+        let mut generation_stmt = conn.prepare(
+            "SELECT from_id, to_id, relation, owner_agent, generation FROM edges
+             WHERE owner_agent = ?1
+                OR from_id IN (SELECT id FROM nodes WHERE owner_agent = ?1)
+                OR to_id IN (SELECT id FROM nodes WHERE owner_agent = ?1)
+             ORDER BY from_id, to_id, relation, owner_agent, generation",
+        )?;
+        let edge_generations = generation_stmt
+            .query_map(params![alias], |row| {
+                Ok(serde_json::json!({
+                    "from_id": row.get::<_, String>(0)?,
+                    "to_id": row.get::<_, String>(1)?,
+                    "relation": row.get::<_, String>(2)?,
+                    "owner_agent": row.get::<_, Option<String>>(3)?,
+                    "generation": row.get::<_, String>(4)?,
+                }))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(serde_json::json!({
             "nodes": nodes,
             "edges": edges,
             "affected_foreign_edges": affected_foreign_edges,
+            "edge_generations": edge_generations,
         }))
     }
 
@@ -515,10 +614,26 @@ impl KnowledgeGraph {
         &self,
         alias: &str,
     ) -> anyhow::Result<KnowledgeOwnerPurgeReport> {
+        let snapshot = self.export_owner(alias)?;
+        self.purge_archived_owner(alias, &snapshot)
+    }
+
+    /// Purge only the exact set already made durable by the caller. Changes to
+    /// nodes or incident edges leave all rows as retryable residue, including
+    /// changes made through another SQLite connection or a recreated alias.
+    pub fn purge_archived_owner(
+        &self,
+        alias: &str,
+        archived: &serde_json::Value,
+    ) -> anyhow::Result<KnowledgeOwnerPurgeReport> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("failed to begin knowledge ownership purge")?;
+        anyhow::ensure!(
+            Self::export_owner_from(&tx, alias)? == *archived,
+            "knowledge changed after retirement snapshot; rows retained for retry"
+        );
         let owned_nodes: usize = tx.query_row(
             "SELECT COUNT(*) FROM nodes WHERE owner_agent = ?1",
             params![alias],
@@ -616,6 +731,29 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    // Edge tuples intentionally deduplicate relations, but do not identify an
+    // insertion across delete/recreate. SQLite creates this durable identity;
+    // the trigger also covers older clients that insert only the tuple fields.
+    fn migrate_edge_generations(conn: &mut Connection) -> anyhow::Result<()> {
+        if Self::table_has_column(conn, "edges", "generation")? {
+            return Ok(());
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::table_has_column(&tx, "edges", "generation")? {
+            tx.execute_batch(
+                "ALTER TABLE edges ADD COLUMN generation TEXT NOT NULL DEFAULT '';
+                 UPDATE edges SET generation = lower(hex(randomblob(16)));
+                 CREATE TRIGGER edges_insertion_generation AFTER INSERT ON edges
+                 WHEN NEW.generation = '' BEGIN
+                     UPDATE edges SET generation = lower(hex(randomblob(16)))
+                     WHERE rowid = NEW.rowid;
+                 END;",
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn table_has_column(
         conn: &Connection,
         table: &'static str,
@@ -663,6 +801,8 @@ impl KnowledgeGraph {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("failed to begin atomic knowledge node admission")?;
+        let resolved_scope = scope.resolve()?;
+        let scope = &*resolved_scope;
         let count: usize = tx.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         if count >= self.max_nodes {
             anyhow::bail!(
@@ -718,7 +858,15 @@ impl KnowledgeGraph {
         to_id: &str,
         relation: Relation,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Establish the SQLite snapshot before resolving policy; a busy store
+        // must not park an operation while it retains an old permission.
+        conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, usize>(0)
+        })?;
+        let resolved_scope = scope.resolve()?;
+        let scope = &*resolved_scope;
 
         // Both endpoints must exist and be visible to the caller. An
         // invisible node is reported exactly like a missing one so the
@@ -755,6 +903,7 @@ impl KnowledgeGraph {
             params![from_id, to_id, relation.as_str(), scope.write_owner()],
         )?;
 
+        conn.commit()?;
         Ok(())
     }
 
@@ -764,7 +913,15 @@ impl KnowledgeGraph {
         scope: &KnowledgeScope,
         id: &str,
     ) -> anyhow::Result<Option<KnowledgeNode>> {
-        let conn = self.conn.lock();
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // Establish the SQLite snapshot before resolving policy; a busy store
+        // must not park an operation while it retains an old permission.
+        conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, usize>(0)
+        })?;
+        let resolved_scope = scope.resolve()?;
+        let scope = &*resolved_scope;
         let (vis, vis_params) = scope.visibility_sql("owner_agent", 2);
         let sql = format!(
             "SELECT id, node_type, title, content, tags, created_at, updated_at, source_project, owner_agent
@@ -787,7 +944,15 @@ impl KnowledgeGraph {
         scope: &KnowledgeScope,
         tags: &[String],
     ) -> anyhow::Result<Vec<KnowledgeNode>> {
-        let conn = self.conn.lock();
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // Establish the SQLite snapshot before resolving policy; a busy store
+        // must not park an operation while it retains an old permission.
+        conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, usize>(0)
+        })?;
+        let resolved_scope = scope.resolve()?;
+        let scope = &*resolved_scope;
         let (vis, vis_params) = scope.visibility_sql("owner_agent", 1);
         let sql = format!(
             "SELECT id, node_type, title, content, tags, created_at, updated_at, source_project, owner_agent
@@ -817,7 +982,15 @@ impl KnowledgeGraph {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        let conn = self.conn.lock();
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // Establish the SQLite snapshot before resolving policy; a busy store
+        // must not park an operation while it retains an old permission.
+        conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, usize>(0)
+        })?;
+        let resolved_scope = scope.resolve()?;
+        let scope = &*resolved_scope;
         let limit = sql_limit(limit)?;
 
         // Sanitize FTS query: escape double quotes, wrap tokens in quotes.
@@ -865,7 +1038,15 @@ impl KnowledgeGraph {
         scope: &KnowledgeScope,
         node_id: &str,
     ) -> anyhow::Result<Vec<(KnowledgeNode, Relation)>> {
-        let conn = self.conn.lock();
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // Establish the SQLite snapshot before resolving policy; a busy store
+        // must not park an operation while it retains an old permission.
+        conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, usize>(0)
+        })?;
+        let resolved_scope = scope.resolve()?;
+        let scope = &*resolved_scope;
         if !Self::node_is_visible(&conn, scope, node_id)? {
             return Ok(Vec::new());
         }
@@ -928,7 +1109,15 @@ impl KnowledgeGraph {
         limit: usize,
         direction: Direction,
     ) -> anyhow::Result<Vec<(KnowledgeNode, Relation)>> {
-        let conn = self.conn.lock();
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // Establish the SQLite snapshot before resolving policy; a busy store
+        // must not park an operation while it retains an old permission.
+        conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, usize>(0)
+        })?;
+        let resolved_scope = scope.resolve()?;
+        let scope = &*resolved_scope;
         if !Self::node_is_visible(&conn, scope, node_id)? {
             return Ok(Vec::new());
         }
@@ -973,7 +1162,15 @@ impl KnowledgeGraph {
         node_type: NodeType,
         limit: usize,
     ) -> anyhow::Result<Vec<KnowledgeNode>> {
-        let conn = self.conn.lock();
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // Establish the SQLite snapshot before resolving policy; a busy store
+        // must not park an operation while it retains an old permission.
+        conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, usize>(0)
+        })?;
+        let resolved_scope = scope.resolve()?;
+        let scope = &*resolved_scope;
         let limit = sql_limit(limit)?;
         let (vis, vis_params) = scope.visibility_sql("owner_agent", 3);
         let sql = format!(
@@ -1040,7 +1237,15 @@ impl KnowledgeGraph {
         limit: usize,
         direction: Direction,
     ) -> anyhow::Result<Vec<KnowledgeNode>> {
-        let conn = self.conn.lock();
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // Establish the SQLite snapshot before resolving policy; a busy store
+        // must not park an operation while it retains an old permission.
+        conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, usize>(0)
+        })?;
+        let resolved_scope = scope.resolve()?;
+        let scope = &*resolved_scope;
         if !Self::node_is_visible(&conn, scope, node_id)? {
             return Ok(Vec::new());
         }
@@ -1095,7 +1300,15 @@ impl KnowledgeGraph {
             anyhow::bail!("subgraph depth must be greater than 0");
         }
         let depth = depth.min(Self::MAX_SUBGRAPH_DEPTH);
-        let conn = self.conn.lock();
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // Establish the SQLite snapshot before resolving policy; a busy store
+        // must not park an operation while it retains an old permission.
+        conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, usize>(0)
+        })?;
+        let resolved_scope = scope.resolve()?;
+        let scope = &*resolved_scope;
 
         let (vis_root, vis_params) = scope.visibility_sql("root.owner_agent", 3);
         let (vis_edge, _) = scope.visibility_sql("e.owner_agent", 3);
@@ -1172,39 +1385,50 @@ impl KnowledgeGraph {
         scope: &KnowledgeScope,
         tags: &[String],
     ) -> anyhow::Result<Vec<SearchResult>> {
-        // Find nodes matching the tags, then follow authored_by edges to experts.
-        let matching = self.query_by_tags(scope, tags)?;
-        let mut expert_scores: HashMap<String, f64> = HashMap::new();
-
-        {
-            let conn = self.conn.lock();
-            let (vis_edge, vis_params) = scope.visibility_sql("owner_agent", 2);
-            let sql = format!(
-                "SELECT DISTINCT to_id FROM edges
-                 WHERE from_id = ?1 AND relation = 'authored_by' AND {vis_edge}"
-            );
-            // One statement for every matching node: the SQL is fixed for the
-            // whole lookup, only the anchor parameter changes.
-            let mut stmt = conn.prepare(&sql)?;
-            for node in &matching {
-                let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&node.id];
-                sql_params.extend(vis_params.iter().map(|owner| owner as &dyn rusqlite::ToSql));
-                let mut rows = stmt.query(&sql_params[..])?;
-                while let Some(row) = rows.next()? {
-                    let expert_id: String = row.get(0)?;
-                    *expert_scores.entry(expert_id).or_default() += 1.0;
-                }
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, usize>(0)
+        })?;
+        let resolved_scope = scope.resolve()?;
+        let scope = &*resolved_scope;
+        let (vis_node, owners) = scope.visibility_sql("n.owner_agent", 1);
+        let (vis_edge, _) = scope.visibility_sql("e.owner_agent", 1);
+        let (vis_expert, _) = scope.visibility_sql("x.owner_agent", 1);
+        let sql = format!(
+            "SELECT DISTINCT n.id, n.tags, x.id, x.node_type, x.title, x.content, x.tags,
+                    x.created_at, x.updated_at, x.source_project, x.owner_agent
+             FROM nodes n JOIN edges e ON e.from_id = n.id
+             JOIN nodes x ON x.id = e.to_id
+             WHERE e.relation = 'authored_by' AND x.node_type = 'expert'
+               AND {vis_node} AND {vis_edge} AND {vis_expert}"
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = owners
+            .iter()
+            .map(|owner| owner as &dyn rusqlite::ToSql)
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params.as_slice())?;
+        let mut experts: HashMap<String, SearchResult> = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let stored_tags: String = row.get(1)?;
+            let matching_tags: Vec<&str> = stored_tags
+                .split(',')
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .collect();
+            if !tags.iter().all(|tag| matching_tags.contains(&tag.as_str())) {
+                continue;
             }
-        }
-
-        let mut results: Vec<SearchResult> = Vec::new();
-        for (eid, score) in expert_scores {
-            if let Some(node) = self.get_node(scope, &eid)?
-                && node.node_type == NodeType::Expert
-            {
-                results.push(SearchResult { node, score });
+            let id: String = row.get(2)?;
+            if let Some(result) = experts.get_mut(&id) {
+                result.score += 1.0;
+                continue;
             }
+            let node = row_to_node_at(row, 2)?;
+            experts.insert(id, SearchResult { node, score: 1.0 });
         }
+        let mut results: Vec<SearchResult> = experts.into_values().collect();
 
         results.sort_by(|a, b| {
             b.score
@@ -1216,7 +1440,15 @@ impl KnowledgeGraph {
 
     /// Return summary statistics for the scope-visible part of the graph.
     pub fn stats(&self, scope: &KnowledgeScope) -> anyhow::Result<GraphStats> {
-        let conn = self.conn.lock();
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // Establish the SQLite snapshot before resolving policy; a busy store
+        // must not park an operation while it retains an old permission.
+        conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, usize>(0)
+        })?;
+        let resolved_scope = scope.resolve()?;
+        let scope = &*resolved_scope;
         let (vis, vis_params) = scope.visibility_sql("owner_agent", 1);
         let plain_params: Vec<&dyn rusqlite::ToSql> = vis_params
             .iter()
@@ -1298,15 +1530,19 @@ enum Direction {
 
 /// Parse a database row into a `KnowledgeNode`.
 fn row_to_node(row: &rusqlite::Row<'_>) -> anyhow::Result<KnowledgeNode> {
-    let id: String = row.get(0)?;
-    let node_type_str: String = row.get(1)?;
-    let title: String = row.get(2)?;
-    let content: String = row.get(3)?;
-    let tags_str: String = row.get(4)?;
-    let created_at_str: String = row.get(5)?;
-    let updated_at_str: String = row.get(6)?;
-    let source_project: Option<String> = row.get(7)?;
-    let owner_agent: Option<String> = row.get(8)?;
+    row_to_node_at(row, 0)
+}
+
+fn row_to_node_at(row: &rusqlite::Row<'_>, offset: usize) -> anyhow::Result<KnowledgeNode> {
+    let id: String = row.get(offset)?;
+    let node_type_str: String = row.get(offset + 1)?;
+    let title: String = row.get(offset + 2)?;
+    let content: String = row.get(offset + 3)?;
+    let tags_str: String = row.get(offset + 4)?;
+    let created_at_str: String = row.get(offset + 5)?;
+    let updated_at_str: String = row.get(offset + 6)?;
+    let source_project: Option<String> = row.get(offset + 7)?;
+    let owner_agent: Option<String> = row.get(offset + 8)?;
 
     let tags: Vec<String> = tags_str
         .split(',')
@@ -1344,6 +1580,296 @@ mod tests {
     use tempfile::TempDir;
 
     const TEST_AGENT: &str = "test-agent";
+
+    #[test]
+    fn retained_live_scope_rechecks_after_connection_wait() {
+        let tmp = TempDir::new().unwrap();
+        let graph = Arc::new(KnowledgeGraph::new(&tmp.path().join("graph.db"), 100).unwrap());
+        let mut config = Config::default();
+        config.knowledge.enabled = true;
+        config.agents.insert("a".into(), Default::default());
+        config.agents.insert("b".into(), Default::default());
+        config
+            .agents
+            .get_mut("a")
+            .unwrap()
+            .workspace
+            .read_knowledge_from = vec!["b".into()];
+        let live = Arc::new(RwLock::new(config));
+        let scope = KnowledgeScope::live_agent("a", Arc::clone(&live));
+        let b = agent("b");
+        let id = graph
+            .add_node(&b, NodeType::Pattern, "private", "secret", &[], None)
+            .unwrap();
+        assert!(graph.get_node(&scope, &id).unwrap().is_some());
+        let storage = graph.conn.lock();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker_graph = Arc::clone(&graph);
+        let worker_scope = scope.clone();
+        let worker_id = id.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            worker_graph.get_node(&worker_scope, &worker_id).unwrap()
+        });
+        started_rx.recv().unwrap();
+        live.write()
+            .agents
+            .get_mut("a")
+            .unwrap()
+            .workspace
+            .read_knowledge_from
+            .clear();
+        drop(storage);
+        assert!(worker.join().unwrap().is_none());
+        let later = graph
+            .add_node(&b, NodeType::Pattern, "later", "secret", &[], None)
+            .unwrap();
+        assert!(graph.get_node(&scope, &later).unwrap().is_none());
+        assert_eq!(graph.stats(&scope).unwrap().total_nodes, 0);
+        live.write()
+            .agents
+            .get_mut("a")
+            .unwrap()
+            .workspace
+            .read_knowledge_from = vec!["b".into()];
+        live.write().agents.get_mut("b").unwrap().enabled = false;
+        assert_eq!(
+            graph.stats(&scope).unwrap().total_nodes,
+            2,
+            "configured disabled sibling remains an explicit read source"
+        );
+        live.write().agents.get_mut("a").unwrap().enabled = false;
+        assert!(graph.stats(&scope).is_err());
+        assert!(
+            graph
+                .add_node(&scope, NodeType::Pattern, "denied", "", &[], None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn retained_live_write_rechecks_after_sqlite_writer_wait() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("graph.db");
+        let graph = Arc::new(KnowledgeGraph::new(&path, 100).unwrap());
+        let mut config = Config::default();
+        config.knowledge.enabled = true;
+        config.knowledge.db_path = path.to_string_lossy().into_owned();
+        config.agents.insert("a".into(), Default::default());
+        let live = Arc::new(RwLock::new(config));
+        let scope = KnowledgeScope::live_agent("a", Arc::clone(&live));
+        let mut independent = Connection::open(path).unwrap();
+        let tx = independent
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker_graph = Arc::clone(&graph);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            worker_graph.add_node(
+                &scope,
+                NodeType::Pattern,
+                "queued",
+                "must not write",
+                &[],
+                None,
+            )
+        });
+        started_rx.recv().unwrap();
+        {
+            let mut config_write = live.write();
+            config_write.agents.get_mut("a").unwrap().enabled = false;
+            // Config-side probes use a separate, read-only, nonwaiting
+            // connection. They must not request the blocked writer or the
+            // tool's graph mutex while this config guard is held.
+            let before: i64 = tx
+                .query_row("PRAGMA schema_version", [], |row| row.get(0))
+                .unwrap();
+            KnowledgeGraph::export_existing_owner(&config_write.knowledge.resolved_db_path(), "a")
+                .unwrap();
+            assert!(
+                zeroclaw_config::alias_refs::create_map_key_checked(
+                    &mut config_write,
+                    "agents",
+                    "fresh"
+                )
+                .unwrap()
+            );
+            let after: i64 = tx
+                .query_row("PRAGMA schema_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                before, after,
+                "config-side probes must not initialize schema"
+            );
+        }
+        tx.commit().unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(graph.count_owner("a").unwrap(), 0);
+    }
+
+    #[test]
+    fn archived_owner_fences_new_nodes_updates_and_foreign_edges() {
+        for change in ["new-node", "update", "foreign-edge", "recreate"] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("graph.db");
+            let graph = KnowledgeGraph::new(&path, 100).unwrap();
+            let other = KnowledgeGraph::new(&path, 100).unwrap();
+            let owner = agent("a");
+            let node = graph
+                .add_node(&owner, NodeType::Pattern, "old", "old bytes", &[], None)
+                .unwrap();
+            let snapshot = graph.export_owner("a").unwrap();
+            // This is the exact exported set that has crossed the archive gate.
+            let archive = tmp.path().join("archive.json");
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&archive)
+                .unwrap();
+            use std::io::Write;
+            file.write_all(&serde_json::to_vec(&snapshot).unwrap())
+                .unwrap();
+            file.sync_all().unwrap();
+            match change {
+                "update" => {
+                    other
+                        .conn
+                        .lock()
+                        .execute(
+                            "UPDATE nodes SET content = 'new bytes' WHERE id = ?1",
+                            [&node],
+                        )
+                        .unwrap();
+                }
+                "foreign-edge" => {
+                    let peer = other
+                        .add_node(&agent("b"), NodeType::Expert, "peer", "", &[], None)
+                        .unwrap();
+                    other
+                        .add_edge(
+                            &KnowledgeScope::unrestricted(),
+                            &peer,
+                            &node,
+                            Relation::Uses,
+                        )
+                        .unwrap();
+                }
+                "recreate" => {
+                    other.purge_owner("a").unwrap();
+                    other
+                        .add_node(
+                            &owner,
+                            NodeType::Pattern,
+                            "new incarnation",
+                            "new bytes",
+                            &[],
+                            None,
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    other
+                        .add_node(&owner, NodeType::Pattern, "new", "new bytes", &[], None)
+                        .unwrap();
+                }
+            }
+            let before = other.export_owner("a").unwrap();
+            assert!(
+                graph.purge_archived_owner("a", &snapshot).is_err(),
+                "{change}"
+            );
+            assert_eq!(
+                other.export_owner("a").unwrap(),
+                before,
+                "{change}: changed generation was removed"
+            );
+            let retry = other.export_owner("a").unwrap();
+            graph.purge_archived_owner("a", &retry).unwrap();
+            assert_eq!(other.count_owner("a").unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn archived_edge_only_owner_fences_identical_tuple_after_recreation() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("graph.db");
+        let graph = KnowledgeGraph::new(&path, 100).unwrap();
+        let a = graph
+            .add_node(&agent("b"), NodeType::Pattern, "a", "", &[], None)
+            .unwrap();
+        let b = graph
+            .add_node(&agent("b"), NodeType::Pattern, "b", "", &[], None)
+            .unwrap();
+        graph
+            .add_edge(
+                &KnowledgeScope::for_agent("retired", vec!["b".into()]),
+                &a,
+                &b,
+                Relation::Uses,
+            )
+            .unwrap();
+        let old = graph.export_owner("retired").unwrap();
+        graph.purge_archived_owner("retired", &old).unwrap();
+        let mut config = Config::default();
+        config.knowledge.db_path = path.to_string_lossy().into_owned();
+        zeroclaw_config::alias_refs::create_map_key_checked(&mut config, "agents", "retired")
+            .unwrap();
+        let reopened = KnowledgeGraph::new(&path, 100).unwrap();
+        reopened
+            .add_edge(
+                &KnowledgeScope::for_agent("retired", vec!["b".into()]),
+                &a,
+                &b,
+                Relation::Uses,
+            )
+            .unwrap();
+        let new = reopened.export_owner("retired").unwrap();
+        assert_eq!(old["edges"], new["edges"]);
+        assert_ne!(old["edge_generations"], new["edge_generations"]);
+        assert!(graph.purge_archived_owner("retired", &old).is_err());
+        assert_eq!(reopened.export_owner("retired").unwrap(), new);
+        reopened.purge_archived_owner("retired", &new).unwrap();
+        assert_eq!(reopened.count_owner("retired").unwrap(), 0);
+    }
+
+    #[test]
+    fn edge_generation_migration_preserves_rows_and_legacy_insertions() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("graph.db");
+        let graph = KnowledgeGraph::new(&path, 100).unwrap();
+        let a = graph
+            .add_node(&agent("a"), NodeType::Pattern, "a", "", &[], None)
+            .unwrap();
+        let b = graph
+            .add_node(&agent("a"), NodeType::Pattern, "b", "", &[], None)
+            .unwrap();
+        graph.add_edge(&agent("a"), &a, &b, Relation::Uses).unwrap();
+        let before = graph.export_owner("a").unwrap();
+        graph.conn.lock().execute_batch("DROP TRIGGER edges_insertion_generation; ALTER TABLE edges DROP COLUMN generation;").unwrap();
+        assert!(KnowledgeGraph::export_existing_owner(&path, "a").is_err());
+        let migrated = KnowledgeGraph::new(&path, 100).unwrap();
+        let after = migrated.export_owner("a").unwrap();
+        assert_eq!(before["nodes"], after["nodes"]);
+        assert_eq!(before["edges"], after["edges"]);
+        assert_eq!(
+            after["edge_generations"][0]["generation"]
+                .as_str()
+                .unwrap()
+                .len(),
+            32
+        );
+        let reopened = KnowledgeGraph::new(&path, 100).unwrap();
+        assert_eq!(reopened.export_owner("a").unwrap(), after);
+        reopened.conn.lock().execute("INSERT INTO edges (from_id,to_id,relation,owner_agent) VALUES (?1,?2,'uses','legacy')", params![a,b]).unwrap();
+        assert_eq!(
+            reopened.export_owner("legacy").unwrap()["edge_generations"][0]["generation"]
+                .as_str()
+                .unwrap()
+                .len(),
+            32
+        );
+    }
 
     fn agent(alias: &str) -> KnowledgeScope {
         KnowledgeScope::for_agent(alias, Vec::new())

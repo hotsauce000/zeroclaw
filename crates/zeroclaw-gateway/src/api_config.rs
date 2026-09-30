@@ -1255,9 +1255,11 @@ async fn delete_agent_cascade(
         }
         // Nothing left to persist — release the config lock before the
         // retryable side effects, exactly like the committed-delete path below.
+        let retirement =
+            zeroclaw_runtime::agent_owned_state::prepare_knowledge_retirement(&committed, alias);
         drop(guard);
         let workspace = committed.agent_workspace_dir(alias);
-        return finish_agent_delete_cascade(state, &committed, alias, &workspace).await;
+        return finish_agent_delete_cascade(state, &committed, alias, &workspace, retirement).await;
     }
 
     // Refuse on HARD: config blockers (e.g. enabled heartbeat.agent) OR live ACP
@@ -1302,6 +1304,8 @@ async fn delete_agent_cascade(
     let workspace = working.agent_workspace_dir(alias);
 
     // Config cascade: scrub soft refs + remove the agents entry.
+    let retirement =
+        zeroclaw_runtime::agent_owned_state::prepare_knowledge_retirement(&working, alias);
     let cascade = match alias_refs::delete_with_cascade(
         &mut working,
         &AliasKind::Agent,
@@ -1353,7 +1357,7 @@ async fn delete_agent_cascade(
     // Read it back from the (now-swapped) AppState for the side-effects below.
     let committed = state.config.read().clone();
 
-    finish_agent_delete_cascade(state, &committed, alias, &workspace).await
+    finish_agent_delete_cascade(state, &committed, alias, &workspace, retirement).await
 }
 
 /// Post-commit half of the agent delete: archive the workspace, run the
@@ -1367,6 +1371,7 @@ async fn finish_agent_delete_cascade(
     committed: &zeroclaw_config::schema::Config,
     alias: &str,
     workspace: &std::path::Path,
+    retirement: Result<Option<serde_json::Value>, String>,
 ) -> Response {
     let archive =
         zeroclaw_runtime::agent_owned_state::archive_agent_workspace(committed, alias, workspace)
@@ -1375,12 +1380,13 @@ async fn finish_agent_delete_cascade(
     let mut warnings = archive.warnings;
 
     // Owned-state cascade (export-then-delete memory/cron/acp + clear sessions).
-    let owned = zeroclaw_runtime::agent_owned_state::cascade_owned_state(
+    let owned = zeroclaw_runtime::agent_owned_state::cascade_owned_state_with_retirement(
         committed,
         Some(&state.mem),
         state.session_backend.as_ref(),
         alias,
         &archive_dir,
+        retirement,
     )
     .await;
     // Combine per-side-effect failures (archive dir / workspace rename) with

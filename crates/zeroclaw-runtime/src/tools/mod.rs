@@ -2261,10 +2261,17 @@ fn all_tools_with_runtime_on_thread(
                                     .collect()
                             })
                             .unwrap_or_default();
-                        let scope = zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent(
-                            agent_alias,
-                            read_knowledge_from,
-                        );
+                        let scope = if let Some(live) = &live_config {
+                            zeroclaw_memory::knowledge_graph::KnowledgeScope::live_agent(
+                                agent_alias,
+                                Arc::clone(live),
+                            )
+                        } else {
+                            zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent(
+                                agent_alias,
+                                read_knowledge_from,
+                            )
+                        };
                         tool_arcs.push(Arc::new(KnowledgeTool::new(Arc::new(graph), scope)));
                     }
                     Err(e) => {

@@ -442,6 +442,7 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             // Owned-state HARD gate (live ACP sessions) runs BEFORE the config
             // cascade so a refusal mutates nothing.
             agent_delete_precheck(config, &alias)?;
+            let retirement = prepare_knowledge_retirement(config, &alias);
             // A prior delete may have committed the config removal and then
             // failed its owned-state cascade (the cascade refuses to purge when
             // export/archive fails). Re-enter the cascade for the absent key
@@ -451,7 +452,7 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             if config.agent(&alias).is_none() {
                 let workspace = config.agent_workspace_dir(&alias);
                 if agent_delete_residue_exists(config, &alias).await {
-                    return agent_delete_owned_state(config, &alias, &workspace).await;
+                    return agent_delete_owned_state(config, &alias, &workspace, retirement).await;
                 }
             }
             // Resolve the workspace dir while the entry still exists (a custom
@@ -461,7 +462,7 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             let workspace = config.agent_workspace_dir(&alias);
             apply_delete(config, &AliasKind::Agent, &alias)?;
             save(config).await?;
-            agent_delete_owned_state(config, &alias, &workspace).await
+            agent_delete_owned_state(config, &alias, &workspace, retirement).await
         }
     }
 }
@@ -547,6 +548,21 @@ fn agent_delete_precheck(_config: &Config, _alias: &str) -> Result<()> {
     Ok(())
 }
 
+fn prepare_knowledge_retirement(
+    config: &Config,
+    alias: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+    {
+        zeroclaw_runtime::agent_owned_state::prepare_knowledge_retirement(config, alias)
+    }
+    #[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+    {
+        let _ = (config, alias);
+        Ok(None)
+    }
+}
+
 /// Archive the workspace and run the owned-state cascade, returning both halves
 /// so the caller can report every partial failure.
 ///
@@ -559,6 +575,7 @@ async fn run_agent_delete_cascade(
     config: &Config,
     alias: &str,
     workspace: &std::path::Path,
+    retirement: Result<Option<serde_json::Value>, String>,
 ) -> Result<(
     zeroclaw_runtime::agent_owned_state::AgentDeletionArchive,
     zeroclaw_runtime::agent_owned_state::OwnedStateReport,
@@ -574,12 +591,13 @@ async fn run_agent_delete_cascade(
     let archive =
         zeroclaw_runtime::agent_owned_state::archive_agent_workspace(config, alias, workspace)
             .await;
-    let report = zeroclaw_runtime::agent_owned_state::cascade_owned_state(
+    let report = zeroclaw_runtime::agent_owned_state::cascade_owned_state_with_retirement(
         config,
         Some(&mem),
         session_backend.as_ref(),
         alias,
         &archive.path,
+        retirement,
     )
     .await;
     Ok((archive, report))
@@ -590,8 +608,9 @@ async fn agent_delete_owned_state(
     config: &Config,
     alias: &str,
     workspace: &std::path::Path,
+    retirement: Result<Option<serde_json::Value>, String>,
 ) -> Result<()> {
-    let (archive, report) = run_agent_delete_cascade(config, alias, workspace).await?;
+    let (archive, report) = run_agent_delete_cascade(config, alias, workspace, retirement).await?;
     let archive_dir = archive.path;
     for warning in &archive.warnings {
         eprintln!(
@@ -640,6 +659,7 @@ async fn agent_delete_owned_state(
     _config: &Config,
     _alias: &str,
     _workspace: &std::path::Path,
+    _retirement: Result<Option<serde_json::Value>, String>,
 ) -> Result<()> {
     warn_agent_owned_state();
     Ok(())
@@ -1044,9 +1064,14 @@ mod tests {
         // ── attempt 1: config is already committed as removed (the alias is
         // absent), and the cascade is refused by the archive blocker. ────────
         let workspace = config.agent_workspace_dir("victim");
-        agent_delete_owned_state(&config, "victim", &workspace)
-            .await
-            .expect("a refused cascade is still a completed call");
+        agent_delete_owned_state(
+            &config,
+            "victim",
+            &workspace,
+            prepare_knowledge_retirement(&config, "victim"),
+        )
+        .await
+        .expect("a refused cascade is still a completed call");
         let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &knowledge_path,
             config.knowledge.max_nodes,
@@ -1149,9 +1174,14 @@ mod tests {
             "the fixture must make the workspace uninspectable, not absent"
         );
 
-        let (archive, _report) = run_agent_delete_cascade(&config, "victim", &workspace)
-            .await
-            .expect("a refused archive is still a completed call");
+        let (archive, _report) = run_agent_delete_cascade(
+            &config,
+            "victim",
+            &workspace,
+            prepare_knowledge_retirement(&config, "victim"),
+        )
+        .await
+        .expect("a refused archive is still a completed call");
         assert!(
             archive
                 .warnings
