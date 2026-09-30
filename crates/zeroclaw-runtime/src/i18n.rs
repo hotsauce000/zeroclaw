@@ -1508,7 +1508,7 @@ mod tests {
         /// One parity case: the Fluent key, its arguments, and the substrings
         /// every locale's rendering must contain.
         type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
-        let cases: [ParityCase; 33] = [
+        let cases: [ParityCase; 35] = [
             (
                 "cli-plugin-config-entry-key-channel",
                 &[("alias", ALIAS), ("key", KEY)],
@@ -1605,6 +1605,25 @@ mod tests {
                 "cli-plugin-channel-row-missing",
                 &[("alias", ALIAS), ("command", COMMAND)],
                 &[BINDING, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-row-missing-declared",
+                &[("alias", ALIAS), ("hosts", HOSTS), ("command", COMMAND)],
+                &[BINDING, HOSTS, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-alias-unkeyed",
+                &[
+                    ("alias", "op\\u{1b}s"),
+                    ("name", PACKAGE),
+                    ("reason", REASON),
+                ],
+                &[
+                    "plugin.op\\u{1b}s",
+                    "[channels.plugin.op\\u{1b}s]",
+                    PACKAGE,
+                    REASON,
+                ],
             ),
             (
                 "cli-plugin-channel-required-config",

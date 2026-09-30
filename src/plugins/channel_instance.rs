@@ -28,14 +28,11 @@ use zeroclaw_config::schema::{Config, PluginEntryConfig};
 use zeroclaw_plugins::error::PluginError;
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+use zeroclaw_runtime::plugin_runtime::PLUGIN_CHANNEL_FAMILY;
 
 use super::egress_ceremony::{
     ShellDialect, canonical_hosts, egress_hosts_path, zeroclaw_invocation_for,
 };
-
-/// The composite channel family of explicit `[channels.plugin.<alias>]`
-/// bindings: a bound instance registers as the channel `plugin.<alias>`.
-pub const PLUGIN_CHANNEL_FAMILY: &str = "plugin";
 
 /// One `[[plugins.entries]]` row a package's instance owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,9 +182,14 @@ pub fn bound_channel_aliases(config: &Config, package: &str) -> Vec<String> {
 /// channel package has no instance, so it yields no row rather than a
 /// package-level key nothing reads.
 ///
+/// A bound alias no instance can be keyed by, one the instance identity rules
+/// reject, yields no row. Config validation only warns about such an alias,
+/// so it can reach live config, and it must not take the package's other
+/// rows down with it: [`unkeyed_channel_aliases`] reports it instead.
+///
 /// # Errors
 ///
-/// A key derivation failure from the instance constructor.
+/// A key derivation failure for the default tool binding.
 pub fn instance_rows(
     config: &Config,
     manifest: &PluginManifest,
@@ -211,10 +213,34 @@ pub fn instance_rows(
     }
     if manifest.capabilities.contains(&PluginCapability::Channel) {
         for alias in bound_channel_aliases(config, &manifest.name) {
-            rows.extend(channel_instance_row(manifest, &alias)?);
+            if let Ok(row) = channel_instance_row(manifest, &alias) {
+                rows.extend(row);
+            }
         }
     }
     Ok(rows)
+}
+
+/// The aliases bound to `manifest`'s package that no instance can be keyed
+/// by, each with the instance identity rules' reason: the aliases
+/// [`instance_rows`] skips. Sorted by alias; empty for a package without the
+/// `channel` capability.
+#[must_use]
+pub fn unkeyed_channel_aliases(
+    config: &Config,
+    manifest: &PluginManifest,
+) -> Vec<(String, String)> {
+    if !manifest.capabilities.contains(&PluginCapability::Channel) {
+        return Vec::new();
+    }
+    bound_channel_aliases(config, &manifest.name)
+        .into_iter()
+        .filter_map(|alias| {
+            channel_instance_key(manifest, &alias)
+                .err()
+                .map(|error| (alias, error.to_string()))
+        })
+        .collect()
 }
 
 /// The row the channel instance `alias` makes of `manifest`'s package owns,
@@ -497,9 +523,10 @@ fn degraded_binding_section(config: &Config, alias: &str) -> Option<String> {
 /// lets `plugin install` persist a package's tool row and its channel
 /// instance together.
 ///
-/// A created binding gets `package` and nothing else, so it takes the schema
-/// default `enabled = true`. A created row gets the plan's seed as its
-/// `egress_hosts`, the same dirty-path write install seeding uses.
+/// A created binding is written with `package` and the schema default
+/// `enabled = true`: the ceremony sets nothing else. A created row gets the
+/// plan's seed as its `egress_hosts`, the same dirty-path write install
+/// seeding uses.
 /// `egress_allow_private` is never written: a private-address carve-out stays
 /// operator-authored.
 ///
@@ -674,18 +701,25 @@ pub fn config_set_command_for(
 /// With `alias` the command binds that alias, quoted like every other
 /// argument. Without one it ends in the literal placeholder `<alias>`, for the
 /// operator to replace with the alias they choose.
+///
+/// With `egress_choice` the command also ends in `--egress <declared|none>`,
+/// a placeholder the operator replaces with their decision. The ceremony
+/// refuses to create a row whose manifest declares destinations it can use
+/// without that decision, so a command printed for such a row must ask for it
+/// rather than be refused as printed, and must not make the choice itself.
 #[must_use]
 pub fn plugin_bind_command_for(
     dialect: ShellDialect,
     config_dir: &Path,
     package: &str,
     alias: Option<&str>,
+    egress_choice: bool,
 ) -> String {
     let dir = config_dir.to_string_lossy();
     let mut arguments = vec![dir.as_ref(), package];
     arguments.extend(alias);
     let (dialect, marker) = dialect.command_form(&arguments);
-    format!(
+    let mut command = format!(
         "{marker}{} plugin bind {} --channel-alias {}",
         zeroclaw_invocation_for(dialect, config_dir),
         dialect.quote_literal(package),
@@ -693,5 +727,146 @@ pub fn plugin_bind_command_for(
             || "<alias>".to_string(),
             |alias| dialect.quote_literal(alias)
         )
-    )
+    );
+    if egress_choice {
+        command.push_str(" --egress <declared|none>");
+    }
+    command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ShellDialect, config_set_command_for, plugin_bind_command_for};
+    use std::path::Path;
+
+    /// The marker a Windows line starts with when a value in it is not
+    /// literal in `cmd.exe`, spelled out so the forms below are exact.
+    const POWERSHELL_ONLY: &str = "# PowerShell only, cmd.exe cannot pass this value literally: ";
+
+    /// POSIX: every argument single-quoted, an embedded quote closed, escaped
+    /// and reopened, and a missing value left for `config set` to prompt for.
+    #[test]
+    fn config_set_commands_quote_every_argument_in_the_posix_form() {
+        let dir = Path::new("/tmp/it's here/profile a");
+        assert_eq!(
+            config_set_command_for(ShellDialect::Posix, dir, "plugins.enabled", Some("true")),
+            "zeroclaw --config-dir '/tmp/it'\\''s here/profile a' config set \
+             'plugins.enabled' 'true'"
+        );
+        assert_eq!(
+            config_set_command_for(
+                ShellDialect::Posix,
+                dir,
+                "plugins.entries.zpi1_k.config.api_token",
+                None
+            ),
+            "zeroclaw --config-dir '/tmp/it'\\''s here/profile a' config set \
+             'plugins.entries.zpi1_k.config.api_token'"
+        );
+    }
+
+    /// Windows: one double-quoted argument each, literal in both Windows
+    /// shells; a profile path neither passes literally sends the whole line to
+    /// the marked PowerShell form.
+    #[test]
+    fn config_set_commands_take_the_windows_form_or_the_marked_powershell_form() {
+        assert_eq!(
+            config_set_command_for(
+                ShellDialect::Windows,
+                Path::new(r"C:\Users\op erator\.zeroclaw"),
+                "channels.plugin.operations.enabled",
+                Some("true")
+            ),
+            concat!(
+                r#"zeroclaw --config-dir "C:\Users\op erator\.zeroclaw" config set "#,
+                r#""channels.plugin.operations.enabled" "true""#
+            )
+        );
+        assert_eq!(
+            config_set_command_for(
+                ShellDialect::Windows,
+                Path::new(r"C:\%USERPROFILE%\.zeroclaw"),
+                "plugins.enabled",
+                Some("true")
+            ),
+            format!(
+                "{POWERSHELL_ONLY}{}",
+                r"zeroclaw --config-dir 'C:\%USERPROFILE%\.zeroclaw' config set 'plugins.enabled' 'true'"
+            )
+        );
+    }
+
+    /// POSIX: the package and a chosen alias are quoted; the alias the
+    /// operator has yet to choose and the egress decision they have yet to
+    /// make stay bare placeholders.
+    #[test]
+    fn plugin_bind_commands_leave_the_operators_choices_as_placeholders_in_the_posix_form() {
+        let dir = Path::new("/srv/zeroclaw/profile a");
+        assert_eq!(
+            plugin_bind_command_for(ShellDialect::Posix, dir, "chat-bridge", None, false),
+            "zeroclaw --config-dir '/srv/zeroclaw/profile a' plugin bind 'chat-bridge' \
+             --channel-alias <alias>"
+        );
+        assert_eq!(
+            plugin_bind_command_for(ShellDialect::Posix, dir, "chat-bridge", None, true),
+            "zeroclaw --config-dir '/srv/zeroclaw/profile a' plugin bind 'chat-bridge' \
+             --channel-alias <alias> --egress <declared|none>"
+        );
+        assert_eq!(
+            plugin_bind_command_for(
+                ShellDialect::Posix,
+                dir,
+                "chat-bridge",
+                Some("operations"),
+                true
+            ),
+            "zeroclaw --config-dir '/srv/zeroclaw/profile a' plugin bind 'chat-bridge' \
+             --channel-alias 'operations' --egress <declared|none>"
+        );
+    }
+
+    /// Windows: the same command with double-quoted arguments, or the marked
+    /// PowerShell form when the profile path is not literal in `cmd.exe`.
+    #[test]
+    fn plugin_bind_commands_take_the_windows_form_or_the_marked_powershell_form() {
+        assert_eq!(
+            plugin_bind_command_for(
+                ShellDialect::Windows,
+                Path::new(r"C:\Users\op erator\.zeroclaw"),
+                "chat-bridge",
+                Some("operations"),
+                false
+            ),
+            concat!(
+                r#"zeroclaw --config-dir "C:\Users\op erator\.zeroclaw" plugin bind "#,
+                r#""chat-bridge" --channel-alias "operations""#
+            )
+        );
+        assert_eq!(
+            plugin_bind_command_for(
+                ShellDialect::Windows,
+                Path::new(r"C:\Users\op erator\.zeroclaw"),
+                "chat-bridge",
+                None,
+                true
+            ),
+            concat!(
+                r#"zeroclaw --config-dir "C:\Users\op erator\.zeroclaw" plugin bind "#,
+                r#""chat-bridge" --channel-alias <alias> --egress <declared|none>"#
+            )
+        );
+        assert_eq!(
+            plugin_bind_command_for(
+                ShellDialect::Windows,
+                Path::new(r"C:\%USERPROFILE%\.zeroclaw"),
+                "chat-bridge",
+                Some("operations"),
+                true
+            ),
+            format!(
+                "{POWERSHELL_ONLY}{}",
+                r"zeroclaw --config-dir 'C:\%USERPROFILE%\.zeroclaw' plugin bind 'chat-bridge' --channel-alias 'operations' --egress <declared|none>"
+            )
+        );
+    }
 }

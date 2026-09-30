@@ -301,7 +301,9 @@ key's command prompts for the value without echo, and no value is ever
 printed. The command is printed only for a property name in the portable key
 grammar (1 to 128 ASCII letters, digits, `_`, `-`, or `.`); any other name is
 reported with the config file row to edit instead, so keep required property
-names inside it.
+names inside it. When the entry does not exist yet, as for a binding written
+by hand, `plugin info` prints the `plugin bind` command that creates it in
+place of the keys, since `config set` resolves only an entry that exists.
 
 Call `config.get` and `secrets.get` inside each operation that uses them. The
 host resolves at most one canonical revision for that call and drops its view
@@ -334,8 +336,12 @@ zeroclaw plugin bind acme.chat --channel-alias operations --egress declared
 `--egress declared` grants the destinations the manifest declares, and
 `--egress none` binds with no network reach. The flag matters only when the
 command creates the instance's config entry, and it is required then if the
-manifest declares destinations. `zeroclaw plugin install <source>
---channel-alias operations` runs the same ceremony during installation;
+manifest declares destinations and the package holds a transport that can
+reach them (`http_client`, `websocket_client`, or `socket_client`).
+`zeroclaw plugin install <source> --channel-alias operations` runs the same
+ceremony during installation; there the flag governs only the channel
+instance's entry, and a tool entry of the same package is seeded as install
+always seeds it.
 [Binding a channel instance](./index.md#binding-a-channel-instance) describes
 it in full.
 
@@ -356,7 +362,7 @@ channels = ["plugin.operations"]
 
 `plugin bind` writes only the `[channels.plugin.operations]` table and the
 instance's `[[plugins.entries]]` row. A new binding is written with `package`
-alone and takes the default `enabled = true`. Two steps stay explicit operator
+and the default `enabled = true`. Two steps stay explicit operator
 decisions that the command never makes: turning the plugin system on
 (`plugins.enabled`), and ownership, adding `plugin.operations` to an enabled
 agent's `channels` list (`agents.<agent>.channels`). The readiness report the

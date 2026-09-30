@@ -13,15 +13,17 @@
 //! and what the guest observed, changes with the grant. That is what proves the
 //! host-owned egress policy gates *reach*, not construction.
 //!
-//! The first three tests build the declaration and the grant by hand. The rest
-//! let the shipped `zeroclaw` binary write them into an isolated config
+//! The first three tests build the declaration and the grant by hand. The next
+//! two let the shipped `zeroclaw` binary write them into an isolated config
 //! directory: `plugin install --channel-alias` binds the alias and creates the
 //! instance's row, `config set` supplies what the binding ceremony leaves to
 //! the operator, and the channel is constructed from the file the binary wrote.
 //! Only an owning agent is added in memory, since binding an agent is
 //! deliberately outside the ceremony. So the row the ceremony writes is proved
 //! to be the row the runtime reads, and the command it prints is proved to be
-//! the one that opens the destination.
+//! the one that opens the destination. The last test drives only the binary
+//! and constructs no channel: a refused install writes and publishes nothing,
+//! and a retry under a free alias binds it.
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
@@ -331,7 +333,9 @@ async fn construct_and_probe(config: Config) -> (usize, Option<String>) {
 /// security posture decision the binding ceremony never makes, so the test
 /// makes it here, before any command runs. `locale = "en"` selects the English
 /// catalogue on every platform, where `LANG` alone does not (macOS and Windows
-/// report the OS locale), so the one prose line parsed below is stable.
+/// report the OS locale), so the one prose line parsed below is stable. The
+/// file is at the current schema version, which the ceremony requires before
+/// it writes.
 fn config_dir_with_plugins_dir() -> TempDir {
     let config_dir = TempDir::new().expect("create isolated config directory");
     let plugins_dir = plugins_dir_of(config_dir.path());
@@ -343,8 +347,9 @@ fn config_dir_with_plugins_dir() -> TempDir {
     std::fs::write(
         config_dir.path().join("config.toml"),
         format!(
-            "schema_version = 3\nlocale = \"en\"\n\n[plugins]\nenabled = true\n\
-             auto_discover = false\nmax_active_instances = 1\nplugins_dir = '{plugins_dir}'\n"
+            "schema_version = {}\nlocale = \"en\"\n\n[plugins]\nenabled = true\n\
+             auto_discover = false\nmax_active_instances = 1\nplugins_dir = '{plugins_dir}'\n",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
         ),
     )
     .expect("write config.toml");

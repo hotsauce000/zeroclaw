@@ -187,9 +187,11 @@ Binding the alias derives, prints, and seeds that key. To put a channel
 instance's values on it:
 
 1. Run `zeroclaw plugin bind <package> --channel-alias <alias>`. If the
-   manifest declares destinations and the instance has no row yet, add
-   `--egress declared` to grant them or `--egress none` to bind with no
-   network reach; without either, the command refuses and lists them. It
+   manifest declares destinations, the package holds a transport that can
+   reach them (`http_client`, `websocket_client`, or `socket_client`), and the
+   instance has no row yet, add `--egress declared` to grant them or
+   `--egress none` to bind with no network reach; without either, the command
+   refuses and lists them. It
    creates the `[channels.plugin.<alias>]` binding, or keeps one you already
    wrote, and seeds the instance's `[[plugins.entries]]` row.
    `zeroclaw plugin install <source> --channel-alias <alias>` does the same

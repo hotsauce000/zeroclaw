@@ -144,9 +144,10 @@ You can write that table by hand, or let `zeroclaw plugin bind <package>
 --channel-alias <alias>` write it for an installed channel package. The command
 also seeds the instance's `[[plugins.entries]]` row, requires an explicit
 `--egress declared` or `--egress none` flag before it creates that row from a
-manifest that declares destinations, and reports what the instance still needs
-before it can start. It never sets `plugins.enabled` and never edits an agent's
-`channels`. See
+manifest that declares destinations and holds a transport that can reach them
+(`http_client`, `websocket_client`, or `socket_client`), and reports what the
+instance still needs before it can start. It never sets `plugins.enabled` and
+never edits an agent's `channels`. See
 [Binding a channel instance](../plugins/index.md#binding-a-channel-instance).
 
 ## What a plugin still cannot do

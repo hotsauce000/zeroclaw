@@ -582,12 +582,13 @@ fn has_enabled_owner_ref(config: &Config, channel_ref: &str) -> bool {
     })
 }
 
-/// The plugin family's own channel namespace.
+/// The plugin family's own channel namespace: an explicit
+/// `[channels.plugin.<alias>]` binding runs as the channel `plugin.<alias>`.
 ///
 /// `[channels.plugin.<alias>]` declarations are bound to a package by their
 /// `package` field, so this family is never a mirror target.
 #[cfg(feature = "plugins-wasm")]
-const PLUGIN_CHANNEL_FAMILY: &str = "plugin";
+pub const PLUGIN_CHANNEL_FAMILY: &str = "plugin";
 
 /// How many installed channel packages claim each mirrored channel id.
 ///

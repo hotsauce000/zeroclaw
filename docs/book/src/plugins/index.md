@@ -396,8 +396,16 @@ list computed from this one. The directory, the host list, and every other
 argument a command carries (a config path naming a schema property, a package,
 an alias) are each quoted as one literal argument, so nothing a manifest
 declares can be expanded or substituted by your shell; paste the command as
-printed. The one exception is the `<alias>` placeholder in the `plugin bind`
-hint, which you replace with the alias you choose.
+printed. The exceptions are the placeholders in a printed `plugin bind`
+command: `<alias>`, which you replace with the alias you choose, and
+`<declared|none>`, which you replace with your egress decision. Replace both
+before you run it. On Linux and macOS, a placeholder left at the end of the
+line is a shell syntax error, so that command runs nothing. An `<alias>` left
+in front of a filled-in `--egress`, though, is read by the shell as two
+redirections, from a file named `alias` and into a file named `--egress`: the
+command then fails on the missing file, or runs with your decision taken as
+the alias and no `--egress` flag, and the ceremony refuses it for the missing
+decision.
 
 The quoting follows the shell of the platform the command was printed on. On
 Linux and macOS it is the POSIX single-quoted form (`sh`, `bash`, `zsh`,
@@ -488,15 +496,25 @@ zeroclaw plugin bind acme.chat --channel-alias operations --egress declared
 alias and how you repair a partial binding. `zeroclaw plugin install <source>
 --channel-alias <alias>` runs the same ceremony as part of the install, and
 takes the same `--egress` flag, which install accepts only together with
-`--channel-alias`. There, every refusal below happens before the package is
-published; the tool row, the binding, and the channel row are written in one
-save; and a failure while writing them rolls the package back. An install of a
-channel package without `--channel-alias` publishes it as before, then prints
-the `plugin bind` command to run, with an `<alias>` placeholder. The ceremony
-never prompts: every decision is a flag.
+`--channel-alias`. The flag governs only the channel instance's row: a tool
+row of the same package is seeded by install's own rule, as it always was.
+There, every refusal below happens before the package is published; the tool
+row, the binding, and the channel row are written in one save; and a failure
+while writing them rolls the package back. An install of a channel package
+without `--channel-alias` publishes it as before. If bindings already name
+the package, as a `plugin remove` leaves them, it then prints each bound
+alias's readiness report, described below; otherwise it prints the
+`plugin bind` command to run, with an `<alias>` placeholder and, when the
+manifest declares destinations the channel can reach, an
+`--egress <declared|none>` placeholder for your decision. The ceremony never
+prompts: every decision is a flag.
 
 The command refuses, and writes nothing, when:
 
+- the configuration file is on an older schema version; run
+  `zeroclaw config migrate` first, as `zeroclaw config set` requires, since a
+  save would stamp the current version onto sections still in the older
+  shape;
 - the package does not provide a channel;
 - the alias is not 1 to 63 lowercase letters, digits, and single underscores,
   starting and ending with a letter or digit;
@@ -507,9 +525,9 @@ The command refuses, and writes nothing, when:
   and was not loaded, because the command never writes over a section the
   loader dropped.
 
-Otherwise it creates the binding, written with `package` alone so it takes the
-default `enabled = true`, or keeps one that already names the package exactly
-as it is, `enabled = false` included. It then creates the instance's
+Otherwise it creates the binding, written with `package` and the default
+`enabled = true`, or keeps one that already names the package exactly as it
+is, `enabled = false` included. It then creates the instance's
 `[[plugins.entries]]` row, when the row does not exist yet and the instance has
 host-owned state to hold: a `config_schema`, a declared destination, or a
 transport the egress authority governs (`http_client`, `websocket_client`, or
@@ -557,10 +575,14 @@ each answer from the source the runtime uses:
    names the row to edit in the config file instead. An instance whose row does
    not exist yet, such as a binding written by hand, gets the `plugin bind`
    command that creates the row in place of per-key commands, since
-   `config set` resolves only rows that exist. Values are never printed.
+   `config set` resolves only rows that exist. When the manifest declares
+   destinations the row can use, the report names them and the command ends in
+   `--egress <declared|none>`, for your decision. Values are never printed.
 3. The runtime config resolver's verdict on the row, which names the schema
    path or property that fails, never a value.
-4. The egress gap, in the words `plugin list` uses.
+4. The egress gap, in the words `plugin list` uses. `plugin bind` and
+   `plugin install --channel-alias` leave it out, because they have just
+   reported the row's grant with its command.
 5. The activation plan's own verdict, which names the first precondition the
    runtime finds unmet. It checks, in order, `plugins.enabled`, the binding's
    `enabled`, an enabled agent that lists `plugin.<alias>` in its `channels`,
@@ -568,8 +590,10 @@ each answer from the source the runtime uses:
    `plugins.max_active_instances`. A disabled plugin system or binding
    comes with the command that enables it. A missing owner is described
    rather than given a command, because `config set` on an agent's `channels`
-   list replaces the whole list. If the runtime cannot build its activation
-   plan at all, the report says so with the runtime's error.
+   list replaces the whole list. When every precondition holds, the plan
+   admits the instance, and it starts at the next daemon start or reload if
+   its component loads. If the runtime cannot build its activation plan at
+   all, the report says so with the runtime's error.
 6. A reminder that a running daemon starts the instance only after a restart
    or reload.
 
@@ -579,6 +603,13 @@ when the instance cannot start yet; only a refusal or a failed write exits
 non-zero. `zeroclaw plugin info <package>` prints the same report after each
 bound alias's key, and for a channel package with no bound alias it prints the
 same `plugin bind` hint install does.
+
+A binding whose alias no plugin instance can be named by, such as one holding
+a control character, which configuration validation only warns about, does
+not stop the package's other instances from being reported. `plugin list`,
+`plugin info`, `plugin install`, and `plugin remove` print one line saying the
+binding is skipped, with the alias escaped, and name the
+`[channels.plugin.<alias>]` table to rename or remove.
 
 ## Where the trust boundary actually is
 
