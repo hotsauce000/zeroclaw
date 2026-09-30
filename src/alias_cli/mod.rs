@@ -588,6 +588,7 @@ fn rename_refused(error: RenameRecoveryError) -> anyhow::Error {
             &[("from", from.as_str()), ("to", to.as_str())],
             "agent `{$to}` is the target of an unfinished rename from `{$from}`; run `zeroclaw agents rename {$from} {$to}` first",
         ),
+        RenameRecoveryError::SourceReconfigured { .. } => error.to_string(),
         RenameRecoveryError::Unreadable { .. }
         | RenameRecoveryError::Busy { .. }
         | RenameRecoveryError::Persist { .. } => return rename_recovery_failed(&error),

@@ -2717,6 +2717,12 @@ mod tests {
                 .starts_with("agent lifecycle recovery journal could not be read: "),
             "{err}"
         );
+        // Surfaces render this before authorizing the caller, so it names the
+        // journal file and never the directory holding it.
+        assert!(
+            !err.to_string().contains(&dir.path().display().to_string()),
+            "{err}"
+        );
         assert!(!cfg.agents.contains_key("scout"));
         // Only agent creation consults the journal.
         assert!(create_map_key_checked(&mut cfg, "providers.models.anthropic", "scout").unwrap());
@@ -2754,12 +2760,22 @@ mod tests {
             Err(crate::schema::VivifyRefusal::Reserved)
         );
 
-        // A journal that cannot be read refuses rather than guessing.
+        // A journal that cannot be read refuses rather than guessing, and
+        // says so without naming the directory holding it.
         make_journal_unreadable(dir.path());
-        assert!(matches!(
-            cfg.ensure_map_key_for_path_checked("agents.scout.enabled"),
-            Err(crate::schema::VivifyRefusal::RecoveryUnreadable(_))
-        ));
+        let refusal = cfg
+            .ensure_map_key_for_path_checked("agents.scout.enabled")
+            .unwrap_err();
+        assert!(
+            matches!(refusal, crate::schema::VivifyRefusal::RecoveryUnreadable(_)),
+            "{refusal:?}"
+        );
+        assert!(
+            !refusal
+                .to_string()
+                .contains(&dir.path().display().to_string()),
+            "{refusal}"
+        );
         assert!(!cfg.agents.contains_key("scout"));
         // An alias that already exists never consults the journal.
         assert_eq!(

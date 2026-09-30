@@ -869,7 +869,8 @@ fn agent_recovery_error_to_rpc(
         RenameRecoveryError::InvalidAlias { .. }
         | RenameRecoveryError::ReservedAlias { .. }
         | RenameRecoveryError::AliasRetired { .. }
-        | RenameRecoveryError::RecoveryPending { .. } => {
+        | RenameRecoveryError::RecoveryPending { .. }
+        | RenameRecoveryError::SourceReconfigured { .. } => {
             rpc_err(INVALID_PARAMS, format!("{path}.{alias}: {err}"))
         }
         RenameRecoveryError::Unreadable { .. }

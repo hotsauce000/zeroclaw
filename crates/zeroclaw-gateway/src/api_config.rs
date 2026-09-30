@@ -1887,7 +1887,8 @@ fn agent_recovery_error_response(
         RenameRecoveryError::InvalidAlias { .. }
         | RenameRecoveryError::ReservedAlias { .. }
         | RenameRecoveryError::AliasRetired { .. }
-        | RenameRecoveryError::RecoveryPending { .. } => ConfigApiCode::ValidationFailed,
+        | RenameRecoveryError::RecoveryPending { .. }
+        | RenameRecoveryError::SourceReconfigured { .. } => ConfigApiCode::ValidationFailed,
         RenameRecoveryError::NotConfigured { .. } => ConfigApiCode::PathNotFound,
         RenameRecoveryError::Unreadable { .. }
         | RenameRecoveryError::Busy { .. }

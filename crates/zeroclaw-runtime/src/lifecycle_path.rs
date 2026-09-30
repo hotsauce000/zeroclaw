@@ -1,11 +1,15 @@
-//! Presence checks for the paths an agent lifecycle operation inspects before
-//! it moves or opens anything.
+//! Presence and identity checks for the paths an agent lifecycle operation
+//! inspects before it moves or opens anything.
 //!
 //! A lifecycle operation must tell "nothing is there" apart from "whether
 //! anything is there cannot be established": the first lets it skip a store
 //! or move a directory into place, the second must stop it. A path under an
 //! ancestor that is a file, or that cannot be read, is the second case on
 //! every platform, even where the platform reports it as simply missing.
+//!
+//! Two differently spelled paths can also name one directory, through a
+//! symlink or on a case-insensitive filesystem; [`same_existing_file`] tells
+//! an operation so before it treats one as the other's destination.
 
 use std::path::Path;
 
@@ -85,6 +89,47 @@ pub async fn inspect_lifecycle_path(path: &Path) -> PathPresence {
     classify_presence(path, tokio::fs::try_exists(path).await).await
 }
 
+/// Whether `a` and `b` name one existing file or directory, however each is
+/// spelled: through a symlink, with `..` components, or in another letter
+/// case on a case-insensitive filesystem. Both must exist; when either does
+/// not, they are not the same file. A path that cannot be inspected for any
+/// other reason is an error.
+///
+/// Unix compares device and inode numbers; elsewhere the two paths are
+/// canonicalized and compared.
+pub fn same_existing_file(a: &Path, b: &Path) -> std::io::Result<bool> {
+    let (Some(a_meta), Some(b_meta)) = (existing_metadata(a)?, existing_metadata(b)?) else {
+        return Ok(false);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(a_meta.dev() == b_meta.dev() && a_meta.ino() == b_meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a_meta, b_meta);
+        Ok(std::fs::canonicalize(a)? == std::fs::canonicalize(b)?)
+    }
+}
+
+/// The metadata of `path`, following symlinks, or `None` when nothing exists
+/// there: the path is missing, or one of its ancestors is not a directory.
+fn existing_metadata(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +195,38 @@ mod tests {
         assert_eq!(inspect_lifecycle_path(&dir).await, PathPresence::Present);
         assert_eq!(inspect_lifecycle_path(&file).await, PathPresence::Present);
         assert!(!PathPresence::Present.is_uninspectable());
+    }
+
+    #[test]
+    fn same_existing_file_sees_one_directory_through_every_spelling() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("agents").join("scout");
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = tmp.path().join("agents").join("ranger");
+        std::fs::create_dir_all(&other).unwrap();
+
+        assert!(same_existing_file(&dir, &dir).unwrap());
+        let dotted = tmp
+            .path()
+            .join("agents")
+            .join("ranger")
+            .join("..")
+            .join("scout");
+        assert!(same_existing_file(&dir, &dotted).unwrap());
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&dir, &link).unwrap();
+            assert!(same_existing_file(&link, &dir).unwrap());
+        }
+        assert!(!same_existing_file(&dir, &other).unwrap());
+
+        // Both must exist.
+        let missing = tmp.path().join("agents").join("missing");
+        assert!(!same_existing_file(&dir, &missing).unwrap());
+        assert!(!same_existing_file(&missing, &missing).unwrap());
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        assert!(!same_existing_file(&file.join("child"), &dir).unwrap());
     }
 }

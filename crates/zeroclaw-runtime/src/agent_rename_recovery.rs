@@ -17,10 +17,12 @@
 //!
 //! The record keeps the recovery durable across the window after the commit
 //! and across processes. While it is open the old alias cannot be reused, and
-//! re-running the same rename resumes it.
+//! re-running the same rename resumes it. A rename that cannot finish is
+//! dropped with [`abandon_rename`], which moves nothing and reports what is
+//! still kept under the old alias.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,14 +38,16 @@ use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::MemoryBackendKind;
 
-use crate::lifecycle_path::{PathPresence, inspect_lifecycle_path};
+use crate::lifecycle_path::{PathPresence, inspect_lifecycle_path, same_existing_file};
 
 /// How long [`arm`], and a rename discovered without a record, wait for the
 /// journal lock. Callers hold their config write lock while arming, so a
 /// contended journal fails fast rather than stalling every config write.
 const ARM_LOCK_WAIT: Duration = Duration::from_millis(250);
-/// How long [`converge`] waits for the journal lock to clear a record.
-const CLEAR_LOCK_WAIT: Duration = Duration::from_secs(5);
+/// How long a step that changes an existing record waits for the journal
+/// lock: [`converge`] committing or clearing it, and [`abandon_rename`]
+/// dropping it.
+const RECORD_LOCK_WAIT: Duration = Duration::from_secs(5);
 /// The store the journal's own read failures are reported under.
 const JOURNAL_STORE: &str = "agent lifecycle recovery journal";
 
@@ -54,6 +58,7 @@ const KEY_INCOMPLETE: &str = "agents.rename_recovery.incomplete";
 const KEY_REFUSED: &str = "agents.rename_recovery.refused";
 const KEY_UNREADABLE: &str = "agents.rename_recovery.unreadable";
 const KEY_RECORD_FAILED: &str = "agents.rename_recovery.record_failed";
+const KEY_ABANDONED: &str = "agents.rename_recovery.abandoned";
 
 /// Store handles a rename surface already holds. `None` means the surface
 /// holds no handle for that store, not that the store is unconfigured: the
@@ -247,6 +252,11 @@ pub enum RenameRecoveryError {
     /// An unfinished rename of `from` is still converging into `to`. Display
     /// leaves `from` out, for the same reason.
     RecoveryPending { from: String, to: String },
+    /// `from` is configured again while its rename to `to` is unfinished: an
+    /// agent brought back around the create guards (a hand edit, say) would
+    /// take over whatever the rename still owes `to`, so nothing moves until
+    /// the operator removes it or abandons the rename.
+    SourceReconfigured { from: String, to: String },
     /// A store could not be read, so whether a rename is unfinished, or state
     /// is left under an alias, is unknown.
     Unreadable { store: String, detail: String },
@@ -274,6 +284,10 @@ impl fmt::Display for RenameRecoveryError {
                 f,
                 "agent `{to}` is the target of an unfinished rename; re-run that rename first"
             ),
+            Self::SourceReconfigured { from, to } => write!(
+                f,
+                "agent `{from}` is configured again while its rename to `{to}` is unfinished; remove `[agents.{from}]` from the config by hand, or abandon the rename, then retry"
+            ),
             Self::Unreadable { store, detail } => write!(f, "{store} could not be read: {detail}"),
             Self::Busy { detail } => write!(
                 f,
@@ -287,6 +301,16 @@ impl fmt::Display for RenameRecoveryError {
 }
 
 impl std::error::Error for RenameRecoveryError {}
+
+/// What [`abandon_rename`] dropped, and what it left behind.
+#[derive(Debug)]
+pub struct AbandonedRename {
+    /// The record that was dropped.
+    pub record: RecoveryRecord,
+    /// State still kept under the old alias, which an agent created under it
+    /// adopts, and every store that could not be read to tell.
+    pub residue: Vec<FollowerIssue>,
+}
 
 /// What [`resolve`] decided a rename is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,14 +347,14 @@ impl Armed {
 /// Decide whether renaming `from` to `to` is a fresh rename or resumes an
 /// unfinished one.
 ///
-/// An open record decides first: this rename's own record resumes it, and a
-/// record of another rename that retired either alias, or still converges
-/// into one of them, refuses it. Otherwise a configured `from` is fresh. A
-/// `from` that is gone while `to` is configured may be a rename committed
-/// without a record (by an older build, say): the followers are probed, and
-/// any state left under `from`, or a store that cannot be read, records the
-/// rename as committed so it resumes and `from` stays retired until it
-/// converges.
+/// An open record decides first: this rename's own record resumes it, unless
+/// `from` is configured again, and a record of another rename that retired
+/// either alias, or still converges into one of them, refuses it. Otherwise a
+/// configured `from` is fresh. A `from` that is gone while `to` is configured
+/// may be a rename committed without a record (by an older build, say): the
+/// followers are probed, and any state left under `from`, or a store that
+/// cannot be read, records the rename as committed so it resumes and `from`
+/// stays retired until it converges.
 pub async fn resolve(
     config: &Config,
     from: &str,
@@ -339,7 +363,9 @@ pub async fn resolve(
 ) -> Result<Disposition, RenameRecoveryError> {
     validate_rename(from, to)?;
     let journal = AgentRecoveryJournal::for_config(config);
-    let records = load_records(config, &journal).inspect_err(|e| log_refusal(from, to, e))?;
+    let records = load_records(config, &journal)
+        .await
+        .inspect_err(|e| log_refusal(from, to, e))?;
     validate_source(config, &records, from)?;
     match match_records(&records, config, from, to) {
         RecordMatch::Refused(error) => {
@@ -369,8 +395,8 @@ pub async fn resolve(
 /// surface has committed and called [`acknowledge_commit`] or [`abandon`].
 ///
 /// `config_before_commit` is the config the commit starts from. The record
-/// keeps `from`'s workspace for the move only when it sits at the
-/// alias-derived location; a custom path is alias-independent and never moves.
+/// keeps `from`'s workspace for the move only when `from` sets no
+/// `workspace.path` and so follows its alias; a custom path never moves.
 pub async fn arm(
     config_before_commit: &Config,
     from: &str,
@@ -380,13 +406,13 @@ pub async fn arm(
     let journal = AgentRecoveryJournal::for_config(config_before_commit);
     // Checked before the lock, which creates the data directory and its lock
     // file, so a request that fails it leaves nothing behind.
-    let records =
-        load_records(config_before_commit, &journal).inspect_err(|e| log_refusal(from, to, e))?;
+    let records = load_records(config_before_commit, &journal)
+        .await
+        .inspect_err(|e| log_refusal(from, to, e))?;
     validate_source(config_before_commit, &records, from)?;
     drop(records);
-    let guard = lock_journal(&journal, ARM_LOCK_WAIT).await?;
-    match prepare_record(&journal, &guard, config_before_commit, from, to) {
-        Ok(record) => {
+    match prepare_record(journal, config_before_commit, from, to).await {
+        Ok(armed) => {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -394,11 +420,11 @@ pub async fn arm(
                         "error_key": KEY_ARMED,
                         "from": from,
                         "to": to,
-                        "moves_workspace": record.source_workspace.is_some(),
+                        "moves_workspace": armed.record.source_workspace.is_some(),
                     })),
                 "agent rename recovery armed before the config commit"
             );
-            Ok(Armed { record, guard })
+            Ok(armed)
         }
         Err(error) => {
             log_refusal(from, to, &error);
@@ -411,9 +437,9 @@ pub async fn arm(
 /// the journal lock. Best effort: a failure is logged, and the prepared record
 /// still covers the rename, since the live config shows the commit.
 ///
-/// `config_after_commit` must show the commit: `from` gone and `to` present.
-/// Otherwise the record is left prepared, where the live config decides its
-/// effect, rather than retiring an alias that is still configured.
+/// `config_after_commit` must show the commit, with `from` gone. Otherwise
+/// the record is left prepared, and void while the live config still has
+/// `from`, rather than retiring an alias that is still configured.
 pub async fn acknowledge_commit(config_after_commit: &Config, armed: Armed) {
     let Armed { mut record, guard } = armed;
     let (from, to) = (record.from.clone(), record.to.clone());
@@ -480,8 +506,10 @@ pub async fn abandon(config: &Config, armed: Armed) {
 /// The re-check decides the outcome: a follower whose move failed but that
 /// holds nothing under `from` has converged. A converge without a record is
 /// allowed, for a rename discovered or committed without one, but only once
-/// `from` is no longer configured. The journal lock is taken only to clear
-/// the record, never across follower I/O.
+/// `from` is no longer configured; a recorded rename whose `from` is
+/// configured again moves nothing. A prepared record is marked committed
+/// before anything moves. The journal lock is taken only to update the
+/// record, never across follower I/O.
 pub async fn converge(
     config: &Config,
     from: &str,
@@ -491,7 +519,9 @@ pub async fn converge(
     validate_rename(from, to)?;
     let journal = AgentRecoveryJournal::for_config(config);
     let (record, recorded) = {
-        let records = load_records(config, &journal).inspect_err(|e| log_refusal(from, to, e))?;
+        let records = load_records(config, &journal)
+            .await
+            .inspect_err(|e| log_refusal(from, to, e))?;
         validate_source(config, &records, from)?;
         let recorded = records.iter().any(|r| is_rename_record(r, from, to));
         match match_records(&records, config, from, to) {
@@ -511,11 +541,22 @@ pub async fn converge(
             ),
         });
     }
+    // A prepared record retires `from` only while the config lacks it. Once
+    // state starts moving that must no longer hang on the config, so the
+    // record is committed first.
+    let record = match record {
+        Some(record) if record.phase == RecoveryPhase::Prepared => Some(
+            promote_record(&journal, record)
+                .await
+                .inspect_err(|e| log_record_failed(from, to, &e.to_string()))?,
+        ),
+        record => record,
+    };
 
     let plan = FollowerPlan::resolve(config, from, to, record.as_ref(), stores).await;
     let mut report = ConvergeReport::default();
     let attempted = plan.act_all(config, from, to, &mut report).await;
-    let outstanding = plan.verify(config, from, attempted).await;
+    let outstanding = plan.verify(config, from, to, attempted).await;
 
     if !outstanding.is_empty() {
         let warnings: Vec<String> = outstanding.iter().map(ToString::to_string).collect();
@@ -538,7 +579,9 @@ pub async fn converge(
         });
     }
     if recorded {
-        clear_record(&journal, from, to).await?;
+        // Another process may have cleared the record since it was read; a
+        // record that is already gone is not an error.
+        remove_record(&journal, from, to).await?;
     }
     ::zeroclaw_log::record!(
         INFO,
@@ -553,6 +596,59 @@ pub async fn converge(
         "agent rename converged; nothing is left under the old alias"
     );
     Ok(ConvergeOutcome::Converged(report))
+}
+
+/// Drop the recovery record of the unfinished rename of `from` to `to`
+/// without moving anything: the operator's way out of a rename that cannot
+/// finish. The followers are probed but never acted on, and neither the
+/// config nor any store changes.
+///
+/// Once the record is gone `from` can be created again, and an agent created
+/// under it adopts whatever state is still kept under it. `residue` lists
+/// that state, and every store that could not be read, so the operator can
+/// check it first. Only a record of exactly this rename is dropped, and it is
+/// dropped even while `from` is configured again.
+pub async fn abandon_rename(
+    config: &Config,
+    from: &str,
+    to: &str,
+) -> Result<AbandonedRename, RenameRecoveryError> {
+    validate_rename(from, to)?;
+    let journal = AgentRecoveryJournal::for_config(config);
+    let records = load_records(config, &journal)
+        .await
+        .inspect_err(|e| log_refusal(from, to, e))?;
+    validate_source(config, &records, from)?;
+    let not_recorded = || RenameRecoveryError::NotConfigured {
+        alias: from.to_string(),
+    };
+    if !records.iter().any(|r| is_rename_record(r, from, to)) {
+        return Err(not_recorded());
+    }
+    drop(records);
+
+    // Probed as if no record covered the rename: an agent created under
+    // `from` adopts whatever is at its default workspace, wherever the record
+    // said the workspace was.
+    let plan = FollowerPlan::resolve(config, from, to, None, &SurfaceStores::none()).await;
+    let residue = plan.residue(config, from, to).await;
+    let record = remove_record(&journal, from, to)
+        .await?
+        .ok_or_else(not_recorded)?;
+    let warnings: Vec<String> = residue.iter().map(ToString::to_string).collect();
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "error_key": KEY_ABANDONED,
+                "from": from,
+                "to": to,
+                "residue": warnings,
+            })
+        ),
+        "agent rename abandoned; state still kept under the old alias stays there, and an agent created under it adopts that state"
+    );
+    Ok(AbandonedRename { record, residue })
 }
 
 /// Refuse an `alias` that an unfinished rename retired. Surfaces that bring
@@ -607,11 +703,13 @@ pub async fn ensure_not_pending_target(
 
 /// The alias checks every entry point makes before it reads the journal or
 /// touches the filesystem. `to` names a new directory under
-/// `<install>/agents`, so it must satisfy the alias grammar. Neither alias may
-/// be the reserved one, and they must differ. Whether `from` must satisfy the
-/// grammar as well depends on the journal: see [`validate_source`].
+/// `<install>/agents`, so it must satisfy the alias grammar, and `from` must
+/// at least name a single directory there. Neither alias may be the reserved
+/// one, and they must differ. Whether `from` must satisfy the grammar as well
+/// depends on the journal: see [`validate_source`].
 fn validate_rename(from: &str, to: &str) -> Result<(), RenameRecoveryError> {
     require_alias_grammar(to)?;
+    require_single_component(from)?;
     for alias in [from, to] {
         if zeroclaw_config::alias_refs::is_reserved_agent_alias(alias) {
             return Err(RenameRecoveryError::ReservedAlias {
@@ -634,8 +732,9 @@ fn validate_rename(from: &str, to: &str) -> Result<(), RenameRecoveryError> {
 /// the grammar, and renaming such a legacy alias to a valid one is how an
 /// operator migrates it. Only a `from` that nothing names comes straight from
 /// the request into path derivation, so only that one must satisfy the
-/// grammar. The journal is read from its fixed path, which derives nothing
-/// from `from`.
+/// grammar; a legacy one still passed [`require_single_component`] in
+/// [`validate_rename`]. The journal is read from its fixed path, which
+/// derives nothing from `from`.
 fn validate_source(
     config: &Config,
     records: &[RecoveryRecord],
@@ -656,15 +755,65 @@ fn require_alias_grammar(alias: &str) -> Result<(), RenameRecoveryError> {
     })
 }
 
-/// Every journal record. A config without a data directory has no journal.
-fn load_records(
+/// Refuse an alias that would not name exactly one directory under
+/// `<install>/agents`. The alias grammar rules all of these out; a legacy
+/// alias exempt from the grammar is still held to this, since every follower
+/// path is derived from it.
+fn require_single_component(alias: &str) -> Result<(), RenameRecoveryError> {
+    let mut components = Path::new(alias).components();
+    let reason = if alias.is_empty() {
+        "alias must not be empty"
+    } else if alias.contains(['/', '\\', '\0']) {
+        "alias must not contain a path separator or NUL"
+    } else if alias == "." || alias == ".." {
+        "alias must not be `.` or `..`"
+    } else if !matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    ) {
+        "alias must name a single directory"
+    } else {
+        return Ok(());
+    };
+    Err(RenameRecoveryError::InvalidAlias {
+        alias: alias.to_string(),
+        reason: reason.to_string(),
+    })
+}
+
+/// Every journal record, read off the async workers. A config without a data
+/// directory has no journal.
+async fn load_records(
     config: &Config,
     journal: &AgentRecoveryJournal,
 ) -> Result<Vec<RecoveryRecord>, RenameRecoveryError> {
     if config.data_dir.as_os_str().is_empty() {
         return Ok(Vec::new());
     }
-    journal.load().map_err(journal_error)
+    let journal = journal.clone();
+    match tokio::task::spawn_blocking(move || journal.load()).await {
+        Ok(loaded) => loaded.map_err(journal_error),
+        Err(e) => Err(RenameRecoveryError::Unreadable {
+            store: JOURNAL_STORE.to_string(),
+            detail: e.to_string(),
+        }),
+    }
+}
+
+/// Run `op` on a blocking thread and wait for it. Journal writes are file
+/// I/O, and a lock wait sleeps its thread, so neither runs on an async
+/// worker.
+async fn off_async_worker<T, F>(op: F) -> Result<T, RenameRecoveryError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RenameRecoveryError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(op).await {
+        Ok(result) => result,
+        Err(e) => Err(RenameRecoveryError::Persist {
+            detail: e.to_string(),
+        }),
+    }
 }
 
 fn journal_error(error: JournalError) -> RenameRecoveryError {
@@ -698,11 +847,12 @@ enum RecordMatch<'r> {
     Refused(RenameRecoveryError),
 }
 
-/// Match `records` against renaming `from` to `to`, in precedence order: `to`
-/// retired by another rename; `from` still receiving another rename's state;
-/// `from` retired, by this rename (pending) or another; `to` still receiving
-/// another rename's state. Only effective records count: a prepared record
-/// whose commit never landed retires nothing.
+/// Match `records` against renaming `from` to `to`, in precedence order:
+/// `from` configured again while a rename of it is unfinished; `to` retired
+/// by another rename; `from` still receiving another rename's state; `from`
+/// retired, by this rename (pending) or another; `to` still receiving another
+/// rename's state. Only effective records count: a prepared record whose
+/// commit never landed retires nothing.
 fn match_records<'r>(
     records: &'r [RecoveryRecord],
     config: &Config,
@@ -710,6 +860,16 @@ fn match_records<'r>(
     to: &str,
 ) -> RecordMatch<'r> {
     let effective = || records.iter().filter(|r| r.is_effective(config));
+    // Resuming would move the rename's remaining state out from under an
+    // agent that is live under `from` again.
+    if config.agent(from).is_some()
+        && let Some(record) = effective().find(|r| r.from == from)
+    {
+        return RecordMatch::Refused(RenameRecoveryError::SourceReconfigured {
+            from: from.to_string(),
+            to: record.to.clone(),
+        });
+    }
     if let Some(record) = effective().find(|r| r.from == to) {
         return RecordMatch::Refused(RenameRecoveryError::AliasRetired {
             alias: to.to_string(),
@@ -740,54 +900,60 @@ fn match_records<'r>(
     RecordMatch::Clear
 }
 
-/// Take the journal's writer lock off the async runtime: the wait sleeps the
-/// thread between attempts.
-async fn lock_journal(
-    journal: &AgentRecoveryJournal,
-    wait: Duration,
-) -> Result<JournalGuard, RenameRecoveryError> {
-    let journal = journal.clone();
-    match tokio::task::spawn_blocking(move || journal.lock(wait)).await {
-        Ok(locked) => locked.map_err(journal_error),
-        Err(e) => Err(RenameRecoveryError::Persist {
-            detail: e.to_string(),
-        }),
-    }
-}
-
-/// Under the lock: drop void records, re-check `from` and that no effective
-/// record forbids the rename against the journal as it now stands (another
-/// process may have changed it since it was last read), and record the
-/// rename as prepared.
-fn prepare_record(
-    journal: &AgentRecoveryJournal,
-    guard: &JournalGuard,
+/// Take the journal lock and, holding it, drop void records, re-check `from`
+/// and that no effective record forbids the rename against the journal as it
+/// now stands (another process may have changed it since it was last read),
+/// and record the rename as prepared. The lock stays held only once the
+/// rename is armed.
+async fn prepare_record(
+    journal: AgentRecoveryJournal,
     config: &Config,
     from: &str,
     to: &str,
-) -> Result<RecoveryRecord, RenameRecoveryError> {
-    // Holding the lock, no other operation sits between its prepare and its
-    // commit, so every prepared record whose commit did not land is void.
-    journal.collect_void(guard, config).map_err(journal_error)?;
-    let records = journal.load().map_err(journal_error)?;
-    validate_source(config, &records, from)?;
-    match match_records(&records, config, from, to) {
-        RecordMatch::Clear => {}
-        RecordMatch::Pending(record) => {
-            return Err(RenameRecoveryError::RecoveryPending {
-                from: record.from.clone(),
-                to: record.to.clone(),
-            });
+) -> Result<Armed, RenameRecoveryError> {
+    let config = Box::new(config.clone());
+    let (from, to) = (from.to_string(), to.to_string());
+    off_async_worker(move || {
+        let guard = journal.lock(ARM_LOCK_WAIT).map_err(journal_error)?;
+        // Holding the lock, no other operation sits between its prepare and
+        // its commit, so every prepared record whose commit did not land is
+        // void.
+        journal
+            .collect_void(&guard, &config)
+            .map_err(journal_error)?;
+        let records = journal.load().map_err(journal_error)?;
+        validate_source(&config, &records, &from)?;
+        match match_records(&records, &config, &from, &to) {
+            RecordMatch::Clear => {}
+            RecordMatch::Pending(record) => {
+                return Err(RenameRecoveryError::RecoveryPending {
+                    from: record.from.clone(),
+                    to: record.to.clone(),
+                });
+            }
+            RecordMatch::Refused(error) => return Err(error),
         }
-        RecordMatch::Refused(error) => return Err(error),
-    }
-    let current = config.agent_workspace_dir(from);
-    let source_workspace = (current == config.default_agent_workspace_dir(from)).then_some(current);
-    let record = new_record(from, to, RecoveryPhase::Prepared, source_workspace);
-    journal
-        .upsert(guard, record.clone())
-        .map_err(journal_error)?;
-    Ok(record)
+        let source_workspace = armed_source_workspace(&config, &from);
+        let record = new_record(&from, &to, RecoveryPhase::Prepared, source_workspace);
+        journal
+            .upsert(&guard, record.clone())
+            .map_err(journal_error)?;
+        Ok(Armed { record, guard })
+    })
+    .await
+}
+
+/// The workspace a rename armed from `config` moves: `from`'s default
+/// location, but only when `from` sets no `workspace.path` and so follows its
+/// alias. An explicit path stays where the operator put it, even one naming
+/// the default location.
+fn armed_source_workspace(config: &Config, from: &str) -> Option<PathBuf> {
+    let explicit = config
+        .agent(from)
+        .and_then(|agent| agent.workspace.path.as_ref())
+        .is_some();
+    let default = config.default_agent_workspace_dir(from);
+    (!explicit && config.agent_workspace_dir(from) == default).then_some(default)
 }
 
 fn new_record(
@@ -861,52 +1027,95 @@ async fn record_discovered(
     from: &str,
     to: &str,
 ) -> Result<Disposition, RenameRecoveryError> {
-    let guard = lock_journal(journal, ARM_LOCK_WAIT).await?;
-    let records = journal.load().map_err(journal_error)?;
-    validate_source(config, &records, from)?;
-    match match_records(&records, config, from, to) {
-        RecordMatch::Pending(_) => return Ok(Disposition::Resume),
-        RecordMatch::Refused(error) => return Err(error),
-        RecordMatch::Clear => {}
-    }
     // Only a `to` at the alias-derived location takes the old workspace.
     let default_to = config.default_agent_workspace_dir(to);
-    let source_workspace = (config.agent_workspace_dir(to) == default_to)
-        .then(|| config.default_agent_workspace_dir(from));
-    journal
-        .upsert(
-            &guard,
-            new_record(from, to, RecoveryPhase::Committed, source_workspace),
-        )
-        .map_err(journal_error)?;
-    Ok(Disposition::Resume)
+    let source_workspace = (lexically_normalized(&config.agent_workspace_dir(to))
+        == lexically_normalized(&default_to))
+    .then(|| config.default_agent_workspace_dir(from));
+    let journal = journal.clone();
+    let config = Box::new(config.clone());
+    let (from, to) = (from.to_string(), to.to_string());
+    off_async_worker(move || {
+        let guard = journal.lock(ARM_LOCK_WAIT).map_err(journal_error)?;
+        let records = journal.load().map_err(journal_error)?;
+        validate_source(&config, &records, &from)?;
+        match match_records(&records, &config, &from, &to) {
+            RecordMatch::Pending(_) => return Ok(Disposition::Resume),
+            RecordMatch::Refused(error) => return Err(error),
+            RecordMatch::Clear => {}
+        }
+        journal
+            .upsert(
+                &guard,
+                new_record(&from, &to, RecoveryPhase::Committed, source_workspace),
+            )
+            .map_err(journal_error)?;
+        Ok(Disposition::Resume)
+    })
+    .await
 }
 
-/// Drop the record of the converged rename. Another process may have
-/// replaced or cleared it since this converge read the journal, so it is
-/// removed only while it still names this rename.
-async fn clear_record(
+/// Mark the prepared record of this rename committed, holding the journal
+/// lock. Another process may have committed, replaced, or cleared it since
+/// it was read, so only a record that still names this rename and is still
+/// prepared is written. Returns the record as the journal now holds it, or as
+/// it was read when the journal no longer names this rename.
+async fn promote_record(
+    journal: &AgentRecoveryJournal,
+    record: RecoveryRecord,
+) -> Result<RecoveryRecord, RenameRecoveryError> {
+    let journal = journal.clone();
+    off_async_worker(move || {
+        let guard = journal.lock(RECORD_LOCK_WAIT).map_err(journal_error)?;
+        let current = journal
+            .load()
+            .map_err(journal_error)?
+            .into_iter()
+            .find(|r| is_rename_record(r, &record.from, &record.to));
+        let Some(current) = current else {
+            return Ok(record);
+        };
+        if current.phase == RecoveryPhase::Committed {
+            return Ok(current);
+        }
+        let committed = RecoveryRecord {
+            phase: RecoveryPhase::Committed,
+            ..current
+        };
+        journal
+            .upsert(&guard, committed.clone())
+            .map_err(journal_error)?;
+        Ok(committed)
+    })
+    .await
+}
+
+/// Drop the record of this rename, holding the journal lock, and return it.
+/// Another process may have replaced or cleared it since it was read, so it
+/// is removed only while it still names this rename; `None` when it no
+/// longer does.
+async fn remove_record(
     journal: &AgentRecoveryJournal,
     from: &str,
     to: &str,
-) -> Result<(), RenameRecoveryError> {
+) -> Result<Option<RecoveryRecord>, RenameRecoveryError> {
     let journal = journal.clone();
     let (from, to) = (from.to_string(), to.to_string());
-    let cleared = tokio::task::spawn_blocking(move || -> Result<(), JournalError> {
-        let guard = journal.lock(CLEAR_LOCK_WAIT)?;
-        let records = journal.load()?;
-        if records.iter().any(|r| is_rename_record(r, &from, &to)) {
-            journal.remove(&guard, RecoveryOperation::Rename, &from)?;
+    off_async_worker(move || {
+        let guard = journal.lock(RECORD_LOCK_WAIT).map_err(journal_error)?;
+        let current = journal
+            .load()
+            .map_err(journal_error)?
+            .into_iter()
+            .find(|r| is_rename_record(r, &from, &to));
+        if current.is_some() {
+            journal
+                .remove(&guard, RecoveryOperation::Rename, &from)
+                .map_err(journal_error)?;
         }
-        Ok(())
+        Ok(current)
     })
-    .await;
-    match cleared {
-        Ok(cleared) => cleared.map_err(journal_error),
-        Err(e) => Err(RenameRecoveryError::Persist {
-            detail: e.to_string(),
-        }),
-    }
+    .await
 }
 
 /// A follower's store as resolved for one rename.
@@ -926,13 +1135,93 @@ struct WorkspaceMove {
     /// Every spelling of `source` an ACP row may have recorded as its working
     /// directory: as configured, and with symlinks resolved.
     spellings: Vec<String>,
+    /// The two aliases differ only in letter case, so on a case-insensitive
+    /// filesystem `source` and `destination` are one directory.
+    case_only: bool,
+}
+
+/// What the workspace follower does for one rename. It always watches the
+/// old alias's default workspace, where an agent re-created under the old
+/// alias would find its workspace: the record never clears while anything is
+/// there, whatever the new alias's workspace configuration.
+enum WorkspaceFollower {
+    /// The workspace moves from the old alias's default location to the new
+    /// alias's.
+    Move(WorkspaceMove),
+    /// Nothing moves: the new alias keeps a custom path, or the record kept
+    /// no workspace because the old alias had one. An empty directory left
+    /// at the old default location is removed; anything else there is the
+    /// operator's to move.
+    Leftover(PathBuf),
+    /// The new alias's custom workspace is the old default location itself.
+    TargetUsesOld,
+    /// The recorded workspace is not the old default location under this
+    /// config: the install moved, or the journal was edited.
+    RecordMismatch(PathBuf),
+    /// Whether the new alias's custom workspace is the old default location
+    /// could not be established. Carries why.
+    Uninspectable(String),
+}
+
+impl WorkspaceFollower {
+    /// 1 while the old default location holds anything, or the new alias's
+    /// configuration still points at it, and 0 once neither is so. An error
+    /// carries why that could not be established.
+    async fn residue(&self) -> Result<usize, String> {
+        match self {
+            Self::Move(workspace) => match inspect_lifecycle_path(&workspace.source).await {
+                PathPresence::Absent => Ok(0),
+                PathPresence::Uninspectable(reason) => Err(reason),
+                // A case-insensitive filesystem gives aliases that differ only
+                // in case one directory, which is then already where it
+                // belongs. Any other way of sharing it, a symlink say, is
+                // still residue: the old alias would share it once re-created.
+                PathPresence::Present if workspace.case_only => {
+                    match same_place(&workspace.source, &workspace.destination).await {
+                        Ok(same) => Ok(usize::from(!same)),
+                        Err(e) => Err(format!(
+                            "cannot inspect {}: {e}",
+                            workspace.destination.display()
+                        )),
+                    }
+                }
+                PathPresence::Present => Ok(1),
+            },
+            Self::Leftover(old) => match inspect_lifecycle_path(old).await {
+                PathPresence::Present => Ok(1),
+                PathPresence::Absent => Ok(0),
+                PathPresence::Uninspectable(reason) => Err(reason),
+            },
+            Self::TargetUsesOld | Self::RecordMismatch(_) => Ok(1),
+            Self::Uninspectable(reason) => Err(reason.clone()),
+        }
+    }
+
+    /// The warning line for a workspace follower that still holds residue
+    /// when nothing more specific is known.
+    fn residue_detail(&self, from: &str, to: &str) -> String {
+        match self {
+            Self::Move(WorkspaceMove { source: old, .. }) | Self::Leftover(old) => format!(
+                "the old default workspace of `{from}` still exists at {}",
+                old.display()
+            ),
+            Self::TargetUsesOld => format!(
+                "agent `{to}` uses the old default workspace of `{from}` as its workspace.path"
+            ),
+            Self::RecordMismatch(recorded) => format!(
+                "the recorded workspace {} is not the default workspace of `{from}` under this config",
+                recorded.display()
+            ),
+            Self::Uninspectable(reason) => reason.clone(),
+        }
+    }
 }
 
 /// Where each follower's state lives for one rename, resolved once from the
 /// live config, what exists on disk, and the genuine handles the surface
 /// holds. Resolving opens only stores that already exist.
 struct FollowerPlan {
-    workspace: Option<WorkspaceMove>,
+    workspace: WorkspaceFollower,
     memory: Slot<Arc<dyn Memory>>,
     acp: Slot<Arc<AcpSessionStore>>,
     sessions: Slot<Arc<dyn SessionBackend>>,
@@ -947,7 +1236,7 @@ impl FollowerPlan {
         stores: &SurfaceStores<'_>,
     ) -> Self {
         Self {
-            workspace: workspace_move(config, from, to, record).await,
+            workspace: workspace_follower(config, from, to, record).await,
             memory: memory_slot(config, stores).await,
             acp: match stores.acp {
                 Some(store) => Slot::Open(Arc::clone(store)),
@@ -980,14 +1269,7 @@ impl FollowerPlan {
     ) -> Result<usize, FollowerIssue> {
         let unreadable = |detail: String| FollowerIssue::unreadable(follower, detail);
         match follower {
-            FollowerKind::Workspace => match &self.workspace {
-                None => Ok(0),
-                Some(workspace) => match inspect_lifecycle_path(&workspace.source).await {
-                    PathPresence::Present => Ok(1),
-                    PathPresence::Absent => Ok(0),
-                    PathPresence::Uninspectable(reason) => Err(unreadable(reason)),
-                },
-            },
+            FollowerKind::Workspace => self.workspace.residue().await.map_err(unreadable),
             FollowerKind::Memory => match &self.memory {
                 Slot::OutOfScope => Ok(0),
                 Slot::Unreadable(reason) => Err(unreadable(reason.clone())),
@@ -1030,9 +1312,10 @@ impl FollowerPlan {
     }
 
     fn workspace_spellings(&self) -> &[String] {
-        self.workspace
-            .as_ref()
-            .map_or(&[], |workspace| workspace.spellings.as_slice())
+        match &self.workspace {
+            WorkspaceFollower::Move(workspace) => &workspace.spellings,
+            _ => &[],
+        }
     }
 
     /// Probe every follower in order and move the ones holding state under
@@ -1076,19 +1359,31 @@ impl FollowerPlan {
         report: &mut ConvergeReport,
     ) -> Option<FollowerIssue> {
         match follower {
-            FollowerKind::Workspace => {
-                let workspace = self.workspace.as_ref()?;
-                let moved = move_workspace(workspace).await;
-                if moved.is_ok() {
-                    report.workspace_moved = true;
-                    // Best effort: `<install>/agents/<from>` is empty now
-                    // unless something else was kept beside the workspace.
-                    if let Some(alias_dir) = config.default_agent_workspace_dir(from).parent() {
-                        let _ = tokio::fs::remove_dir(alias_dir).await;
+            FollowerKind::Workspace => match &self.workspace {
+                WorkspaceFollower::Move(workspace) => {
+                    let moved = move_workspace(workspace).await;
+                    if moved.is_ok() {
+                        report.workspace_moved = true;
+                        remove_alias_dir(&workspace.source).await;
                     }
+                    moved.err()
                 }
-                moved.err()
-            }
+                WorkspaceFollower::Leftover(old) => remove_leftover(old, from).await.err(),
+                WorkspaceFollower::TargetUsesOld => Some(FollowerIssue::conflict(
+                    follower,
+                    format!(
+                        "agent `{to}` uses the old default workspace of `{from}` as its workspace.path; point workspace.path elsewhere, then re-run the rename"
+                    ),
+                )),
+                WorkspaceFollower::RecordMismatch(_) => Some(FollowerIssue::conflict(
+                    follower,
+                    self.workspace.residue_detail(from, to),
+                )),
+                // Its probe reports it unreadable, so it is never acted on.
+                WorkspaceFollower::Uninspectable(reason) => {
+                    Some(FollowerIssue::unreadable(follower, reason.clone()))
+                }
+            },
             FollowerKind::Memory => {
                 let Slot::Open(memory) = &self.memory else {
                     return None;
@@ -1098,10 +1393,7 @@ impl FollowerPlan {
                         report.memory_rows = rows;
                         None
                     }
-                    Err(e) => Some(FollowerIssue::lagging(
-                        follower,
-                        format!("memory rename: {e:#}"),
-                    )),
+                    Err(e) => Some(memory_rename_failed(memory.as_ref(), to, &e).await),
                 }
             }
             FollowerKind::Cron => match crate::cron::rename_jobs_by_agent(config, from, to) {
@@ -1123,7 +1415,9 @@ impl FollowerPlan {
                     Ok(rows) => report.acp_sessions = rows,
                     Err(e) => failure = Some(format!("acp rename: {e:#}")),
                 }
-                if let (Some(workspace), true) = (&self.workspace, workspace_settled) {
+                if let (WorkspaceFollower::Move(workspace), true) =
+                    (&self.workspace, workspace_settled)
+                {
                     let destination = workspace.destination.to_string_lossy();
                     for spelling in &workspace.spellings {
                         match store.relocate_session_workspaces(spelling, &destination) {
@@ -1162,6 +1456,7 @@ impl FollowerPlan {
         &self,
         config: &Config,
         from: &str,
+        to: &str,
         attempted: Vec<(FollowerKind, Option<FollowerIssue>)>,
     ) -> Vec<FollowerIssue> {
         let mut outstanding = Vec::new();
@@ -1169,48 +1464,125 @@ impl FollowerPlan {
             match self.probe(follower, config, from).await {
                 Ok(0) => {}
                 Ok(_) => outstanding.push(issue.unwrap_or_else(|| {
-                    FollowerIssue::lagging(
-                        follower,
-                        format!("{follower} still attributes state to `{from}`"),
-                    )
+                    FollowerIssue::lagging(follower, self.residue_detail(follower, from, to))
                 })),
                 Err(unreadable) => outstanding.push(unreadable),
             }
         }
         outstanding
     }
+
+    /// Probe every follower without acting and list what is still kept under
+    /// `from`, and every store that could not be read.
+    async fn residue(&self, config: &Config, from: &str, to: &str) -> Vec<FollowerIssue> {
+        let mut residue = Vec::new();
+        for follower in FollowerKind::ALL {
+            match self.probe(follower, config, from).await {
+                Ok(0) => {}
+                Ok(_) => residue.push(FollowerIssue::lagging(
+                    follower,
+                    self.residue_detail(follower, from, to),
+                )),
+                Err(unreadable) => residue.push(unreadable),
+            }
+        }
+        residue
+    }
+
+    /// The warning line for `follower` still holding state under `from`.
+    fn residue_detail(&self, follower: FollowerKind, from: &str, to: &str) -> String {
+        match follower {
+            FollowerKind::Workspace => self.workspace.residue_detail(from, to),
+            _ => format!("{follower} still attributes state to `{from}`"),
+        }
+    }
 }
 
-/// The workspace move of this rename, or `None` when the workspace does not
-/// follow the alias: `to` keeps a custom path, or `from`'s recorded workspace
-/// was custom. The source is the recorded one when a record covers the
-/// rename, and otherwise `from`'s alias-derived location.
-async fn workspace_move(
+/// Decide what the workspace follower does for renaming `from` to `to`,
+/// covered by `record` when one exists.
+///
+/// A `to` at its own default location takes the old default workspace, as
+/// long as the record kept that location for the move. A record that kept
+/// none (the old alias had a `workspace.path`) moves nothing, and neither
+/// does one naming another path. A `to` with a custom path takes nothing,
+/// and that path must not be the old default location itself. Whether or not
+/// anything moves, the old default location has to be empty or gone before
+/// the record clears.
+async fn workspace_follower(
     config: &Config,
     from: &str,
     to: &str,
     record: Option<&RecoveryRecord>,
-) -> Option<WorkspaceMove> {
+) -> WorkspaceFollower {
+    let old = config.default_agent_workspace_dir(from);
     let destination = config.default_agent_workspace_dir(to);
-    if config.agent_workspace_dir(to) != destination {
-        return None;
+    let current = config.agent_workspace_dir(to);
+    if lexically_normalized(&current) != lexically_normalized(&destination) {
+        return match same_place(&current, &old).await {
+            Ok(true) => WorkspaceFollower::TargetUsesOld,
+            Ok(false) => WorkspaceFollower::Leftover(old),
+            Err(e) => WorkspaceFollower::Uninspectable(format!(
+                "cannot tell whether {} is {}: {e}",
+                current.display(),
+                old.display()
+            )),
+        };
     }
-    let source = match record {
-        Some(record) => record.source_workspace.clone()?,
-        None => config.default_agent_workspace_dir(from),
-    };
-    let mut spellings = vec![source.to_string_lossy().into_owned()];
-    if let Some(canonical) = canonical_spelling(&source).await {
-        let canonical = canonical.to_string_lossy().into_owned();
-        if !spellings.contains(&canonical) {
-            spellings.push(canonical);
+    match record.map(|record| record.source_workspace.as_ref()) {
+        Some(None) => WorkspaceFollower::Leftover(old),
+        Some(Some(recorded)) if lexically_normalized(recorded) != lexically_normalized(&old) => {
+            WorkspaceFollower::RecordMismatch(recorded.clone())
+        }
+        _ => {
+            let mut spellings = vec![old.to_string_lossy().into_owned()];
+            if let Some(canonical) = canonical_spelling(&old).await {
+                let canonical = canonical.to_string_lossy().into_owned();
+                if !spellings.contains(&canonical) {
+                    spellings.push(canonical);
+                }
+            }
+            WorkspaceFollower::Move(WorkspaceMove {
+                source: old,
+                destination,
+                spellings,
+                case_only: from.to_lowercase() == to.to_lowercase(),
+            })
         }
     }
-    Some(WorkspaceMove {
-        source,
-        destination,
-        spellings,
-    })
+}
+
+/// `path` with `.` components dropped and each `..` folded into the
+/// component before it, without consulting the filesystem.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                // Nothing lies above the root.
+                Some(Component::RootDir) => {}
+                _ => normalized.push(component),
+            },
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+/// Whether `a` and `b` name the same place: the same path once `.` and `..`
+/// are folded, or one existing file or directory reached both ways.
+async fn same_place(a: &Path, b: &Path) -> std::io::Result<bool> {
+    if lexically_normalized(a) == lexically_normalized(b) {
+        return Ok(true);
+    }
+    let (a, b) = (a.to_path_buf(), b.to_path_buf());
+    match tokio::task::spawn_blocking(move || same_existing_file(&a, &b)).await {
+        Ok(same) => same,
+        Err(e) => Err(std::io::Error::other(e)),
+    }
 }
 
 /// `path` with the symlinks in its existing part resolved. A path that no
@@ -1300,6 +1672,72 @@ async fn is_empty_directory(path: &Path) -> std::io::Result<bool> {
         .is_none())
 }
 
+/// Best effort: remove `<install>/agents/<from>` once the old default
+/// workspace below it is gone. It stays when anything else was kept beside
+/// the workspace.
+async fn remove_alias_dir(old_workspace: &Path) {
+    if let Some(alias_dir) = old_workspace.parent() {
+        let _ = tokio::fs::remove_dir(alias_dir).await;
+    }
+}
+
+/// Remove the old default workspace of `from`, which this rename does not
+/// move, when it is an empty directory. Anything else there is not this
+/// rename's to take, and an agent re-created under `from` would adopt it, so
+/// it is left for the operator to move.
+async fn remove_leftover(old: &Path, from: &str) -> Result<(), FollowerIssue> {
+    let follower = FollowerKind::Workspace;
+    match is_empty_directory(old).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(FollowerIssue::conflict(
+                follower,
+                format!(
+                    "the old default workspace of `{from}` still exists at {}; move its contents by hand, then re-run the rename",
+                    old.display()
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(FollowerIssue::unreadable(
+                follower,
+                format!("cannot inspect {}: {e}", old.display()),
+            ));
+        }
+    }
+    tokio::fs::remove_dir(old).await.map_err(|e| {
+        FollowerIssue::lagging(
+            follower,
+            format!(
+                "cannot remove the empty old default workspace {}: {e}",
+                old.display()
+            ),
+        )
+    })?;
+    remove_alias_dir(old).await;
+    Ok(())
+}
+
+/// Why renaming memory from the old alias to `to` failed. The backends that
+/// key memory by an agent identity refuse to merge into an alias that already
+/// owns memory, which only an operator can settle; that is told apart by
+/// reading whether `to` owns memory, not by the error text. Anything else
+/// lags, and re-running the rename retries it.
+async fn memory_rename_failed(
+    memory: &dyn Memory,
+    to: &str,
+    error: &anyhow::Error,
+) -> FollowerIssue {
+    let follower = FollowerKind::Memory;
+    match memory.export_agent(to).await {
+        Ok(owned) if !owned.is_empty() => FollowerIssue::conflict(
+            follower,
+            format!("memory for `{to}` already exists; merge it by hand or abandon the rename"),
+        ),
+        _ => FollowerIssue::lagging(follower, format!("memory rename: {error:#}")),
+    }
+}
+
 /// The memory store holding `from`'s attribution. A surface handle is used
 /// unless it is the `NoneMemory` placeholder a surface falls back to when its
 /// configured backend could not be built (or it booted without agents): that
@@ -1371,7 +1809,9 @@ fn log_resumed(from: &str, to: &str, discovered: bool) {
 /// input errors are the caller's to report.
 fn log_refusal(from: &str, to: &str, error: &RenameRecoveryError) {
     let (error_key, message) = match error {
-        RenameRecoveryError::AliasRetired { .. } | RenameRecoveryError::RecoveryPending { .. } => (
+        RenameRecoveryError::AliasRetired { .. }
+        | RenameRecoveryError::RecoveryPending { .. }
+        | RenameRecoveryError::SourceReconfigured { .. } => (
             KEY_REFUSED,
             "agent lifecycle operation refused by an unfinished agent rename",
         ),
@@ -2214,13 +2654,12 @@ mod tests {
         std::fs::create_dir_all(&custom).unwrap();
         std::fs::write(custom.join("MEMORY.md"), "custom").unwrap();
         before.agents.get_mut(FROM).unwrap().workspace.path = Some(custom.clone());
-        // A directory at the old alias-derived location is not this agent's
-        // workspace.
-        let leftover = seed_workspace(&before, FROM);
         let after = committed(&before);
         assert_eq!(after.agent_workspace_dir(TO), custom);
         let stores = SurfaceStores::none();
 
+        // Nothing is at the old default location, so a rename committed
+        // without a record left nothing behind.
         let err = resolve(&after, FROM, TO, &stores).await.unwrap_err();
         assert!(
             matches!(err, RenameRecoveryError::NotConfigured { .. }),
@@ -2228,19 +2667,485 @@ mod tests {
         );
         assert!(!after.data_dir.exists());
 
-        // A recorded rename of the same agent converges without moving either.
+        // A directory at the old default location is not this agent's
+        // workspace, but an agent re-created under the old alias would adopt
+        // it, so a recorded rename does not finish while it holds anything.
+        let leftover = seed_workspace(&before, FROM);
         let armed = arm(&before, FROM, TO).await.unwrap();
         acknowledge_commit(&after, armed).await;
         assert_eq!(records(&after)[0].source_workspace, None);
         let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        let issues = outstanding(&outcome);
+        assert_eq!(issues.len(), 1, "{:?}", outcome.warnings());
+        assert_eq!(issues[0].kind, FollowerIssueKind::Conflict);
+        assert_eq!(
+            issues[0].to_string(),
+            format!(
+                "the old default workspace of `{FROM}` still exists at {}; move its contents by hand, then re-run the rename",
+                leftover.display()
+            )
+        );
+        assert!(!outcome.report().workspace_moved);
+        assert!(leftover.join("MEMORY.md").is_file(), "nothing is deleted");
+        assert!(retired_alias(&after, FROM).unwrap().is_some());
+
+        // Emptied by hand, it is removed and the rename finishes; neither
+        // workspace ever moved.
+        std::fs::remove_file(leftover.join("MEMORY.md")).unwrap();
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
         assert!(outcome.is_converged(), "{:?}", outcome.warnings());
         assert!(!outcome.report().workspace_moved);
+        assert!(!leftover.parent().unwrap().exists());
         assert_eq!(
             std::fs::read_to_string(custom.join("MEMORY.md")).unwrap(),
             "custom"
         );
-        assert!(leftover.exists());
         assert!(!after.default_agent_workspace_dir(TO).exists());
+        assert!(records(&after).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_old_alias_pinned_to_its_default_workspace_never_shares_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut before = fixture(&tmp, &[FROM]);
+        let old = seed_workspace(&before, FROM);
+        // `from` names its own default location as an explicit path, which
+        // the rename hands to `to` unchanged.
+        before.agents.get_mut(FROM).unwrap().workspace.path = Some(old.clone());
+        let mut after = arm_and_commit(&before).await;
+        assert_eq!(
+            records(&after)[0].source_workspace,
+            None,
+            "an explicit path is recorded as custom"
+        );
+        assert_eq!(after.agent_workspace_dir(TO), old);
+        let stores = SurfaceStores::none();
+
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        let issues = outstanding(&outcome);
+        assert_eq!(issues.len(), 1, "{:?}", outcome.warnings());
+        assert_eq!(issues[0].kind, FollowerIssueKind::Conflict);
+        assert_eq!(
+            issues[0].to_string(),
+            format!(
+                "agent `{TO}` uses the old default workspace of `{FROM}` as its workspace.path; point workspace.path elsewhere, then re-run the rename"
+            )
+        );
+        assert!(old.join("MEMORY.md").is_file(), "nothing moved or deleted");
+        assert!(retired_alias(&after, FROM).unwrap().is_some());
+        // The same path spelled another way is the same directory.
+        after.agents.get_mut(TO).unwrap().workspace.path = Some(old.join("..").join("workspace"));
+        let spelled = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert_eq!(outstanding(&spelled)[0].kind, FollowerIssueKind::Conflict);
+
+        // Pointed elsewhere, the old directory still holds files.
+        let elsewhere = tmp.path().join("elsewhere");
+        after.agents.get_mut(TO).unwrap().workspace.path = Some(elsewhere.clone());
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        let issues = outstanding(&outcome);
+        assert_eq!(issues.len(), 1, "{:?}", outcome.warnings());
+        assert_eq!(
+            issues[0].to_string(),
+            format!(
+                "the old default workspace of `{FROM}` still exists at {}; move its contents by hand, then re-run the rename",
+                old.display()
+            )
+        );
+
+        // Once its files are moved by hand the empty directory is removed.
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::rename(old.join("MEMORY.md"), elsewhere.join("MEMORY.md")).unwrap();
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+        assert!(!outcome.report().workspace_moved);
+        assert!(!old.parent().unwrap().exists());
+        assert!(elsewhere.join("MEMORY.md").is_file());
+        assert!(records(&after).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_custom_path_set_after_a_conflict_does_not_strand_the_old_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let old = seed_workspace(&before, FROM);
+        let mut after = arm_and_commit(&before).await;
+        let destination = after.default_agent_workspace_dir(TO);
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("keep.md"), "theirs").unwrap();
+        let stores = SurfaceStores::none();
+        let first = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert_eq!(outstanding(&first)[0].kind, FollowerIssueKind::Conflict);
+
+        // Rather than clearing the destination, the operator gives the new
+        // alias a custom workspace and re-runs the rename.
+        let custom = tmp.path().join("custom");
+        after.agents.get_mut(TO).unwrap().workspace.path = Some(custom.clone());
+        let second = converge(&after, FROM, TO, &stores).await.unwrap();
+        let issues = outstanding(&second);
+        assert_eq!(issues.len(), 1, "{:?}", second.warnings());
+        assert_eq!(issues[0].kind, FollowerIssueKind::Conflict);
+        assert_eq!(
+            issues[0].to_string(),
+            format!(
+                "the old default workspace of `{FROM}` still exists at {}; move its contents by hand, then re-run the rename",
+                old.display()
+            )
+        );
+        assert!(old.join("MEMORY.md").is_file());
+        let mut recreated = after.clone();
+        assert!(
+            matches!(
+                alias_refs::create_map_key_checked(&mut recreated, "agents", FROM),
+                Err(alias_refs::CreateError::Retired { .. })
+            ),
+            "the old alias stays retired while its old workspace is there"
+        );
+
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::rename(old.join("MEMORY.md"), custom.join("MEMORY.md")).unwrap();
+        let third = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert!(third.is_converged(), "{:?}", third.warnings());
+        assert!(!old.exists());
+        assert_eq!(
+            std::fs::read_to_string(destination.join("keep.md")).unwrap(),
+            "theirs"
+        );
+        assert!(records(&after).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recorded_workspace_outside_this_install_is_never_moved() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let old = seed_workspace(&before, FROM);
+        let after = arm_and_commit(&before).await;
+        // The journal names a workspace that is not the old alias's default
+        // location under this config, as after the install moved.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("MEMORY.md"), "elsewhere").unwrap();
+        let journal = AgentRecoveryJournal::for_config(&after);
+        let mut record = records(&after).remove(0);
+        record.source_workspace = Some(elsewhere.clone());
+        let guard = journal.lock(Duration::ZERO).unwrap();
+        journal.upsert(&guard, record).unwrap();
+        drop(guard);
+
+        let outcome = converge(&after, FROM, TO, &SurfaceStores::none())
+            .await
+            .unwrap();
+        let issues = outstanding(&outcome);
+        assert_eq!(issues.len(), 1, "{:?}", outcome.warnings());
+        assert_eq!(issues[0].kind, FollowerIssueKind::Conflict);
+        assert_eq!(
+            issues[0].to_string(),
+            format!(
+                "the recorded workspace {} is not the default workspace of `{FROM}` under this config",
+                elsewhere.display()
+            )
+        );
+        assert!(!outcome.report().workspace_moved);
+        assert!(elsewhere.join("MEMORY.md").is_file());
+        assert!(old.join("MEMORY.md").is_file());
+        assert!(!after.default_agent_workspace_dir(TO).exists());
+        assert_eq!(records(&after).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_case_only_rename_converges_on_either_kind_of_filesystem() {
+        const UPPER: &str = "Scout";
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[UPPER]);
+        let source = seed_workspace(&before, UPPER);
+        seed_acp(&before, "acp-case", UPPER, &source);
+        let destination = before.default_agent_workspace_dir(FROM);
+        // Whether the host folds case decides what converging means.
+        let one_directory = same_existing_file(&source, &destination).unwrap();
+
+        let armed = arm(&before, UPPER, FROM).await.unwrap();
+        let after = renamed(&before, UPPER, FROM);
+        acknowledge_commit(&after, armed).await;
+        let outcome = converge(&after, UPPER, FROM, &SurfaceStores::none())
+            .await
+            .unwrap();
+        assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+        assert_eq!(
+            std::fs::read_to_string(destination.join("MEMORY.md")).unwrap(),
+            UPPER
+        );
+        if one_directory {
+            assert!(
+                !outcome.report().workspace_moved,
+                "one directory under both names is already in place"
+            );
+            assert!(source.join("MEMORY.md").is_file());
+        } else {
+            assert!(outcome.report().workspace_moved);
+            assert!(!source.parent().unwrap().exists());
+        }
+        assert_eq!(acp_row(&after, "acp-case"), (FROM.to_string(), destination));
+        assert!(records(&after).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_workspace_shared_through_a_symlink_is_not_converged() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let old = seed_workspace(&before, FROM);
+        let after = arm_and_commit(&before).await;
+        // The new alias's directory is a link to the old one, so both default
+        // workspaces are one directory without being a case-only rename.
+        std::os::unix::fs::symlink(
+            old.parent().unwrap(),
+            after.default_agent_workspace_dir(TO).parent().unwrap(),
+        )
+        .unwrap();
+        assert!(same_existing_file(&old, &after.default_agent_workspace_dir(TO)).unwrap());
+
+        let outcome = converge(&after, FROM, TO, &SurfaceStores::none())
+            .await
+            .unwrap();
+        assert_eq!(
+            lagging_followers(&outcome),
+            vec![FollowerKind::Workspace],
+            "an agent re-created under the old alias would share it"
+        );
+        assert!(old.join("MEMORY.md").is_file());
+        assert_eq!(records(&after).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rename_whose_old_alias_is_configured_again_moves_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let source = seed_workspace(&before, FROM);
+        seed_memory(&before, FROM, 2).await;
+        let after = arm_and_commit(&before).await;
+        // A hand edit brings the old alias back around the create guards.
+        let mut readded = after.clone();
+        readded.agents.insert(FROM.to_string(), agent());
+        let stores = SurfaceStores::none();
+
+        let refusals = [
+            resolve(&readded, FROM, TO, &stores).await.unwrap_err(),
+            arm(&readded, FROM, TO).await.unwrap_err(),
+            converge(&readded, FROM, TO, &stores).await.unwrap_err(),
+            resolve(&readded, FROM, "wolf", &stores).await.unwrap_err(),
+            converge(&readded, FROM, "wolf", &stores).await.unwrap_err(),
+        ];
+        for refusal in &refusals {
+            assert!(
+                matches!(refusal, RenameRecoveryError::SourceReconfigured { from, to } if from == FROM && to == TO),
+                "{refusal:?}"
+            );
+        }
+        assert_eq!(
+            refusals[0].to_string(),
+            "agent `scout` is configured again while its rename to `ranger` is unfinished; remove `[agents.scout]` from the config by hand, or abandon the rename, then retry"
+        );
+        assert!(source.join("MEMORY.md").is_file(), "nothing moved");
+        assert!(!after.default_agent_workspace_dir(TO).exists());
+        assert_eq!(memory_identity(&after, FROM).await, 1);
+        let recorded = records(&after);
+        assert_eq!(recorded.len(), 1, "the record is untouched");
+        assert_eq!(recorded[0].phase, RecoveryPhase::Committed);
+
+        // With the hand-added entry removed again, the same rename finishes.
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+        assert_eq!(memory_rows(&after, TO).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_prepared_record_retires_the_old_alias_and_converge_commits_it() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        seed_workspace(&before, FROM);
+        let armed = arm(&before, FROM, TO).await.unwrap();
+        let after = committed(&before);
+        // The process stops before acknowledging the commit, and another door
+        // then removes the target.
+        drop(armed);
+        let mut without_target = after.clone();
+        without_target.agents.remove(TO);
+        assert_eq!(records(&after)[0].phase, RecoveryPhase::Prepared);
+        assert!(
+            retired_alias(&without_target, FROM).unwrap().is_some(),
+            "the old alias is gone, so it stays retired whatever became of the target"
+        );
+        assert!(matches!(
+            ensure_alias_not_retired(&without_target, FROM).await,
+            Err(RenameRecoveryError::AliasRetired { .. })
+        ));
+
+        // Converging commits the record before anything moves.
+        let blocker = block_destination(&after);
+        let stores = SurfaceStores::none();
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert!(!outcome.is_converged());
+        assert_eq!(records(&after)[0].phase, RecoveryPhase::Committed);
+        assert!(
+            retired_alias(&before, FROM).unwrap().is_some(),
+            "a committed record keeps the old alias retired even if it comes back"
+        );
+
+        std::fs::remove_file(&blocker).unwrap();
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+        assert!(records(&after).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_memory_merge_refusal_is_a_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        seed_memory(&before, FROM, 2).await;
+        // The new alias already owns memory of its own.
+        seed_memory(&before, TO, 1).await;
+        let after = arm_and_commit(&before).await;
+
+        let outcome = converge(&after, FROM, TO, &SurfaceStores::none())
+            .await
+            .unwrap();
+        let issues = outstanding(&outcome);
+        assert_eq!(issues.len(), 1, "{:?}", outcome.warnings());
+        assert_eq!(issues[0].follower, FollowerKind::Memory);
+        assert_eq!(issues[0].kind, FollowerIssueKind::Conflict);
+        assert_eq!(
+            issues[0].to_string(),
+            format!("memory for `{TO}` already exists; merge it by hand or abandon the rename")
+        );
+        assert_eq!(memory_rows(&after, FROM).await, 2);
+        assert_eq!(memory_rows(&after, TO).await, 1);
+        assert_eq!(records(&after).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_rename_drops_only_its_record_and_reports_what_stays() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM, "owl"]);
+        let old = seed_workspace(&before, FROM);
+        seed_memory(&before, FROM, 2).await;
+        seed_cron(&before, FROM);
+        let first = arm_and_commit(&before).await;
+        let armed = arm(&first, "owl", "wolf").await.unwrap();
+        let after = renamed(&first, "owl", "wolf");
+        acknowledge_commit(&after, armed).await;
+
+        // Only a record of exactly this rename is abandoned.
+        for (from, to) in [(FROM, "wolf"), ("owl", TO), ("hawk", TO)] {
+            assert!(
+                matches!(
+                    abandon_rename(&after, from, to).await,
+                    Err(RenameRecoveryError::NotConfigured { alias }) if alias == from
+                ),
+                "{from} -> {to}"
+            );
+        }
+        assert_eq!(records(&after).len(), 2);
+
+        let abandoned = abandon_rename(&after, FROM, TO).await.unwrap();
+        assert_eq!(
+            (abandoned.record.from.as_str(), abandoned.record.to.as_str()),
+            (FROM, TO)
+        );
+        let residue: Vec<(FollowerKind, String)> = abandoned
+            .residue
+            .iter()
+            .map(|issue| (issue.follower, issue.to_string()))
+            .collect();
+        assert_eq!(
+            residue,
+            vec![
+                (
+                    FollowerKind::Workspace,
+                    format!(
+                        "the old default workspace of `{FROM}` still exists at {}",
+                        old.display()
+                    )
+                ),
+                (
+                    FollowerKind::Memory,
+                    format!("memory still attributes state to `{FROM}`")
+                ),
+                (
+                    FollowerKind::Cron,
+                    format!("cron still attributes state to `{FROM}`")
+                ),
+            ]
+        );
+
+        // The other rename's record is kept; nothing moved; no config was
+        // written; and the old alias can be created again.
+        let remaining = records(&after);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            (remaining[0].from.as_str(), remaining[0].to.as_str()),
+            ("owl", "wolf")
+        );
+        assert!(old.join("MEMORY.md").is_file());
+        assert_eq!(memory_identity(&after, FROM).await, 1);
+        assert_eq!(cron_residue(&after, FROM), Some(1));
+        assert!(!after.default_agent_workspace_dir(TO).exists());
+        assert!(!after.config_path.exists());
+        assert!(ensure_alias_not_retired(&after, FROM).await.is_ok());
+        assert!(ensure_not_pending_target(&after, TO).await.is_ok());
+        let mut recreated = after.clone();
+        assert!(alias_refs::create_map_key_checked(&mut recreated, "agents", FROM).unwrap());
+
+        assert!(matches!(
+            abandon_rename(&after, FROM, TO).await,
+            Err(RenameRecoveryError::NotConfigured { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rename_whose_old_alias_is_configured_again_can_be_abandoned() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let old = seed_workspace(&before, FROM);
+        let after = arm_and_commit(&before).await;
+        let mut readded = after.clone();
+        readded.agents.insert(FROM.to_string(), agent());
+
+        let abandoned = abandon_rename(&readded, FROM, TO).await.unwrap();
+        assert_eq!(abandoned.residue.len(), 1, "{:?}", abandoned.residue);
+        assert_eq!(abandoned.residue[0].follower, FollowerKind::Workspace);
+        assert!(records(&after).is_empty());
+        assert!(old.join("MEMORY.md").is_file());
+        assert_eq!(
+            resolve(&readded, FROM, TO, &SurfaceStores::none())
+                .await
+                .unwrap(),
+            Disposition::Fresh,
+            "the agent brought back is an ordinary agent again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_alias_that_names_more_than_one_directory_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let stores = SurfaceStores::none();
+        for legacy in ["x/../../outside", "..", ".", "back\\slash", "nul\0byte", ""] {
+            let config = fixture(&tmp, &[legacy]);
+            let refusals = [
+                resolve(&config, legacy, TO, &stores).await.unwrap_err(),
+                arm(&config, legacy, TO).await.unwrap_err(),
+                converge(&config, legacy, TO, &stores).await.unwrap_err(),
+                abandon_rename(&config, legacy, TO).await.unwrap_err(),
+            ];
+            for refusal in refusals {
+                assert!(
+                    matches!(&refusal, RenameRecoveryError::InvalidAlias { alias, .. } if alias == legacy),
+                    "{legacy:?}: {refusal:?}"
+                );
+            }
+            assert!(!config.data_dir.exists(), "{legacy:?}: no journal or lock");
+        }
+        assert!(!tmp.path().join("agents").exists());
+        // `<install>/agents/x/../../outside` is `<install>/outside`.
+        assert!(!tmp.path().join("outside").exists());
     }
 
     #[tokio::test]
@@ -2377,9 +3282,11 @@ mod tests {
         assert!(ensure_alias_not_retired(&after, TO).await.is_ok());
         assert!(ensure_not_pending_target(&after, FROM).await.is_ok());
         assert!(ensure_alias_not_retired(&after, "owl").await.is_ok());
+        // Arming from the config before the commit, where the retired alias is
+        // still configured, is refused as a reconfigured old alias.
         assert!(matches!(
             arm(&before, FROM, "wolf").await,
-            Err(RenameRecoveryError::AliasRetired { .. })
+            Err(RenameRecoveryError::SourceReconfigured { .. })
         ));
         assert!(matches!(
             converge(&after, FROM, "wolf", &stores).await,
@@ -2665,6 +3572,19 @@ mod tests {
             "agent `ranger` is the target of an unfinished rename; re-run that rename first"
         );
         assert_eq!(
+            error(RenameRecoveryError::SourceReconfigured {
+                from: FROM.into(),
+                to: TO.into(),
+            }),
+            "agent `scout` is configured again while its rename to `ranger` is unfinished; remove `[agents.scout]` from the config by hand, or abandon the rename, then retry"
+        );
+        let conflict = FollowerIssue::conflict(FollowerKind::Memory, "taken".into());
+        assert_eq!(conflict.to_string(), "taken");
+        assert_eq!(
+            serde_json::to_value(&conflict).unwrap()["kind"],
+            serde_json::json!("conflict")
+        );
+        assert_eq!(
             error(RenameRecoveryError::Unreadable {
                 store: "acp".into(),
                 detail: "locked".into(),
@@ -2712,6 +3632,10 @@ mod tests {
             (
                 "ensure_not_pending_target",
                 std::mem::size_of_val(&send(ensure_not_pending_target(&config, TO))),
+            ),
+            (
+                "abandon_rename",
+                std::mem::size_of_val(&send(abandon_rename(&config, FROM, TO))),
             ),
         ];
         for (name, size) in sizes {

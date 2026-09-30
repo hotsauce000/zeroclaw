@@ -49,7 +49,7 @@ Rename runs the same recoverable sequence on every surface: the `zeroclaw agents
 
 The owned state that follows a rename is:
 
-- the default per-alias workspace, moved from `<install>/agents/<old>/workspace/` to `<install>/agents/<new>/workspace/` (a custom `workspace.path` never moves);
+- the default per-alias workspace, moved from `<install>/agents/<old>/workspace/` to `<install>/agents/<new>/workspace/` (a custom `workspace.path` never moves, even one that names this default location);
 - memory attribution;
 - cron jobs and their run-history ownership;
 - ACP sessions: their owner alias, and their persisted working directory when it was the old default workspace; and
@@ -61,7 +61,13 @@ To finish a rename that reported unfinished work, re-run it with the same aliase
 
 Two conflicts need an operator and keep the record open: the destination workspace already exists and is not empty, or the destination alias already owns memory rows. Resolve them by moving or merging that state by hand, then re-run the same rename.
 
-An alias retired by an unfinished rename cannot be reused until that rename converges, so a re-created agent never inherits the previous holder's workspace, memory, cron, ACP, or session state. While a record for `<old>` to `<new>` is open, every surface refuses to create an agent named `<old>`, including `zeroclaw config set agents.<old>.<field>`, `zeroclaw config patch`, `zeroclaw quickstart`, and the dashboard. Renaming another agent onto `<old>` is refused too, and so is renaming or deleting `<new>` until the pending rename converges. Any other alias can still be created.
+A rename never finishes while `<install>/agents/<old>/workspace/` still exists, whatever `<new>`'s workspace configuration is, because an agent re-created as `<old>` would adopt that directory. When `<new>` has a custom `workspace.path`, the rename removes the old directory if it is empty and otherwise reports it until its contents are moved by hand. If `<new>`'s `workspace.path` points at the old directory itself, point it elsewhere first, then re-run the rename.
+
+If `[agents.<old>]` is back in the config while the record is open (a hand edit, say), re-running the rename is refused and moves nothing, since that entry would take over the state the rename still owes `<new>`. Remove `[agents.<old>]` by hand and re-run the rename, or abandon it.
+
+If a rename cannot be finished, `zeroclaw agents rename <old> <new> --abandon` drops its recovery record without moving anything. `<old>` can then be created again, and the new agent adopts whatever state is still kept under that alias, so check the warnings the command prints first.
+
+An alias retired by an unfinished rename cannot be reused until that rename converges, so a re-created agent never inherits the previous holder's workspace, memory, cron, ACP, or session state. While a record for `<old>` to `<new>` is open, creating an agent named `<old>` is refused by the CLI (including `zeroclaw config set agents.<old>.<field>` and `zeroclaw config patch`), the gateway and dashboard, the daemon RPC, `zeroclaw quickstart`, and the agent-facing config tool. An agent added through an environment override or a hand edit of `config.toml` is not refused; config load logs a warning for it instead. Renaming another agent onto `<old>` is refused too, and so is renaming or deleting `<new>` until the pending rename converges. Any other alias can still be created.
 
 Delete makes the config change durable before running owned-state side effects. It first refuses hard references and live ACP sessions, then removes the config entry and soft references before attempting workspace archival, owned-state export and cleanup, and session-attribution clearing.
 

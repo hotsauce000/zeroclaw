@@ -68,8 +68,11 @@ pub struct RecoveryRecord {
     /// The alias the operation's state converges to.
     pub to: String,
     pub phase: RecoveryPhase,
-    /// Absolute default per-alias workspace of `from` captured before the commit; None when the
-    /// workspace was a custom (alias-independent) path and must not be moved.
+    /// Absolute default per-alias workspace of `from` captured before the
+    /// commit; None when `from` set a `workspace.path`, even one naming its
+    /// default location, which does not follow the alias and must not be
+    /// moved. The runtime moves it only while it is still `from`'s default
+    /// location under the live config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_workspace: Option<PathBuf>,
     /// RFC 3339 timestamp.
@@ -77,24 +80,27 @@ pub struct RecoveryRecord {
 }
 
 impl RecoveryRecord {
-    /// Whether the record's config commit is known to have landed. A
-    /// `Committed` record always is; a `Prepared` one is when the live config
-    /// no longer has `from` but has `to`.
+    /// Whether the record retires `from`. A `Committed` record always does;
+    /// a `Prepared` one does once the live config no longer has `from`.
+    /// Whether `to` is configured does not matter: a `from` that is gone may
+    /// have left state behind whatever happened to `to` since, so the record
+    /// fails closed and keeps `from` retired.
     ///
-    /// A `Prepared` record that is not effective is void: its commit never
-    /// landed, so it retires nothing and has nothing to converge.
+    /// A `Prepared` record that is not effective is void: `from` is still
+    /// configured, so its commit never landed, and it retires nothing and has
+    /// nothing to converge.
     #[must_use]
     pub fn is_effective(&self, config: &Config) -> bool {
         match self.phase {
             RecoveryPhase::Committed => true,
-            RecoveryPhase::Prepared => {
-                !config.agents.contains_key(&self.from) && config.agents.contains_key(&self.to)
-            }
+            RecoveryPhase::Prepared => !config.agents.contains_key(&self.from),
         }
     }
 }
 
-/// Why a journal operation failed.
+/// Why a journal operation failed. Each `path` is the absolute path of the
+/// file involved, for logs; [`Display`](std::fmt::Display) names the file
+/// only by its file name.
 #[derive(Debug)]
 pub enum JournalError {
     /// The journal exists but could not be read or parsed. It may hold an
@@ -109,23 +115,41 @@ pub enum JournalError {
 }
 
 impl std::fmt::Display for JournalError {
+    // The text reaches gateway and daemon RPC error bodies, some of them
+    // rendered before the caller is authorized, so it names the journal file
+    // and never where the install keeps it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreadable { path, detail } => {
-                write!(f, "{} is unreadable: {detail}", path.display())
+                write!(f, "{} is unreadable: {detail}", file_label(path))
             }
             Self::UnsupportedSchema { path, version } => write!(
                 f,
                 "{} uses schema_version {version}; this build reads {SCHEMA_VERSION}",
-                path.display()
+                file_label(path)
             ),
             Self::Busy { path } => write!(
                 f,
                 "{} is locked by another agent lifecycle operation",
-                path.display()
+                file_label(path)
             ),
-            Self::Write { path, detail } => write!(f, "cannot write {}: {detail}", path.display()),
+            Self::Write { path, detail } => {
+                write!(f, "cannot write {}: {detail}", file_label(path))
+            }
         }
+    }
+}
+
+/// The journal file `path` names, by file name alone: the lock file, or else
+/// the journal itself, which also stands for its directory and temp files.
+fn file_label(path: &Path) -> &'static str {
+    if path
+        .file_name()
+        .is_some_and(|name| name == JOURNAL_LOCK_FILE_NAME)
+    {
+        JOURNAL_LOCK_FILE_NAME
+    } else {
+        JOURNAL_FILE_NAME
     }
 }
 
@@ -333,10 +357,7 @@ impl AgentRecoveryJournal {
         }
         Err(JournalError::Write {
             path: self.path.clone(),
-            detail: format!(
-                "the held lock is {}, not this journal's",
-                guard.lock_path.display()
-            ),
+            detail: "the held lock belongs to another journal".to_string(),
         })
     }
 
@@ -803,8 +824,11 @@ mod tests {
             !pending.is_effective(&has_both),
             "`from` is still configured"
         );
-        assert!(!pending.is_effective(&has_neither), "`to` never appeared");
         assert!(pending.is_effective(&has_to), "commit landed");
+        assert!(
+            pending.is_effective(&has_neither),
+            "`from` is gone, so it stays retired whatever became of `to`"
+        );
 
         let landed = committed("alpha", "beta");
         for config in [&has_from, &has_to, &has_both, &has_neither] {
@@ -846,6 +870,53 @@ mod tests {
             Some(prepared("alpha", "beta"))
         );
         drop(guard);
+    }
+
+    #[test]
+    fn errors_name_the_journal_file_and_never_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = AgentRecoveryJournal::for_data_dir(dir.path());
+        let held = journal.lock(Duration::ZERO).unwrap();
+        let busy = journal.lock(Duration::ZERO).unwrap_err();
+        drop(held);
+        std::fs::write(journal.path(), "{not json").unwrap();
+        let unreadable = journal.load().unwrap_err();
+        std::fs::write(journal.path(), r#"{"schema_version":2,"records":[]}"#).unwrap();
+        let unsupported = journal.load().unwrap_err();
+        let other = tempfile::tempdir().unwrap();
+        let foreign = AgentRecoveryJournal::for_data_dir(other.path())
+            .lock(Duration::ZERO)
+            .unwrap();
+        std::fs::remove_file(journal.path()).unwrap();
+        let unwritable = journal
+            .upsert(&foreign, prepared("alpha", "beta"))
+            .unwrap_err();
+
+        let install = dir.path().display().to_string();
+        for (error, expected) in [
+            (
+                &busy,
+                format!("{JOURNAL_LOCK_FILE_NAME} is locked by another agent lifecycle operation"),
+            ),
+            (&unreadable, format!("{JOURNAL_FILE_NAME} is unreadable: ")),
+            (
+                &unsupported,
+                format!("{JOURNAL_FILE_NAME} uses schema_version 2; this build reads 1"),
+            ),
+            (&unwritable, format!("cannot write {JOURNAL_FILE_NAME}: ")),
+        ] {
+            let text = error.to_string();
+            assert!(text.starts_with(&expected), "{text}");
+            assert!(!text.contains(&install), "{text}");
+            assert!(
+                !text.contains(&other.path().display().to_string()),
+                "{text}"
+            );
+        }
+        // The absolute path is still there for logs.
+        assert!(
+            matches!(&busy, JournalError::Busy { path } if path == &dir.path().join(JOURNAL_LOCK_FILE_NAME))
+        );
     }
 
     #[test]
