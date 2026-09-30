@@ -3328,8 +3328,49 @@ enum PluginCommands {
         /// Plugin name
         name: String,
     },
+    /// Bind an installed channel package to a `[channels.plugin.<alias>]`
+    /// instance and create the instance's config entry, which holds its
+    /// config and its egress grant. Re-running it repairs a missing binding
+    /// or entry and never changes one that exists.
+    Bind {
+        /// Installed plugin package that provides the channel
+        package: String,
+        /// Alias of the channel instance, which runs as `plugin.<alias>`
+        #[arg(long)]
+        channel_alias: String,
+        /// Egress for the instance's new config entry: `declared` grants the
+        /// destinations the package manifest declares, `none` binds with no
+        /// network reach. It matters only when this command creates the
+        /// config entry, and it is required when the manifest declares
+        /// destinations and the entry does not exist yet.
+        #[arg(long, value_enum)]
+        egress: Option<EgressDecisionArg>,
+    },
     /// Move plugins from legacy install directories into the configured one
     Migrate,
+}
+
+/// `--egress`: the operator's decision on the destinations a channel
+/// package's manifest declares, taken when its instance's config entry is
+/// created.
+#[cfg(feature = "plugins-wasm")]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum EgressDecisionArg {
+    /// Grant the destinations the manifest declares
+    Declared,
+    /// Grant nothing: the instance has no network reach
+    #[value(name = "none")]
+    Withhold,
+}
+
+#[cfg(feature = "plugins-wasm")]
+impl From<EgressDecisionArg> for crate::plugins::channel_instance::EgressDecision {
+    fn from(arg: EgressDecisionArg) -> Self {
+        match arg {
+            EgressDecisionArg::Declared => Self::SeedDeclared,
+            EgressDecisionArg::Withhold => Self::Withhold,
+        }
+    }
 }
 
 /// Run the install-time load-check on an admitted source and decide whether
@@ -3504,12 +3545,27 @@ fn plugin_list_lines(
 /// One config entry key line per instance row: the default tool binding's in
 /// the form it has always had, then one per bound channel alias, which names
 /// the `plugin.<alias>` binding the key belongs to.
+///
+/// `channel_readiness` holds each bound alias's readiness block
+/// ([`channel_instance_readiness_lines`]), which follows that alias's key
+/// line; an instance that owns no row has no key line, so its block follows
+/// the key lines. `bind_hint` is the line a channel package with no bound
+/// alias gets instead.
 #[cfg(feature = "plugins-wasm")]
 fn plugin_info_lines(
     info: &zeroclaw::plugins::PluginInfo,
     instance_rows: &[crate::plugins::channel_instance::PluginInstanceRow],
+    channel_readiness: &[(String, Vec<String>)],
+    bind_hint: Option<&str>,
     status: &PluginLoadStatus,
 ) -> Vec<String> {
+    let readiness_of = |alias: &str| {
+        channel_readiness
+            .iter()
+            .find(|(bound, _)| bound == alias)
+            .map(|(_, lines)| lines.as_slice())
+            .unwrap_or_default()
+    };
     let mut lines = vec![ta(
         "cli-plugin-name-version",
         &[("name", &info.name), ("version", &info.version)],
@@ -3552,6 +3608,20 @@ fn plugin_info_lines(
                 "Config entry key",
             )
         });
+        if row.is_channel() {
+            lines.extend(readiness_of(&row.binding).iter().cloned());
+        }
+    }
+    for (alias, readiness) in channel_readiness {
+        let has_key_line = instance_rows
+            .iter()
+            .any(|row| row.is_channel() && row.binding == *alias);
+        if !has_key_line {
+            lines.extend(readiness.iter().cloned());
+        }
+    }
+    if let Some(hint) = bind_hint {
+        lines.push(hint.to_string());
     }
     match &info.wasm_path {
         Some(path) => lines.push(ta(
@@ -3691,40 +3761,49 @@ fn print_egress_grant_ceremony(
     instance_key: &str,
     granted: &[String],
 ) {
+    for line in egress_grant_ceremony_lines(config_dir, package, instance_key, granted) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_egress_grant_ceremony`] prints, which the channel
+/// binding ceremony prints for the row it creates as well.
+#[cfg(feature = "plugins-wasm")]
+fn egress_grant_ceremony_lines(
+    config_dir: &std::path::Path,
+    package: &str,
+    instance_key: &str,
+    granted: &[String],
+) -> Vec<String> {
     use crate::plugins::egress_ceremony::egress_set_command;
     if granted.is_empty() {
-        return;
+        return Vec::new();
     }
-    println!(
-        "{}",
-        ta(
-            "cli-plugin-egress-seeded",
-            &[("name", package), ("count", &granted.len().to_string())],
-            "Granted egress from the manifest declaration."
-        )
-    );
+    let mut lines = vec![ta(
+        "cli-plugin-egress-seeded",
+        &[("name", package), ("count", &granted.len().to_string())],
+        "Granted egress from the manifest declaration.",
+    )];
     for host in granted {
         // The literal carries indentation only; the prose is the Fluent value.
-        println!(
+        lines.push(format!(
             "  {}",
             ta(
                 "cli-plugin-egress-destination",
                 &[("host", host)],
                 "-> host"
             )
-        );
+        ));
     }
-    println!(
-        "{}",
-        ta(
-            "cli-plugin-egress-edit-command",
-            &[(
-                "command",
-                &egress_set_command(config_dir, instance_key, granted)
-            )],
-            "Edit this grant later with the printed command."
-        )
-    );
+    lines.push(ta(
+        "cli-plugin-egress-edit-command",
+        &[(
+            "command",
+            &egress_set_command(config_dir, instance_key, granted),
+        )],
+        "Edit this grant later with the printed command.",
+    ));
+    lines
 }
 
 /// Print the declaration-versus-grant difference for an instance row that
@@ -3902,9 +3981,10 @@ fn egress_grant_summary(granted: &[String], allow_private: &[String]) -> Option<
 
 /// The lines `plugin remove` prints for the package's config rows that keep an
 /// egress grant. `plugin remove` deletes the package, not its configuration,
-/// and a package installed later under the same name inherits these rows.
-/// Each line names its instance: the bare package for the default tool
-/// binding, `package (plugin.<alias>)` for a channel row.
+/// and a package installed later under the same name inherits these rows: the
+/// default tool binding's row at once, a channel row once the package is bound
+/// to that alias again. The tool line names the bare package as it always has;
+/// a channel line names its `plugin.<alias>` binding.
 #[cfg(feature = "plugins-wasm")]
 fn removed_plugin_kept_grant_lines(
     config: &crate::config::schema::Config,
@@ -3916,15 +3996,30 @@ fn removed_plugin_kept_grant_lines(
         .filter_map(|row| {
             let (granted, allow_private) = config.plugins.entry_egress(&row.key);
             egress_grant_summary(&granted, &allow_private).map(|grants| {
-                ta(
-                    "cli-plugin-removed-grant-kept",
-                    &[
-                        ("name", &row.display_name(package)),
-                        ("key", &row.key),
-                        ("grants", &grants),
-                    ],
-                    "The plugin's config entry keeps its egress grant.",
-                )
+                if row.is_channel() {
+                    ta(
+                        "cli-plugin-removed-channel-grant-kept",
+                        &[
+                            ("name", package),
+                            ("alias", &row.binding),
+                            ("key", &row.key),
+                            ("grants", &grants),
+                        ],
+                        format!(
+                            "The config entry '{}' for plugin.{} is kept, with its egress grant \
+                             ({grants}): a package installed later as '{package}' and bound to \
+                             that alias inherits it. Delete the [[plugins.entries]] row named \
+                             '{}' to drop the grant.",
+                            row.key, row.binding, row.key
+                        ),
+                    )
+                } else {
+                    ta(
+                        "cli-plugin-removed-grant-kept",
+                        &[("name", package), ("key", &row.key), ("grants", &grants)],
+                        "The plugin's config entry keeps its egress grant.",
+                    )
+                }
             })
         })
         .collect()
@@ -3954,6 +4049,562 @@ fn removed_plugin_binding_lines(package: &str, aliases: &[String]) -> Vec<String
             )
         })
         .collect()
+}
+
+/// `zeroclaw plugin bind`: bind the installed `package` to
+/// `[channels.plugin.<alias>]` and create the instance's row.
+///
+/// [`crate::plugins::channel_instance::plan_channel_binding`] decides
+/// everything before anything is written, so a refusal is an error carrying
+/// the matching Fluent line and leaves config untouched. The plan is applied
+/// and saved with one `save_dirty`, and only when it writes something: a
+/// repeated run that finds the binding and its row in place leaves the config
+/// file byte-identical. Returns the lines to print.
+#[cfg(feature = "plugins-wasm")]
+async fn bind_channel_instance(
+    config: &mut crate::config::schema::Config,
+    host: &zeroclaw::plugins::host::PluginHost,
+    package: &str,
+    alias: &str,
+    decision: Option<crate::plugins::channel_instance::EgressDecision>,
+) -> Result<Vec<String>> {
+    use crate::plugins::channel_instance::{apply_channel_binding, plan_channel_binding};
+    let Some(manifest) = host.manifest(package) else {
+        bail!(ta(
+            "cli-plugin-not-found",
+            &[("name", package)],
+            "Plugin not found"
+        ));
+    };
+    let plan = plan_channel_binding(config, manifest, alias, decision).map_err(|refusal| {
+        anyhow::Error::msg(binding_refusal_line(&manifest.name, alias, &refusal))
+    })?;
+    apply_channel_binding(config, &manifest.name, &plan)?;
+    if plan.writes_config() {
+        Box::pin(config.save_dirty()).await?;
+    }
+    Ok(channel_binding_report_lines(
+        config, host, manifest, &plan, decision,
+    ))
+}
+
+/// The line that explains why the binding ceremony refused to bind `alias` to
+/// `package`.
+#[cfg(feature = "plugins-wasm")]
+fn binding_refusal_line(
+    package: &str,
+    alias: &str,
+    refusal: &crate::plugins::channel_instance::BindingRefusal,
+) -> String {
+    use crate::plugins::channel_instance::BindingRefusal;
+    match refusal {
+        BindingRefusal::NotAChannelPackage => ta(
+            "cli-plugin-channel-not-provided",
+            &[("name", package), ("alias", alias)],
+            format!(
+                "Package '{package}' does not provide a channel, so it cannot be bound to \
+                 plugin.{alias}."
+            ),
+        ),
+        BindingRefusal::InvalidAlias(reason) => ta(
+            "cli-plugin-channel-invalid-alias",
+            &[("alias", alias), ("reason", reason)],
+            format!("'{alias}' is not a valid channel alias: {reason}"),
+        ),
+        BindingRefusal::DegradedConfig { section } => ta(
+            "cli-plugin-channel-config-degraded",
+            &[("alias", alias), ("section", section)],
+            format!(
+                "Refusing to bind plugin.{alias}: the [{section}] section on disk is malformed \
+                 and was not loaded. Repair it and retry."
+            ),
+        ),
+        BindingRefusal::AliasOwnedByOtherPackage { owner } => ta(
+            "cli-plugin-channel-alias-owned",
+            &[("alias", alias), ("owner", owner), ("name", package)],
+            format!(
+                "Channel alias plugin.{alias} is bound to package '{owner}', not '{package}'. \
+                 Choose another alias, or remove the [channels.plugin.{alias}] table first."
+            ),
+        ),
+        BindingRefusal::EgressDecisionRequired { declared } => {
+            let hosts = declared.join(", ");
+            ta(
+                "cli-plugin-channel-egress-decision-required",
+                &[
+                    ("name", package),
+                    ("alias", alias),
+                    ("count", &declared.len().to_string()),
+                    ("hosts", &hosts),
+                ],
+                format!(
+                    "Package '{package}' declares {} destination(s) for plugin.{alias}: {hosts}. \
+                     Re-run with `--egress declared` to grant them, or `--egress none` to bind \
+                     with no network reach.",
+                    declared.len()
+                ),
+            )
+        }
+    }
+}
+
+/// What the binding ceremony prints once `plan` is applied and saved: the
+/// binding line, then what happened to the instance's row, then the
+/// instance's readiness ([`channel_instance_readiness_lines`]).
+///
+/// A row the ceremony created gets the seeded line install prints, then the
+/// grant ceremony when it granted the declaration, the withheld line with the
+/// command that grants it later under `--egress none`, or, when the manifest
+/// declares nothing but holds a governed transport, the line with the command
+/// that grants the deployment's own hosts. A row that already existed gets
+/// install's existing-row report, never a write, and a note when an
+/// `--egress` flag was given for it.
+#[cfg(feature = "plugins-wasm")]
+fn channel_binding_report_lines(
+    config: &crate::config::schema::Config,
+    host: &zeroclaw::plugins::host::PluginHost,
+    manifest: &zeroclaw::plugins::PluginManifest,
+    plan: &crate::plugins::channel_instance::ChannelBindingPlan,
+    decision: Option<crate::plugins::channel_instance::EgressDecision>,
+) -> Vec<String> {
+    use crate::plugins::channel_instance::{
+        EgressDecision, PluginInstanceRow, manifest_has_governed_transport,
+    };
+    use crate::plugins::egress_ceremony::{canonical_hosts, egress_set_command};
+
+    let package = manifest.name.as_str();
+    let alias = plan.alias.as_str();
+    let config_dir = egress_command_config_dir(config);
+    let mut lines = vec![if plan.create_binding {
+        ta(
+            "cli-plugin-channel-bound",
+            &[("alias", alias), ("name", package)],
+            format!("Bound channel instance plugin.{alias} to package '{package}'."),
+        )
+    } else {
+        ta(
+            "cli-plugin-channel-binding-kept",
+            &[("alias", alias), ("name", package)],
+            format!(
+                "Channel instance plugin.{alias} is already bound to '{package}'; the binding \
+                 was left unchanged."
+            ),
+        )
+    }];
+
+    if let Some(row) = &plan.row {
+        let display_name = PluginInstanceRow {
+            capability: zeroclaw::plugins::PluginCapability::Channel,
+            binding: alias.to_string(),
+            key: row.key.clone(),
+        }
+        .display_name(package);
+        if row.create {
+            lines.push(ta(
+                "cli-plugin-config-entry-seeded",
+                &[("name", &row.key)],
+                "Seeded config entry. Set plugin config values with \
+                 `zeroclaw config set plugins.entries.<instance-key>.config.<key>`.",
+            ));
+            if !row.seed.is_empty() {
+                lines.extend(egress_grant_ceremony_lines(
+                    config_dir,
+                    &display_name,
+                    &row.key,
+                    &row.seed,
+                ));
+            } else if decision == Some(EgressDecision::Withhold) && !row.declared.is_empty() {
+                let declared = canonical_hosts(&row.declared);
+                let hosts = declared.join(", ");
+                let command = egress_set_command(config_dir, &row.key, &declared);
+                lines.push(ta(
+                    "cli-plugin-channel-egress-withheld",
+                    &[("alias", alias), ("hosts", &hosts), ("command", &command)],
+                    format!(
+                        "No egress was granted to plugin.{alias} (--egress none). Its manifest \
+                         declares {hosts}. Grant them later with: {command}"
+                    ),
+                ));
+            } else if row.declared.is_empty() && manifest_has_governed_transport(manifest) {
+                let command = egress_set_command(config_dir, &row.key, &["<host>".to_string()]);
+                lines.push(ta(
+                    "cli-plugin-channel-egress-nothing-declared",
+                    &[("name", package), ("alias", alias), ("command", &command)],
+                    format!(
+                        "Package '{package}' declares no destinations. Grant the hosts your \
+                         deployment uses to plugin.{alias} with: {command}"
+                    ),
+                ));
+            }
+        } else {
+            lines.extend(existing_egress_grant_lines(
+                config,
+                &display_name,
+                &row.key,
+                &row.declared,
+            ));
+            if row.decision_ignored {
+                lines.push(ta(
+                    "cli-plugin-channel-egress-flag-ignored",
+                    &[("alias", alias)],
+                    format!(
+                        "--egress was not applied: the config entry for plugin.{alias} already \
+                         exists, and this command never extends an existing grant."
+                    ),
+                ));
+            }
+        }
+    }
+
+    lines.extend(channel_instance_readiness_lines(
+        config, host, manifest, alias,
+    ));
+    lines
+}
+
+/// Whether the channel instance `alias` of `manifest`'s package is ready to
+/// run, as a derived view of live config computed on demand. `plugin bind`
+/// prints it after binding, `plugin install --channel-alias` after the
+/// install, and `plugin info` for each bound alias.
+///
+/// In order: the permissions the manifest requests, which the instance holds
+/// as requested; the keys its `config_schema` requires, each set or missing,
+/// with the command that sets a missing one; the runtime's own verdict on its
+/// configuration; its egress gap, which is `plugin list`'s report for this
+/// row; the activation plan's verdict on the binding; and the note that a
+/// running daemon picks the instance up only after a restart or reload.
+///
+/// Nothing here writes. The ceremony never enables the plugin system, never
+/// edits an agent's `channels`, and never grants a private-address carve-out:
+/// it names what is missing and the command or config path that supplies it.
+/// Config values are never printed, only property names.
+#[cfg(feature = "plugins-wasm")]
+fn channel_instance_readiness_lines(
+    config: &crate::config::schema::Config,
+    host: &zeroclaw::plugins::host::PluginHost,
+    manifest: &zeroclaw::plugins::PluginManifest,
+    alias: &str,
+) -> Vec<String> {
+    use crate::plugins::channel_instance::{
+        channel_instance_row, config_verdict, manifest_has_governed_transport,
+        plugin_bind_command_for, required_keys,
+    };
+    use crate::plugins::egress_ceremony::ShellDialect;
+
+    let package = manifest.name.as_str();
+    let config_dir = egress_command_config_dir(config);
+    let mut lines = Vec::new();
+
+    // The permissions are shown, not decided: the activation plan grants an
+    // instance exactly what its manifest requests.
+    let permissions: Vec<String> = manifest
+        .permissions
+        .iter()
+        .filter_map(|permission| {
+            serde_json::to_value(permission)
+                .ok()?
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    lines.push(if permissions.is_empty() {
+        ta(
+            "cli-plugin-channel-permissions-none",
+            &[("alias", alias)],
+            format!("plugin.{alias} requests no permissions."),
+        )
+    } else {
+        let permissions = permissions.join(", ");
+        ta(
+            "cli-plugin-channel-permissions",
+            &[("alias", alias), ("permissions", &permissions)],
+            format!("plugin.{alias} holds the permissions its manifest requests: {permissions}"),
+        )
+    });
+
+    let row = channel_instance_row(manifest, alias).ok().flatten();
+    let entry = row.as_ref().and_then(|row| {
+        config
+            .plugins
+            .entries
+            .iter()
+            .find(|entry| entry.name == row.key)
+    });
+
+    if let Some(row) = &row {
+        if entry.is_none() {
+            // `config set plugins.entries.<key>...` resolves only a row that
+            // exists, so a per-key command would fail; the ceremony creates
+            // the row.
+            let command =
+                plugin_bind_command_for(ShellDialect::host(), config_dir, package, Some(alias));
+            lines.push(ta(
+                "cli-plugin-channel-row-missing",
+                &[("alias", alias), ("command", &command)],
+                format!(
+                    "plugin.{alias} has no config entry yet, so its configuration cannot be set. \
+                     Create it with: {command}"
+                ),
+            ));
+        } else {
+            let keys = required_keys(manifest, entry);
+            if !keys.is_empty() {
+                lines.push(ta(
+                    "cli-plugin-channel-required-config",
+                    &[("alias", alias), ("count", &keys.len().to_string())],
+                    format!(
+                        "Required configuration for plugin.{alias} ({} key(s)):",
+                        keys.len()
+                    ),
+                ));
+                for key in &keys {
+                    // Indented in code: Fluent trims a value's leading
+                    // whitespace.
+                    lines.push(format!(
+                        "  {}",
+                        required_key_line(config_dir, &row.key, key)
+                    ));
+                }
+            }
+        }
+    }
+
+    // A manifest without a schema has nothing to validate, unless the row
+    // carries values anyway, which the runtime refuses.
+    let verdict = config_verdict(manifest, alias, entry);
+    if manifest.config_schema.is_some() || verdict.is_err() {
+        lines.push(match verdict {
+            Ok(()) => ta(
+                "cli-plugin-channel-config-valid",
+                &[("alias", alias)],
+                format!("plugin.{alias} configuration validates against the package schema."),
+            ),
+            Err(error) => ta(
+                "cli-plugin-channel-config-invalid",
+                &[("alias", alias), ("error", &error)],
+                format!("plugin.{alias} configuration does not validate yet: {error}"),
+            ),
+        });
+    }
+
+    // The same report `plugin list` prints for this row, so bind, install and
+    // list agree. A deployment-wide refusal is reported on its own instead,
+    // as `plugin list` reports it.
+    if manifest_has_governed_transport(manifest) {
+        if let Some(line) = egress_deployment_gap_line(config) {
+            lines.push(line);
+        } else if let Some(row) = &row {
+            lines.extend(instance_row_egress_gap_lines(
+                config,
+                manifest,
+                row,
+                &egress_runtime_inputs(config),
+            ));
+        }
+    }
+
+    lines.extend(channel_activation_line(config, host, alias));
+    lines.push(ta(
+        "cli-plugin-channel-restart-note",
+        &[("alias", alias)],
+        format!("A running daemon picks up plugin.{alias} after a restart or reload."),
+    ));
+    lines
+}
+
+/// One required key's readiness line. Only a name the portable key grammar
+/// accepts is printed inside a command; any other name is printed escaped,
+/// with the row to edit in the config file. A secret's command prompts for
+/// the value without echoing it.
+#[cfg(feature = "plugins-wasm")]
+fn required_key_line(
+    config_dir: &std::path::Path,
+    instance_key: &str,
+    key: &crate::plugins::channel_instance::RequiredKey,
+) -> String {
+    use crate::plugins::channel_instance::config_set_command_for;
+    use crate::plugins::egress_ceremony::ShellDialect;
+
+    // A no-op for every addressable name, whose grammar has nothing to escape.
+    let name = key.name.escape_debug().to_string();
+    if key.set {
+        return ta(
+            "cli-plugin-channel-required-key-set",
+            &[("key", &name)],
+            format!("{name}: set"),
+        );
+    }
+    if !key.addressable {
+        return ta(
+            "cli-plugin-channel-required-key-unaddressable",
+            &[("key", &name), ("row", instance_key)],
+            format!(
+                "{name}: missing. This property name cannot be addressed from the command line; \
+                 set it in the [[plugins.entries]] row named '{instance_key}' in the config file."
+            ),
+        );
+    }
+    let command = config_set_command_for(
+        ShellDialect::host(),
+        config_dir,
+        &format!("plugins.entries.{instance_key}.config.{}", key.name),
+        None,
+    );
+    if key.secret {
+        ta(
+            "cli-plugin-channel-required-secret-missing",
+            &[("key", &name), ("command", &command)],
+            format!(
+                "{name}: missing (secret; the command prompts without echo). Set it with: \
+                 {command}"
+            ),
+        )
+    } else {
+        ta(
+            "cli-plugin-channel-required-key-missing",
+            &[("key", &name), ("command", &command)],
+            format!("{name}: missing. Set it with: {command}"),
+        )
+    }
+}
+
+/// The activation plan's verdict on the binding `alias`, from
+/// `zeroclaw_runtime::plugin_runtime::channel_binding_admission`, so the
+/// report cannot drift from what the runtime does with the same config and
+/// installed packages. Each unmet precondition names what supplies it.
+#[cfg(feature = "plugins-wasm")]
+fn channel_activation_line(
+    config: &crate::config::schema::Config,
+    host: &zeroclaw::plugins::host::PluginHost,
+    alias: &str,
+) -> Option<String> {
+    use crate::plugins::channel_instance::config_set_command_for;
+    use crate::plugins::egress_ceremony::ShellDialect;
+    use zeroclaw_runtime::plugin_runtime::{ChannelBindingAdmission, channel_binding_admission};
+
+    let config_dir = egress_command_config_dir(config);
+    let verdict = match channel_binding_admission(config, host, alias) {
+        Ok(verdict) => verdict,
+        // The runtime's own plan fails the same way, so it starts no plugin
+        // instance at all.
+        Err(error) => {
+            let error = error.to_string();
+            return Some(ta(
+                "cli-plugin-channel-activation-plan-failed",
+                &[("alias", alias), ("error", &error)],
+                format!(
+                    "plugin.{alias} will not activate: the runtime cannot build its plugin \
+                     activation plan ({error})."
+                ),
+            ));
+        }
+    };
+    Some(match verdict {
+        ChannelBindingAdmission::Admitted => ta(
+            "cli-plugin-channel-activation-ready",
+            &[("alias", alias)],
+            format!("plugin.{alias} will activate at the next daemon start or reload."),
+        ),
+        ChannelBindingAdmission::PluginsDisabled => {
+            let command = config_set_command_for(
+                ShellDialect::host(),
+                config_dir,
+                "plugins.enabled",
+                Some("true"),
+            );
+            ta(
+                "cli-plugin-channel-activation-plugins-disabled",
+                &[("alias", alias), ("command", &command)],
+                format!(
+                    "plugin.{alias} will not activate: plugins.enabled is false. Enable the \
+                     plugin system with: {command}"
+                ),
+            )
+        }
+        // Every caller reports an alias it has just bound or found bound in
+        // the same config, so the declaration exists and this is unreachable.
+        // Nothing is printed rather than a claim about a binding that is not
+        // there.
+        ChannelBindingAdmission::Undeclared => return None,
+        ChannelBindingAdmission::BindingDisabled => {
+            let command = config_set_command_for(
+                ShellDialect::host(),
+                config_dir,
+                &format!("channels.plugin.{alias}.enabled"),
+                Some("true"),
+            );
+            ta(
+                "cli-plugin-channel-activation-binding-disabled",
+                &[("alias", alias), ("command", &command)],
+                format!(
+                    "plugin.{alias} will not activate: its binding is disabled. Enable it with: \
+                     {command}"
+                ),
+            )
+        }
+        // No command: `channels` is a list, and `config set` would replace
+        // it rather than add to it.
+        ChannelBindingAdmission::NoEnabledOwner => ta(
+            "cli-plugin-channel-activation-no-owner",
+            &[("alias", alias)],
+            format!(
+                "plugin.{alias} will not activate: no enabled agent lists plugin.{alias} in its \
+                 channels. Add plugin.{alias} to an enabled agent's `channels` list \
+                 (agents.<agent>.channels)."
+            ),
+        ),
+        ChannelBindingAdmission::PackageNotInstalled { package } => ta(
+            "cli-plugin-channel-activation-package-missing",
+            &[("alias", alias), ("name", &package)],
+            format!("plugin.{alias} will not activate: package '{package}' is not installed."),
+        ),
+        ChannelBindingAdmission::NotAChannelPackage { package } => ta(
+            "cli-plugin-channel-activation-not-a-channel",
+            &[("alias", alias), ("name", &package)],
+            format!(
+                "plugin.{alias} will not activate: package '{package}' does not provide a channel."
+            ),
+        ),
+        ChannelBindingAdmission::OverInstanceCeiling => ta(
+            "cli-plugin-channel-activation-over-ceiling",
+            &[("alias", alias)],
+            format!(
+                "plugin.{alias} will not activate: plugins.max_active_instances leaves no slot \
+                 for it."
+            ),
+        ),
+    })
+}
+
+/// The line naming the command that binds a channel instance of `manifest`'s
+/// package, or `None` for a package without the `channel` capability. The
+/// alias is the literal placeholder `<alias>`, for the operator to choose.
+#[cfg(feature = "plugins-wasm")]
+fn channel_bind_hint_line(
+    config: &crate::config::schema::Config,
+    manifest: &zeroclaw::plugins::PluginManifest,
+) -> Option<String> {
+    use crate::plugins::channel_instance::plugin_bind_command_for;
+    use crate::plugins::egress_ceremony::ShellDialect;
+
+    if !manifest
+        .capabilities
+        .contains(&zeroclaw::plugins::PluginCapability::Channel)
+    {
+        return None;
+    }
+    let package = manifest.name.as_str();
+    let command = plugin_bind_command_for(
+        ShellDialect::host(),
+        egress_command_config_dir(config),
+        package,
+        None,
+    );
+    Some(ta(
+        "cli-plugin-channel-bind-hint",
+        &[("name", package), ("command", &command)],
+        format!("Package '{package}' provides a channel. Bind an instance with: {command}"),
+    ))
 }
 
 /// The one line both surfaces print when the runtime refuses a canonical row:
@@ -4102,26 +4753,14 @@ fn egress_grant_gap_lines(
     config: &crate::config::schema::Config,
     manifest: &zeroclaw::plugins::PluginManifest,
 ) -> Result<Vec<String>> {
-    use crate::plugins::channel_instance::{
-        declared_hosts_for_row, instance_rows, manifest_has_governed_transport,
-        row_has_usable_transport,
-    };
-    use crate::plugins::egress_ceremony::{
-        deployment_rejection, plan_egress_gap, resolve_grant_state,
-    };
+    use crate::plugins::channel_instance::{instance_rows, manifest_has_governed_transport};
+    use crate::plugins::egress_ceremony::deployment_rejection;
 
     // No row of a package without a governed transport can use a
     // declaration, so there is nothing to report and no key to derive.
     if !manifest_has_governed_transport(manifest) {
         return Ok(Vec::new());
     }
-    let package = manifest.name.as_str();
-    let row_names: Vec<String> = config
-        .plugins
-        .entries
-        .iter()
-        .map(|entry| entry.name.clone())
-        .collect();
     // The same inputs `plugin_egress_policy` hands the policy constructor at
     // request time, so the diagnostic's verdict on a row is the runtime's.
     // Under a deployment-wide refusal this prints nothing: the caller reports
@@ -4135,40 +4774,66 @@ fn egress_grant_gap_lines(
 
     let mut lines = Vec::new();
     for row in instance_rows(config, manifest)? {
-        // Each row applies its own transport rule: `http_client` for the
-        // default tool binding, any governed transport for a channel row. A
-        // row whose transport cannot use a declaration is skipped, as a tool
-        // package without `http_client` always was.
-        if !row_has_usable_transport(manifest, &row) {
-            continue;
-        }
-        let declared = declared_hosts_for_row(manifest, &row);
-        // The names a pre-typed-config row could carry for this instance: the
-        // package name for the default tool binding, none for a channel row.
-        let legacy_candidates = row.legacy_candidates(package);
-        // `resolve_grant_state` answers the two questions this diagnostic must
-        // keep apart — what the runtime enforces (the canonical `zpi1_` row,
-        // and only that) versus what the operator authored (which, on a
-        // pre-typed-config install, is stranded on a package-name row the
-        // runtime never reads). `plan_egress_gap` turns the answer into the
-        // report, asking the runtime's own policy constructor whether it
-        // accepts the row; this function only renders the plan.
-        let state = resolve_grant_state(&row.key, &legacy_candidates, &row_names, |name| {
-            config.plugins.entry_egress(name)
-        });
-        lines.extend(render_egress_gap_plan(
-            &row.display_name(package),
-            &row.key,
-            &plan_egress_gap(
-                egress_command_config_dir(config),
-                &row.key,
-                &declared,
-                &state,
-                &runtime,
-            ),
+        lines.extend(instance_row_egress_gap_lines(
+            config, manifest, &row, &runtime,
         ));
     }
     Ok(lines)
+}
+
+/// [`egress_grant_gap_lines`] for one instance row, under an accepted
+/// deployment. The channel readiness report prints it for its own row, so
+/// `plugin bind`, `plugin install --channel-alias` and `plugin list` report
+/// that row in the same words.
+#[cfg(feature = "plugins-wasm")]
+fn instance_row_egress_gap_lines(
+    config: &crate::config::schema::Config,
+    manifest: &zeroclaw::plugins::PluginManifest,
+    row: &crate::plugins::channel_instance::PluginInstanceRow,
+    runtime: &crate::plugins::egress_ceremony::EgressRuntimeInputs,
+) -> Vec<String> {
+    use crate::plugins::channel_instance::{declared_hosts_for_row, row_has_usable_transport};
+    use crate::plugins::egress_ceremony::{plan_egress_gap, resolve_grant_state};
+
+    // Each row applies its own transport rule: `http_client` for the
+    // default tool binding, any governed transport for a channel row. A
+    // row whose transport cannot use a declaration is skipped, as a tool
+    // package without `http_client` always was.
+    if !row_has_usable_transport(manifest, row) {
+        return Vec::new();
+    }
+    let package = manifest.name.as_str();
+    let row_names: Vec<String> = config
+        .plugins
+        .entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    let declared = declared_hosts_for_row(manifest, row);
+    // The names a pre-typed-config row could carry for this instance: the
+    // package name for the default tool binding, none for a channel row.
+    let legacy_candidates = row.legacy_candidates(package);
+    // `resolve_grant_state` answers the two questions this diagnostic must
+    // keep apart — what the runtime enforces (the canonical `zpi1_` row,
+    // and only that) versus what the operator authored (which, on a
+    // pre-typed-config install, is stranded on a package-name row the
+    // runtime never reads). `plan_egress_gap` turns the answer into the
+    // report, asking the runtime's own policy constructor whether it
+    // accepts the row; this function only renders the plan.
+    let state = resolve_grant_state(&row.key, &legacy_candidates, &row_names, |name| {
+        config.plugins.entry_egress(name)
+    });
+    render_egress_gap_plan(
+        &row.display_name(package),
+        &row.key,
+        &plan_egress_gap(
+            egress_command_config_dir(config),
+            &row.key,
+            &declared,
+            &state,
+            runtime,
+        ),
+    )
 }
 
 /// Render one instance's plan as the lines `plugin list` prints. Shared with
@@ -10083,11 +10748,45 @@ Add pricing to the active provider profile or supply a catalog entry."
                 match host.get_plugin(&name) {
                     Some(info) => {
                         let instance_rows = installed_instance_rows(&config, &host, &info.name)?;
+                        let manifest = host.manifest(&info.name).ok_or_else(|| {
+                            anyhow::Error::msg("installed plugin manifest is unavailable")
+                        })?;
+                        // A channel package reports each bound alias's
+                        // readiness, or, with none bound, how to bind one.
+                        let channel_readiness: Vec<(String, Vec<String>)> = if manifest
+                            .capabilities
+                            .contains(&zeroclaw::plugins::PluginCapability::Channel)
+                        {
+                            crate::plugins::channel_instance::bound_channel_aliases(
+                                &config, &info.name,
+                            )
+                            .into_iter()
+                            .map(|alias| {
+                                let readiness = channel_instance_readiness_lines(
+                                    &config, &host, manifest, &alias,
+                                );
+                                (alias, readiness)
+                            })
+                            .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let bind_hint = if channel_readiness.is_empty() {
+                            channel_bind_hint_line(&config, manifest)
+                        } else {
+                            None
+                        };
                         // The load-check always runs here. "Why does my plugin
                         // not show up?" is the question this command is reached
                         // for, and discovery metadata cannot answer it.
                         let status = installed_plugin_load_status(&host, &info, limits).await?;
-                        for line in plugin_info_lines(&info, &instance_rows, &status) {
+                        for line in plugin_info_lines(
+                            &info,
+                            &instance_rows,
+                            &channel_readiness,
+                            bind_hint.as_deref(),
+                            &status,
+                        ) {
                             println!("{line}");
                         }
                         if status.is_load_failure() {
@@ -10108,6 +10807,25 @@ Add pricing to the active provider profile or supply a catalog entry."
                         &[("name", &name)],
                         "Plugin not found"
                     )),
+                }
+                Ok(())
+            }
+            PluginCommands::Bind {
+                package,
+                channel_alias,
+                egress,
+            } => {
+                let host = plugin_host_with_configured_security(&config)?;
+                let lines = Box::pin(bind_channel_instance(
+                    &mut config,
+                    &host,
+                    &package,
+                    &channel_alias,
+                    egress.map(Into::into),
+                ))
+                .await?;
+                for line in lines {
+                    println!("{line}");
                 }
                 Ok(())
             }
@@ -17688,7 +18406,7 @@ type = "string"
                 "the in-tree tool fixture must load against this host; got {status:?}"
             );
 
-            let lines = plugin_info_lines(&info, &instance_rows, &status);
+            let lines = plugin_info_lines(&info, &instance_rows, &[], None, &status);
             assert!(
                 lines.iter().any(|line| line.contains("tool-fixture")),
                 "info must name the plugin: {lines:#?}"
@@ -17699,7 +18417,13 @@ type = "string"
             );
             // The verdict is a rendered line, not an implied one: the same
             // plugin under a different verdict must end differently.
-            let other = plugin_info_lines(&info, &instance_rows, &PluginLoadStatus::NoComponent);
+            let other = plugin_info_lines(
+                &info,
+                &instance_rows,
+                &[],
+                None,
+                &PluginLoadStatus::NoComponent,
+            );
             assert_eq!(lines.len(), other.len(), "one verdict line either way");
             assert_ne!(
                 lines.last(),
@@ -17781,7 +18505,7 @@ type = "string"
                 "the verdict must carry the cause chain; got: {cause}"
             );
 
-            let lines = plugin_info_lines(&info, &instance_rows, &status);
+            let lines = plugin_info_lines(&info, &instance_rows, &[], None, &status);
             assert!(
                 lines
                     .last()
@@ -17851,7 +18575,8 @@ type = "string"
                 "--verify must still say something about a component-less package"
             );
 
-            let info_lines = plugin_info_lines(&info, &[], &PluginLoadStatus::NoComponent);
+            let info_lines =
+                plugin_info_lines(&info, &[], &[], None, &PluginLoadStatus::NoComponent);
             assert!(
                 !info_lines
                     .iter()
@@ -19454,7 +20179,7 @@ type = "string"
             loaded: true,
         };
 
-        let lines = plugin_info_lines(&info, &rows, &PluginLoadStatus::NoComponent);
+        let lines = plugin_info_lines(&info, &rows, &[], None, &PluginLoadStatus::NoComponent);
         let key_lines: Vec<&String> = lines.iter().filter(|line| line.contains("zpi1_")).collect();
         assert_eq!(key_lines.len(), 3, "one key line per instance: {lines:#?}");
         let tool_key = expected_instance_key(&manifest);
@@ -19588,20 +20313,31 @@ type = "string"
 
         let rows = instance_rows(&config, &manifest).expect("rows must derive");
         let kept = removed_plugin_kept_grant_lines(&config, "chat-bridge", &rows);
-        let kept_line = |name: &str, key: &str| {
-            ta(
-                "cli-plugin-removed-grant-kept",
-                &[("name", name), ("key", key), ("grants", "api.example.com")],
-                "The plugin's config entry keeps its egress grant.",
-            )
-        };
         assert_eq!(
             kept,
             vec![
-                kept_line("chat-bridge", &tool_key),
-                kept_line("chat-bridge (plugin.operations)", &operations_key),
+                ta(
+                    "cli-plugin-removed-grant-kept",
+                    &[
+                        ("name", "chat-bridge"),
+                        ("key", &tool_key),
+                        ("grants", "api.example.com"),
+                    ],
+                    "The plugin's config entry keeps its egress grant.",
+                ),
+                ta(
+                    "cli-plugin-removed-channel-grant-kept",
+                    &[
+                        ("name", "chat-bridge"),
+                        ("alias", "operations"),
+                        ("key", &operations_key),
+                        ("grants", "api.example.com"),
+                    ],
+                    "The config entry for the channel instance keeps its egress grant.",
+                ),
             ],
-            "one line per row that keeps a grant, the tool row under the bare package"
+            "one line per row that keeps a grant: the tool row under the bare package, the \
+             channel row under its binding, inherited only by a package bound to that alias"
         );
 
         let bindings = removed_plugin_binding_lines(
@@ -19621,6 +20357,1140 @@ type = "string"
                 "the line names the binding, the table that drops it, and the package: {line}"
             );
         }
+    }
+
+    /// A plugin source directory: `manifest_toml` beside a stub component, the
+    /// shape `plugin install` admits. The stub is never load-checked.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn write_plugin_source(manifest_toml: &str) -> tempfile::TempDir {
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        source
+    }
+
+    /// A host with one package installed through the real `PluginHost`, as
+    /// `plugin install` leaves one, and the directories it lives in.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    struct InstalledPackage {
+        host: zeroclaw::plugins::host::PluginHost,
+        _source: tempfile::TempDir,
+        _plugins: tempfile::TempDir,
+    }
+
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn install_package(manifest_toml: &str) -> InstalledPackage {
+        let source = write_plugin_source(manifest_toml);
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(plugins.path())
+            .expect("plugin host");
+        host.install(source.path().to_str().expect("utf-8 source path"))
+            .expect("install the package");
+        InstalledPackage {
+            host,
+            _source: source,
+            _plugins: plugins,
+        }
+    }
+
+    /// The manifest of package `name` providing `capabilities`, requesting
+    /// `permissions` and declaring `hosts`, with no config schema: one a real
+    /// host admits.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn package_manifest_toml(
+        name: &str,
+        capabilities: &[&str],
+        permissions: &[&str],
+        hosts: &[&str],
+    ) -> String {
+        let quote = |xs: &[&str]| -> String {
+            xs.iter()
+                .map(|x| format!("\"{x}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "name = \"{name}\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [{}]\n\
+             permissions = [{}]\n\
+             [egress]\n\
+             hosts = [{}]\n",
+            quote(capabilities),
+            quote(permissions),
+            quote(hosts)
+        )
+    }
+
+    /// The `[channels.plugin.<alias>]` table saved on disk, if there is one.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn binding_on_disk(path: &std::path::Path, alias: &str) -> Option<toml::Table> {
+        let raw = std::fs::read_to_string(path).expect("config file must exist");
+        let doc: toml::Table = toml::from_str(&raw).expect("saved config must be valid TOML");
+        doc.get("channels")
+            .and_then(toml::Value::as_table)
+            .and_then(|channels| channels.get("plugin"))
+            .and_then(toml::Value::as_table)
+            .and_then(|bindings| bindings.get(alias))
+            .and_then(toml::Value::as_table)
+            .cloned()
+    }
+
+    /// The name of every `[[plugins.entries]]` row saved on disk, in order.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn entry_names_on_disk(path: &std::path::Path) -> Vec<String> {
+        let raw = std::fs::read_to_string(path).expect("config file must exist");
+        let doc: toml::Table = toml::from_str(&raw).expect("saved config must be valid TOML");
+        doc.get("plugins")
+            .and_then(toml::Value::as_table)
+            .and_then(|plugins| plugins.get("entries"))
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("name").and_then(toml::Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The `egress_hosts` a saved row grants; empty when the key is absent.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn granted_on_disk(path: &std::path::Path, key: &str) -> Vec<String> {
+        entry_on_disk(path, key)
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The saved text of the first table headed `header`, through its last
+    /// sub-table and without trailing blank lines: exactly the bytes a save
+    /// that did not touch the table must leave alone.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn table_text(raw: &str, header: &str) -> String {
+        let path = header.trim_matches(|c| c == '[' || c == ']');
+        let nested = [format!("[{path}."), format!("[[{path}.")];
+        let mut lines = raw.lines().skip_while(|line| line.trim() != header);
+        let first = lines
+            .next()
+            .unwrap_or_else(|| panic!("no {header} table in:\n{raw}"));
+        let mut text = vec![first];
+        for line in lines {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('[')
+                && !nested
+                    .iter()
+                    .any(|prefix| trimmed.starts_with(prefix.as_str()))
+            {
+                break;
+            }
+            text.push(line);
+        }
+        while text.last().is_some_and(|line| line.trim().is_empty()) {
+            text.pop();
+        }
+        text.join("\n")
+    }
+
+    /// The binding ceremony under `--egress declared`: `plugin bind` creates
+    /// the `[channels.plugin.<alias>]` binding and the instance's row in one
+    /// save, grants the row exactly the canonical declaration, and prints the
+    /// grant with the command that edits it. A socket-only channel is seeded
+    /// the same way: a channel row counts every governed transport, where the
+    /// default tool binding counts only `http_client`.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_creates_the_binding_and_seeds_the_declaration_on_declared() {
+        use crate::plugins::channel_instance::EgressDecision;
+        use crate::plugins::egress_ceremony::egress_set_command;
+
+        for (package, permission) in [
+            ("chat-bridge", "http_client"),
+            ("irc-bridge", "socket_client"),
+        ] {
+            let installed = install_package(&package_manifest_toml(
+                package,
+                &["channel"],
+                &[permission],
+                &["irc.example.net", "api.example.com"],
+            ));
+            let manifest = installed.host.manifest(package).expect("installed").clone();
+            let key = expected_channel_instance_key(&manifest, "operations");
+            let tmp = tempfile::tempdir().expect("config dir");
+            let mut config = config_in_dir(tmp.path());
+
+            let lines = Box::pin(bind_channel_instance(
+                &mut config,
+                &installed.host,
+                package,
+                "operations",
+                Some(EgressDecision::SeedDeclared),
+            ))
+            .await
+            .expect("bind");
+
+            let binding =
+                binding_on_disk(&config.config_path, "operations").expect("the binding is saved");
+            assert_eq!(
+                binding.get("package").and_then(toml::Value::as_str),
+                Some(package)
+            );
+            assert!(
+                config.channels.plugin["operations"].enabled,
+                "a new binding takes the default, enabled"
+            );
+            assert_eq!(
+                entry_names_on_disk(&config.config_path),
+                vec![key.clone()],
+                "one row, keyed by the instance: {permission}"
+            );
+            assert_eq!(
+                granted_on_disk(&config.config_path, &key),
+                vec!["api.example.com", "irc.example.net"],
+                "the row grants the canonical declaration: {permission}"
+            );
+            assert!(
+                entry_on_disk(&config.config_path, &key)
+                    .get("egress_allow_private")
+                    .and_then(toml::Value::as_array)
+                    .is_none_or(Vec::is_empty),
+                "a private-address carve-out is never seeded"
+            );
+            assert!(config.dirty_paths.is_empty(), "the one save wrote it all");
+
+            assert_eq!(
+                lines[0],
+                ta(
+                    "cli-plugin-channel-bound",
+                    &[("alias", "operations"), ("name", package)],
+                    "",
+                )
+            );
+            assert!(
+                lines.contains(&ta("cli-plugin-config-entry-seeded", &[("name", &key)], "")),
+                "the seeded line names the instance key: {lines:#?}"
+            );
+            let command = egress_set_command(
+                egress_command_config_dir(&config),
+                &key,
+                &["api.example.com".to_string(), "irc.example.net".to_string()],
+            );
+            assert!(
+                lines.iter().any(|line| line.contains(&command)),
+                "the grant is printed with the command that edits it: {lines:#?}"
+            );
+        }
+    }
+
+    /// `--egress none` creates the row with an empty grant, so the instance
+    /// has no network reach, and prints the declaration with the command that
+    /// grants it later. That command resolves against the row the ceremony
+    /// created.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_with_none_creates_the_row_with_an_empty_grant_and_prints_the_grant_command() {
+        use crate::plugins::channel_instance::EgressDecision;
+        use crate::plugins::egress_ceremony::{egress_hosts_path, egress_set_command};
+
+        let installed = install_package(&package_manifest_toml(
+            "irc-bridge",
+            &["channel"],
+            &["socket_client"],
+            &["irc.example.net"],
+        ));
+        let manifest = installed
+            .host
+            .manifest("irc-bridge")
+            .expect("installed")
+            .clone();
+        let key = expected_channel_instance_key(&manifest, "operations");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+
+        let lines = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "irc-bridge",
+            "operations",
+            Some(EgressDecision::Withhold),
+        ))
+        .await
+        .expect("bind");
+
+        assert!(binding_on_disk(&config.config_path, "operations").is_some());
+        assert_eq!(entry_names_on_disk(&config.config_path), vec![key.clone()]);
+        assert!(
+            granted_on_disk(&config.config_path, &key).is_empty(),
+            "--egress none grants nothing"
+        );
+
+        let command = egress_set_command(
+            egress_command_config_dir(&config),
+            &key,
+            &["irc.example.net".to_string()],
+        );
+        assert!(
+            lines.contains(&ta(
+                "cli-plugin-channel-egress-withheld",
+                &[
+                    ("alias", "operations"),
+                    ("hosts", "irc.example.net"),
+                    ("command", &command),
+                ],
+                "",
+            )),
+            "{lines:#?}"
+        );
+
+        config
+            .set_prop(&egress_hosts_path(&key), &printed_command_value(&command))
+            .expect("the printed command addresses the row the ceremony created");
+        assert_eq!(
+            config.plugins.entry_egress(&key).0,
+            vec!["irc.example.net".to_string()]
+        );
+    }
+
+    /// Without a decision, a manifest declaring destinations the new row could
+    /// use is refused before anything is written: no binding, no row, and the
+    /// config file byte-identical. The refusal lists the hosts and both flags.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_refuses_without_a_decision_when_hosts_are_declared_and_writes_nothing() {
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["irc.example.net", "api.example.com"],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let before = std::fs::read(&config.config_path).expect("read config");
+
+        let error = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            None,
+        ))
+        .await
+        .expect_err("a declaration needs a decision");
+
+        assert_eq!(
+            error.to_string(),
+            ta(
+                "cli-plugin-channel-egress-decision-required",
+                &[
+                    ("name", "chat-bridge"),
+                    ("alias", "operations"),
+                    ("count", "2"),
+                    ("hosts", "api.example.com, irc.example.net"),
+                ],
+                "",
+            )
+        );
+        assert!(
+            error.to_string().contains("--egress declared")
+                && error.to_string().contains("--egress none"),
+            "the refusal names both flags: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&config.config_path).expect("read config"),
+            before,
+            "nothing is written"
+        );
+        assert!(
+            config.channels.plugin.is_empty()
+                && config.plugins.entries.is_empty()
+                && config.dirty_paths.is_empty(),
+            "nothing changes in memory either"
+        );
+    }
+
+    /// A repeated ceremony writes nothing: the binding is kept, the row exists,
+    /// and the config file stays byte-identical, whether the flag is repeated
+    /// or omitted, since an existing row needs no decision.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_is_idempotent_a_second_run_leaves_the_config_file_byte_identical() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect("first bind");
+        let after_first = std::fs::read(&config.config_path).expect("read config");
+
+        for decision in [Some(EgressDecision::SeedDeclared), None] {
+            let lines = Box::pin(bind_channel_instance(
+                &mut config,
+                &installed.host,
+                "chat-bridge",
+                "operations",
+                decision,
+            ))
+            .await
+            .expect("repeat bind");
+            assert_eq!(
+                lines[0],
+                ta(
+                    "cli-plugin-channel-binding-kept",
+                    &[("alias", "operations"), ("name", "chat-bridge")],
+                    "",
+                ),
+                "{decision:?}"
+            );
+            assert_eq!(
+                std::fs::read(&config.config_path).expect("read config"),
+                after_first,
+                "a repeated run writes nothing: {decision:?}"
+            );
+        }
+        assert_eq!(config.channels.plugin.len(), 1, "one binding");
+        assert_eq!(config.plugins.entries.len(), 1, "one row");
+    }
+
+    /// Repair, without touching what exists. A row whose binding was removed
+    /// gets the binding back, and the row, an encrypted config value and a TLS
+    /// profile included, keeps its exact bytes. A binding made with `config
+    /// set`, which has no row, gets its row, and keeps its exact bytes.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_repairs_a_binding_that_has_no_row_and_a_row_that_has_no_binding_without_touching_their_bytes()
+     {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(
+            r#"name = "irc-bridge"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["channel"]
+permissions = ["socket_client", "config_read"]
+
+[config_schema]
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.ca_bundle]
+type = "string"
+x-secret = true
+
+[egress]
+hosts = ["irc.example.net"]
+"#,
+        );
+        let manifest = installed
+            .host
+            .manifest("irc-bridge")
+            .expect("installed")
+            .clone();
+        let operations_key = expected_channel_instance_key(&manifest, "operations");
+        let support_key = expected_channel_instance_key(&manifest, "support");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+
+        // `operations`: a row whose binding is gone.
+        config
+            .plugins
+            .entries
+            .push(crate::config::schema::PluginEntryConfig {
+                name: operations_key.clone(),
+                config: std::collections::HashMap::from([(
+                    "ca_bundle".to_string(),
+                    "not a real certificate".to_string(),
+                )]),
+                egress_hosts: vec!["irc.example.net".to_string()],
+                egress_allow_private: Vec::new(),
+                tls_profiles: vec![crate::config::schema::PluginTlsProfileConfig {
+                    name: "corp".to_string(),
+                    hosts: vec!["irc.example.net".to_string()],
+                    system_roots: true,
+                    custom_ca_secret: Some("ca_bundle".to_string()),
+                    client_certificate_secret: None,
+                    client_private_key_secret: None,
+                }],
+            });
+        config.mark_dirty(&format!("plugins.entries.{operations_key}"));
+        // `support`: a binding with no row.
+        bind_channel_alias(&mut config, "support", "irc-bridge", true);
+        config.mark_dirty("channels.plugin.support");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("write the starting config");
+        let before = std::fs::read_to_string(&config.config_path).expect("read config");
+        assert!(
+            before.contains("enc2:") && before.contains("corp"),
+            "premise: the row holds an encrypted value and a TLS profile:\n{before}"
+        );
+        let row_before = table_text(&before, "[[plugins.entries]]");
+        let binding_before = table_text(&before, "[channels.plugin.support]");
+
+        Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "irc-bridge",
+            "operations",
+            None,
+        ))
+        .await
+        .expect("an existing row needs no decision");
+        Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "irc-bridge",
+            "support",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect("the missing row is created");
+
+        let after = std::fs::read_to_string(&config.config_path).expect("read config");
+        assert_eq!(
+            table_text(&after, "[[plugins.entries]]"),
+            row_before,
+            "the existing row keeps its bytes:\n{after}"
+        );
+        assert_eq!(
+            table_text(&after, "[channels.plugin.support]"),
+            binding_before,
+            "the existing binding keeps its bytes:\n{after}"
+        );
+        assert_eq!(
+            binding_on_disk(&config.config_path, "operations")
+                .and_then(|binding| binding.get("package").cloned()),
+            Some(toml::Value::String("irc-bridge".to_string())),
+            "the missing binding is created"
+        );
+        assert_eq!(
+            entry_names_on_disk(&config.config_path),
+            vec![operations_key, support_key.clone()],
+            "one row per instance, no duplicate"
+        );
+        assert_eq!(
+            granted_on_disk(&config.config_path, &support_key),
+            vec!["irc.example.net"]
+        );
+    }
+
+    /// An existing row is never extended, whatever the flags: a script that
+    /// always passes `--egress declared` cannot widen a grant. The row keeps
+    /// its empty grant, the declaration difference is printed with the command
+    /// that applies it, and the flag is reported as not applied.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_never_extends_an_existing_row_even_with_declared() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let manifest = installed
+            .host
+            .manifest("chat-bridge")
+            .expect("installed")
+            .clone();
+        let key = expected_channel_instance_key(&manifest, "operations");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        config
+            .plugins
+            .entries
+            .push(crate::config::schema::PluginEntryConfig {
+                name: key.clone(),
+                config: std::collections::HashMap::new(),
+                egress_hosts: Vec::new(),
+                egress_allow_private: Vec::new(),
+                tls_profiles: Vec::new(),
+            });
+        config.mark_dirty(&format!("plugins.entries.{key}"));
+        Box::pin(config.save_dirty())
+            .await
+            .expect("write the starting config");
+
+        let lines = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect("bind");
+
+        assert!(
+            config.plugins.entry_egress(&key).0.is_empty(),
+            "the existing grant stays empty"
+        );
+        assert!(granted_on_disk(&config.config_path, &key).is_empty());
+        let name = "chat-bridge (plugin.operations)";
+        for expected in [
+            format!(
+                "  {}",
+                ta(
+                    "cli-plugin-egress-added",
+                    &[("host", "api.example.com")],
+                    ""
+                )
+            ),
+            ta("cli-plugin-egress-never-extended", &[("name", name)], ""),
+            ta(
+                "cli-plugin-channel-egress-flag-ignored",
+                &[("alias", "operations")],
+                "",
+            ),
+        ] {
+            assert!(
+                lines.contains(&expected),
+                "missing {expected:?}: {lines:#?}"
+            );
+        }
+        assert!(
+            !lines.contains(&ta("cli-plugin-config-entry-seeded", &[("name", &key)], "")),
+            "nothing was seeded: {lines:#?}"
+        );
+    }
+
+    /// Another package's alias is never taken over: the refusal names the
+    /// owner, and config, in memory and on disk, is left as it was.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_refuses_an_alias_owned_by_another_package_and_changes_nothing() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        bind_channel_alias(&mut config, "operations", "other-bridge", true);
+        config.mark_dirty("channels.plugin.operations");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("write the starting config");
+        let before = std::fs::read(&config.config_path).expect("read config");
+
+        let error = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect_err("another package's alias is refused");
+
+        assert_eq!(
+            error.to_string(),
+            ta(
+                "cli-plugin-channel-alias-owned",
+                &[
+                    ("alias", "operations"),
+                    ("owner", "other-bridge"),
+                    ("name", "chat-bridge"),
+                ],
+                "",
+            )
+        );
+        assert_eq!(
+            std::fs::read(&config.config_path).expect("read config"),
+            before
+        );
+        assert_eq!(config.channels.plugin["operations"].package, "other-bridge");
+        assert!(config.plugins.entries.is_empty() && config.dirty_paths.is_empty());
+    }
+
+    /// A section the loader dropped is never written over. A malformed
+    /// `plugins`, `channels`, `channels.plugin` or alias table, or a config
+    /// that failed to load at all, refuses the ceremony before any write; a
+    /// dropped table of another alias does not.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_refuses_a_degraded_plugins_or_channels_section() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+
+        for (security, section) in [
+            (false, "plugins"),
+            (false, "channels"),
+            (false, "channels.plugin"),
+            (false, "channels.plugin.operations"),
+            (true, crate::config::migration::WHOLE_CONFIG_SENTINEL),
+        ] {
+            let tmp = tempfile::tempdir().expect("config dir");
+            let mut config = config_in_dir(tmp.path());
+            if security {
+                config.degraded_security.push(section.to_string());
+            } else {
+                config.degraded_sections.push(section.to_string());
+            }
+            let before = std::fs::read(&config.config_path).expect("read config");
+
+            let error = Box::pin(bind_channel_instance(
+                &mut config,
+                &installed.host,
+                "chat-bridge",
+                "operations",
+                Some(EgressDecision::SeedDeclared),
+            ))
+            .await
+            .expect_err("a degraded section refuses the ceremony");
+
+            assert_eq!(
+                error.to_string(),
+                ta(
+                    "cli-plugin-channel-config-degraded",
+                    &[("alias", "operations"), ("section", section)],
+                    "",
+                )
+            );
+            assert_eq!(
+                std::fs::read(&config.config_path).expect("read config"),
+                before,
+                "{section}: nothing is written"
+            );
+            assert!(
+                config.channels.plugin.is_empty() && config.plugins.entries.is_empty(),
+                "{section}: nothing changes in memory"
+            );
+        }
+
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        config
+            .degraded_sections
+            .push("channels.plugin.support".to_string());
+        Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect("another alias's dropped table does not block this binding");
+        assert!(binding_on_disk(&config.config_path, "operations").is_some());
+    }
+
+    /// Instances never read each other's rows. Alias `operations` holds an
+    /// operator-authored grant and the mixed package's tool row another;
+    /// binding `support` grants the new row the manifest's declaration and
+    /// nothing else, and leaves both other rows as they were.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_seeds_alias_b_from_the_manifest_only_never_from_alias_a_or_the_tool_row() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["tool", "channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let manifest = installed
+            .host
+            .manifest("chat-bridge")
+            .expect("installed")
+            .clone();
+        let tool_key = expected_instance_key(&manifest);
+        let operations_key = expected_channel_instance_key(&manifest, "operations");
+        let support_key = expected_channel_instance_key(&manifest, "support");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let row = |name: &str, hosts: &[&str]| crate::config::schema::PluginEntryConfig {
+            name: name.to_string(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        };
+        config.plugins.entries = vec![
+            row(&tool_key, &["tool.example.net"]),
+            row(&operations_key, &["api.example.com", "gitea.a.example.net"]),
+        ];
+        bind_channel_alias(&mut config, "operations", "chat-bridge", true);
+
+        Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "support",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect("bind support");
+
+        assert_eq!(
+            config.plugins.entry_egress(&support_key).0,
+            vec!["api.example.com".to_string()],
+            "the new row gets the declaration only"
+        );
+        assert_eq!(
+            granted_on_disk(&config.config_path, &support_key),
+            vec!["api.example.com"]
+        );
+        assert_eq!(
+            config.plugins.entry_egress(&operations_key).0,
+            vec![
+                "api.example.com".to_string(),
+                "gitea.a.example.net".to_string()
+            ],
+            "alias A's grant is untouched"
+        );
+        assert_eq!(
+            config.plugins.entry_egress(&tool_key).0,
+            vec!["tool.example.net".to_string()],
+            "the tool row's grant is untouched"
+        );
+    }
+
+    /// The required keys, in schema order: a missing secret and a missing
+    /// plain key each get the exact `config set` command, which prompts for
+    /// the value rather than taking it on the command line; a publisher's
+    /// hostile property name gets no command, only the row to edit. Once set,
+    /// each key reads `set` and no value is ever printed.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_prints_required_keys_with_commands_only_for_addressable_names_and_never_values() {
+        use crate::plugins::channel_instance::config_set_command_for;
+        use crate::plugins::egress_ceremony::ShellDialect;
+
+        let installed = install_package(
+            r#"name = "chat-bridge"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["channel"]
+permissions = ["socket_client", "config_read"]
+
+[config_schema]
+type = "object"
+additionalProperties = false
+required = ["api_token", "label", "$(id)"]
+
+[config_schema.properties.api_token]
+type = "string"
+x-secret = true
+
+[config_schema.properties.label]
+type = "string"
+
+[config_schema.properties."$(id)"]
+type = "string"
+"#,
+        );
+        let manifest = installed
+            .host
+            .manifest("chat-bridge")
+            .expect("installed")
+            .clone();
+        let key = expected_channel_instance_key(&manifest, "operations");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+
+        let lines = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            None,
+        ))
+        .await
+        .expect("nothing is declared, so no decision is needed");
+
+        let command_for = |name: &str| {
+            config_set_command_for(
+                ShellDialect::host(),
+                egress_command_config_dir(&config),
+                &format!("plugins.entries.{key}.config.{name}"),
+                None,
+            )
+        };
+        let expected = [
+            ta(
+                "cli-plugin-channel-required-config",
+                &[("alias", "operations"), ("count", "3")],
+                "",
+            ),
+            format!(
+                "  {}",
+                ta(
+                    "cli-plugin-channel-required-secret-missing",
+                    &[("key", "api_token"), ("command", &command_for("api_token"))],
+                    "",
+                )
+            ),
+            format!(
+                "  {}",
+                ta(
+                    "cli-plugin-channel-required-key-missing",
+                    &[("key", "label"), ("command", &command_for("label"))],
+                    "",
+                )
+            ),
+            format!(
+                "  {}",
+                ta(
+                    "cli-plugin-channel-required-key-unaddressable",
+                    &[("key", "$(id)"), ("row", &key)],
+                    "",
+                )
+            ),
+        ];
+        let at = lines
+            .iter()
+            .position(|line| line == &expected[0])
+            .unwrap_or_else(|| panic!("the required keys are listed: {lines:#?}"));
+        assert_eq!(&lines[at..at + expected.len()], &expected, "{lines:#?}");
+        assert!(
+            !lines.iter().any(|line| line.contains("config.$(id)")),
+            "a hostile property name never reaches a command: {lines:#?}"
+        );
+
+        let values = [
+            ("api_token", "SECRET-VALUE-4f1d"),
+            ("label", "LABEL-VALUE-8c2e"),
+            ("$(id)", "HOSTILE-VALUE-6b3a"),
+        ];
+        let entry = config
+            .plugins
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == key)
+            .expect("the ceremony created the row");
+        for (name, value) in values {
+            entry.config.insert(name.to_string(), value.to_string());
+        }
+        let lines = channel_instance_readiness_lines(
+            &config,
+            &installed.host,
+            installed.host.manifest("chat-bridge").expect("installed"),
+            "operations",
+        );
+        for (name, _) in values {
+            assert!(
+                lines.contains(&format!(
+                    "  {}",
+                    ta("cli-plugin-channel-required-key-set", &[("key", name)], "")
+                )),
+                "{name} reads set: {lines:#?}"
+            );
+        }
+        assert!(
+            lines.contains(&ta(
+                "cli-plugin-channel-config-valid",
+                &[("alias", "operations")],
+                "",
+            )),
+            "the runtime's resolver accepts the row: {lines:#?}"
+        );
+        for (_, value) in values {
+            assert!(
+                !lines.iter().any(|line| line.contains(value)),
+                "no value is ever printed: {lines:#?}"
+            );
+        }
+    }
+
+    /// The activation line is the runtime's own verdict on the binding, one
+    /// unmet precondition at a time, each naming what supplies it. The
+    /// ceremony itself enables nothing and edits no agent.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn readiness_reports_the_runtime_verdict_for_each_unmet_precondition() {
+        use crate::plugins::channel_instance::config_set_command_for;
+        use crate::plugins::egress_ceremony::ShellDialect;
+
+        let installed = install_package(&package_manifest_toml(
+            "irc-bridge",
+            &["channel"],
+            &["socket_client"],
+            &[],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let lines = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "irc-bridge",
+            "operations",
+            None,
+        ))
+        .await
+        .expect("bind");
+        let config_dir = egress_command_config_dir(&config).to_path_buf();
+        let enable_plugins = config_set_command_for(
+            ShellDialect::host(),
+            &config_dir,
+            "plugins.enabled",
+            Some("true"),
+        );
+        assert!(
+            lines.contains(&ta(
+                "cli-plugin-channel-activation-plugins-disabled",
+                &[("alias", "operations"), ("command", &enable_plugins)],
+                "",
+            )),
+            "{lines:#?}"
+        );
+        assert!(
+            !config.plugins.enabled && config.agents.is_empty(),
+            "the ceremony never enables the plugin system or edits an agent"
+        );
+
+        let manifest = installed.host.manifest("irc-bridge").expect("installed");
+        let readiness = |config: &crate::config::schema::Config| {
+            channel_instance_readiness_lines(config, &installed.host, manifest, "operations")
+        };
+
+        config.plugins.enabled = true;
+        assert!(
+            readiness(&config).contains(&ta(
+                "cli-plugin-channel-activation-no-owner",
+                &[("alias", "operations")],
+                "",
+            )),
+            "{:#?}",
+            readiness(&config)
+        );
+
+        config.agents.insert(
+            "operator".to_string(),
+            crate::config::schema::AliasedAgentConfig {
+                channels: vec![crate::config::providers::ChannelRef::new(
+                    "plugin.operations",
+                )],
+                ..crate::config::schema::AliasedAgentConfig::default()
+            },
+        );
+        config.plugins.max_active_instances = 0;
+        assert!(
+            readiness(&config).contains(&ta(
+                "cli-plugin-channel-activation-over-ceiling",
+                &[("alias", "operations")],
+                "",
+            )),
+            "{:#?}",
+            readiness(&config)
+        );
+
+        config.plugins.max_active_instances = 50;
+        if let Some(binding) = config.channels.plugin.get_mut("operations") {
+            binding.enabled = false;
+        }
+        let enable_binding = config_set_command_for(
+            ShellDialect::host(),
+            &config_dir,
+            "channels.plugin.operations.enabled",
+            Some("true"),
+        );
+        assert!(
+            readiness(&config).contains(&ta(
+                "cli-plugin-channel-activation-binding-disabled",
+                &[("alias", "operations"), ("command", &enable_binding)],
+                "",
+            )),
+            "{:#?}",
+            readiness(&config)
+        );
+    }
+
+    /// With every precondition met the instance is reported ready, the
+    /// declaration the ceremony granted leaves no egress gap, and the note
+    /// that a running daemon needs a restart or reload closes the report.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn readiness_reports_ready_when_every_precondition_holds() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "irc-bridge",
+            &["channel"],
+            &["socket_client"],
+            &["irc.example.net"],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        config.plugins.enabled = true;
+        config.agents.insert(
+            "operator".to_string(),
+            crate::config::schema::AliasedAgentConfig {
+                channels: vec![crate::config::providers::ChannelRef::new(
+                    "plugin.operations",
+                )],
+                ..crate::config::schema::AliasedAgentConfig::default()
+            },
+        );
+
+        let lines = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "irc-bridge",
+            "operations",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect("bind");
+
+        assert!(
+            lines.contains(&ta(
+                "cli-plugin-channel-permissions",
+                &[("alias", "operations"), ("permissions", "socket_client")],
+                "",
+            )),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.contains(&ta(
+                "cli-plugin-channel-activation-ready",
+                &[("alias", "operations")],
+                "",
+            )),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines.last(),
+            Some(&ta(
+                "cli-plugin-channel-restart-note",
+                &[("alias", "operations")],
+                "",
+            )),
+            "the restart note closes the report"
+        );
+        let manifest = installed.host.manifest("irc-bridge").expect("installed");
+        assert!(
+            egress_grant_gap_lines(&config, manifest)
+                .expect("gap lines must build")
+                .is_empty(),
+            "`plugin list` agrees: the granted declaration leaves no gap"
+        );
     }
 
     /// Install still seeds the default tool binding's row alone. An alias bound

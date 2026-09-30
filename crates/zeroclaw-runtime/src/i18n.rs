@@ -1476,27 +1476,39 @@ mod tests {
         }
     }
 
-    /// The channel instance lines of `plugin info` and `plugin remove`.
+    /// The channel instance lines of `plugin info`, `plugin remove`,
+    /// `plugin bind` and `plugin install --channel-alias`: the binding
+    /// ceremony's outcome and refusals, and the readiness report.
     ///
-    /// Both name a `[channels.plugin.<alias>]` binding the operator has to find
-    /// in their config file, so every catalogue must keep the binding in its
-    /// config spelling, `plugin.<alias>`, next to the key or package it is
-    /// about, and the removal line must keep the `[channels.plugin.<alias>]`
-    /// table it tells the operator to delete. A catalogue that omits a key
-    /// ships the raw `{key}` sentinel, and one that copies English ships an
-    /// untranslated line; both fail here.
+    /// Every one names a `[channels.plugin.<alias>]` binding, a config path,
+    /// a flag or a command the operator has to find or run, so every
+    /// catalogue must keep those literal: the binding in its config spelling,
+    /// `plugin.<alias>`, the `[channels.plugin.<alias>]` table and the
+    /// `[[plugins.entries]]` row, the `--egress` flags, the config paths, and
+    /// the printed command whole. A catalogue that omits a key ships the raw
+    /// `{key}` sentinel, and one that copies English ships an untranslated
+    /// line; both fail here.
     #[test]
     fn plugin_channel_instance_cli_strings_are_translated_in_every_locale() {
         const ALIAS: &str = "operations";
         const KEY: &str = "zpi1_fixture";
         const PACKAGE: &str = "chat-bridge";
+        const OWNER: &str = "other-bridge";
         const BINDING: &str = "plugin.operations";
         const TABLE: &str = "[channels.plugin.operations]";
+        const ROW: &str = "[[plugins.entries]]";
+        const GRANTS: &str = "api.example.com; private: 10.0.0.5";
+        const HOSTS: &str = "api.example.com, irc.example.net";
+        const PERMISSIONS: &str = "http_client, config_read";
+        const PROPERTY: &str = "api_token";
+        const REASON: &str = "alias 'Ops' must start with a lowercase letter or digit";
+        const ERROR: &str = "plugin 'chat-bridge' config violates config_schema at '/required'";
+        const COMMAND: &str = "zeroclaw --config-dir '/srv/zc' config set 'plugins.enabled' 'true'";
 
         /// One parity case: the Fluent key, its arguments, and the substrings
         /// every locale's rendering must contain.
         type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
-        let cases: [ParityCase; 2] = [
+        let cases: [ParityCase; 33] = [
             (
                 "cli-plugin-config-entry-key-channel",
                 &[("alias", ALIAS), ("key", KEY)],
@@ -1506,6 +1518,178 @@ mod tests {
                 "cli-plugin-removed-binding-kept",
                 &[("name", PACKAGE), ("alias", ALIAS)],
                 &[BINDING, TABLE, PACKAGE],
+            ),
+            (
+                "cli-plugin-removed-channel-grant-kept",
+                &[
+                    ("name", PACKAGE),
+                    ("alias", ALIAS),
+                    ("key", KEY),
+                    ("grants", GRANTS),
+                ],
+                &[BINDING, KEY, GRANTS, PACKAGE, ROW],
+            ),
+            (
+                "cli-plugin-channel-bound",
+                &[("alias", ALIAS), ("name", PACKAGE)],
+                &[BINDING, PACKAGE],
+            ),
+            (
+                "cli-plugin-channel-binding-kept",
+                &[("alias", ALIAS), ("name", PACKAGE)],
+                &[BINDING, PACKAGE],
+            ),
+            (
+                "cli-plugin-channel-not-provided",
+                &[("name", PACKAGE), ("alias", ALIAS)],
+                &[PACKAGE, BINDING],
+            ),
+            (
+                "cli-plugin-channel-invalid-alias",
+                &[("alias", "Ops"), ("reason", REASON)],
+                &["Ops", REASON],
+            ),
+            (
+                "cli-plugin-channel-alias-owned",
+                &[("alias", ALIAS), ("owner", OWNER), ("name", PACKAGE)],
+                &[BINDING, OWNER, PACKAGE, TABLE],
+            ),
+            (
+                "cli-plugin-channel-config-degraded",
+                &[("alias", ALIAS), ("section", "channels.plugin")],
+                &[BINDING, "[channels.plugin]"],
+            ),
+            (
+                "cli-plugin-channel-egress-decision-required",
+                &[
+                    ("name", PACKAGE),
+                    ("alias", ALIAS),
+                    ("count", "2"),
+                    ("hosts", HOSTS),
+                ],
+                &[
+                    PACKAGE,
+                    BINDING,
+                    "2",
+                    HOSTS,
+                    "`--egress declared`",
+                    "`--egress none`",
+                ],
+            ),
+            (
+                "cli-plugin-channel-egress-withheld",
+                &[("alias", ALIAS), ("hosts", HOSTS), ("command", COMMAND)],
+                &[BINDING, "--egress none", HOSTS, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-egress-nothing-declared",
+                &[("name", PACKAGE), ("alias", ALIAS), ("command", COMMAND)],
+                &[PACKAGE, BINDING, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-egress-flag-ignored",
+                &[("alias", ALIAS)],
+                &["--egress", BINDING],
+            ),
+            (
+                "cli-plugin-channel-permissions",
+                &[("alias", ALIAS), ("permissions", PERMISSIONS)],
+                &[BINDING, PERMISSIONS],
+            ),
+            (
+                "cli-plugin-channel-permissions-none",
+                &[("alias", ALIAS)],
+                &[BINDING],
+            ),
+            (
+                "cli-plugin-channel-row-missing",
+                &[("alias", ALIAS), ("command", COMMAND)],
+                &[BINDING, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-required-config",
+                &[("alias", ALIAS), ("count", "3")],
+                &[BINDING, "3"],
+            ),
+            (
+                "cli-plugin-channel-required-key-set",
+                &[("key", PROPERTY)],
+                &[PROPERTY],
+            ),
+            (
+                "cli-plugin-channel-required-key-missing",
+                &[("key", PROPERTY), ("command", COMMAND)],
+                &[PROPERTY, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-required-secret-missing",
+                &[("key", PROPERTY), ("command", COMMAND)],
+                &[PROPERTY, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-required-key-unaddressable",
+                &[("key", "$(id)"), ("row", KEY)],
+                &["$(id)", KEY, ROW],
+            ),
+            (
+                "cli-plugin-channel-config-invalid",
+                &[("alias", ALIAS), ("error", ERROR)],
+                &[BINDING, ERROR],
+            ),
+            (
+                "cli-plugin-channel-config-valid",
+                &[("alias", ALIAS)],
+                &[BINDING],
+            ),
+            (
+                "cli-plugin-channel-activation-ready",
+                &[("alias", ALIAS)],
+                &[BINDING],
+            ),
+            (
+                "cli-plugin-channel-activation-plugins-disabled",
+                &[("alias", ALIAS), ("command", COMMAND)],
+                &[BINDING, "plugins.enabled", COMMAND],
+            ),
+            (
+                "cli-plugin-channel-activation-binding-disabled",
+                &[("alias", ALIAS), ("command", COMMAND)],
+                &[BINDING, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-activation-no-owner",
+                &[("alias", ALIAS)],
+                &[BINDING, "`channels`", "agents.<agent>.channels"],
+            ),
+            (
+                "cli-plugin-channel-activation-over-ceiling",
+                &[("alias", ALIAS)],
+                &[BINDING, "plugins.max_active_instances"],
+            ),
+            (
+                "cli-plugin-channel-activation-package-missing",
+                &[("alias", ALIAS), ("name", PACKAGE)],
+                &[BINDING, PACKAGE],
+            ),
+            (
+                "cli-plugin-channel-activation-not-a-channel",
+                &[("alias", ALIAS), ("name", PACKAGE)],
+                &[BINDING, PACKAGE],
+            ),
+            (
+                "cli-plugin-channel-activation-plan-failed",
+                &[("alias", ALIAS), ("error", ERROR)],
+                &[BINDING, ERROR],
+            ),
+            (
+                "cli-plugin-channel-restart-note",
+                &[("alias", ALIAS)],
+                &[BINDING],
+            ),
+            (
+                "cli-plugin-channel-bind-hint",
+                &[("name", PACKAGE), ("command", COMMAND)],
+                &[PACKAGE, COMMAND],
             ),
         ];
 

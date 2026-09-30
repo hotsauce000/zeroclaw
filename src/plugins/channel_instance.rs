@@ -13,13 +13,25 @@
 //! same binding through, so a key the CLI prints is the key the runtime
 //! resolves.
 //!
+//! The binding ceremony's decisions live here too: [`plan_channel_binding`]
+//! decides, without writing anything, whether an alias can be bound and what
+//! the binding and its row need, and [`apply_channel_binding`] carries a plan
+//! out on a `Config` for the caller's one save.
+//!
 //! Like `egress_ceremony`, this module owns only decisions; every user-facing
 //! string stays in the CLI so it routes through Fluent.
 
-use zeroclaw_config::schema::Config;
+use std::path::Path;
+
+use serde_json::Value;
+use zeroclaw_config::schema::{Config, PluginEntryConfig};
 use zeroclaw_plugins::error::PluginError;
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use super::egress_ceremony::{
+    ShellDialect, canonical_hosts, egress_hosts_path, zeroclaw_invocation_for,
+};
 
 /// The composite channel family of explicit `[channels.plugin.<alias>]`
 /// bindings: a bound instance registers as the channel `plugin.<alias>`.
@@ -199,15 +211,35 @@ pub fn instance_rows(
     }
     if manifest.capabilities.contains(&PluginCapability::Channel) {
         for alias in bound_channel_aliases(config, &manifest.name) {
-            let key = channel_instance_key(manifest, &alias)?;
-            rows.push(PluginInstanceRow {
-                capability: PluginCapability::Channel,
-                binding: alias,
-                key,
-            });
+            rows.extend(channel_instance_row(manifest, &alias)?);
         }
     }
     Ok(rows)
+}
+
+/// The row the channel instance `alias` makes of `manifest`'s package owns,
+/// or `None` when such an instance owns no host state
+/// ([`manifest_owns_instance_state`]).
+///
+/// This does not ask whether a binding exists: [`instance_rows`] enumerates
+/// bound aliases, and the binding ceremony plans the row of an alias it is
+/// about to bind.
+///
+/// # Errors
+///
+/// A key derivation failure, as [`channel_instance_key`] reports it.
+pub fn channel_instance_row(
+    manifest: &PluginManifest,
+    alias: &str,
+) -> Result<Option<PluginInstanceRow>, PluginError> {
+    if !manifest_owns_instance_state(manifest) {
+        return Ok(None);
+    }
+    Ok(Some(PluginInstanceRow {
+        capability: PluginCapability::Channel,
+        binding: alias.to_string(),
+        key: channel_instance_key(manifest, alias)?,
+    }))
 }
 
 /// Whether `row`'s instance holds a transport that can reach a declared
@@ -250,4 +282,415 @@ pub fn declared_hosts_for_row(manifest: &PluginManifest, row: &PluginInstanceRow
     } else {
         Vec::new()
     }
+}
+
+/// The operator's decision on the destinations a channel instance's manifest
+/// declares.
+///
+/// It takes effect only when the binding ceremony creates the instance's row,
+/// and the grant it writes there is the record of the decision. A row that
+/// already exists is never extended, whatever the decision says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressDecision {
+    /// Grant the declared destinations, in canonical form, on the new row.
+    SeedDeclared,
+    /// Create the row with an empty grant: no network reach until the operator
+    /// grants some.
+    Withhold,
+}
+
+/// Why the binding ceremony refuses an alias. Every refusal is decided before
+/// anything is written, so a refused ceremony leaves config as it found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingRefusal {
+    /// The manifest does not declare the `channel` capability.
+    NotAChannelPackage,
+    /// The alias fails the config alias grammar. Carries the grammar's own
+    /// message.
+    InvalidAlias(String),
+    /// The loader dropped a section the ceremony would write into, or the
+    /// whole config, because it is malformed on disk. Carries the section as
+    /// the loader recorded it. Writing now would put the salvaged defaults
+    /// over what the operator wrote.
+    DegradedConfig { section: String },
+    /// The alias is bound to another package. The ceremony never rewrites a
+    /// binding's `package`.
+    AliasOwnedByOtherPackage { owner: String },
+    /// The row would be created and its manifest declares destinations the
+    /// row can use, but no decision was given. Carries that declaration in
+    /// canonical form, the list `--egress declared` would grant.
+    EgressDecisionRequired { declared: Vec<String> },
+}
+
+/// What the ceremony does to the `[[plugins.entries]]` row of the instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowPlan {
+    /// The instance's `zpi1_` config entry key.
+    pub key: String,
+    /// Whether the ceremony creates the row. `false` when it already exists,
+    /// and then nothing about the row is written.
+    pub create: bool,
+    /// The canonical hosts to grant on the new row. Non-empty only when the
+    /// row is created and the decision is [`EgressDecision::SeedDeclared`].
+    pub seed: Vec<String>,
+    /// The destinations the manifest declares for this row, as
+    /// [`declared_hosts_for_row`] gives them.
+    pub declared: Vec<String>,
+    /// An egress decision was given, but the row exists, so it was not
+    /// applied.
+    pub decision_ignored: bool,
+}
+
+/// What binding `alias` to a package writes, decided from live config and the
+/// package's manifest by [`plan_channel_binding`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelBindingPlan {
+    /// The alias being bound: the instance is routed as `plugin.<alias>`.
+    pub alias: String,
+    /// Whether the ceremony creates `[channels.plugin.<alias>]`. `false` when
+    /// the binding already names this package, and then it is left exactly
+    /// as it is, `enabled = false` included.
+    pub create_binding: bool,
+    /// The instance's row, or `None` when the instance owns no host state.
+    pub row: Option<RowPlan>,
+}
+
+impl ChannelBindingPlan {
+    /// Whether applying the plan writes anything. A plan that finds the
+    /// binding and its row already in place writes nothing, so a repeated
+    /// ceremony leaves the config file byte-identical.
+    #[must_use]
+    pub fn writes_config(&self) -> bool {
+        self.create_binding || self.row.as_ref().is_some_and(|row| row.create)
+    }
+}
+
+/// Decide whether `alias` can be bound to `manifest`'s package, and what the
+/// binding and the instance's row need. Pure: nothing is written.
+///
+/// The checks run in this order and stop at the first refusal:
+///
+/// 1. The manifest declares the `channel` capability.
+/// 2. The alias passes the config alias grammar.
+/// 3. The loader dropped none of the sections the ceremony writes into: the
+///    whole config, `plugins`, `channels`, `channels.plugin`, or the alias's
+///    own table. The ceremony never writes over a section the loader could
+///    not read.
+/// 4. An absent binding is created; one that names this package is kept as
+///    it is; one that names another package is refused.
+/// 5. An instance that owns no host state gets no row. An existing row is left
+///    untouched, and a decision given for it is reported as not applied. An
+///    absent row is created: when the manifest declares destinations the row
+///    can use, `egress` decides whether the new row grants them, and without
+///    a decision the ceremony refuses; with nothing declared the row starts
+///    with an empty grant and no decision is needed.
+///
+/// # Errors
+///
+/// The first [`BindingRefusal`] the checks reach.
+pub fn plan_channel_binding(
+    config: &Config,
+    manifest: &PluginManifest,
+    alias: &str,
+    egress: Option<EgressDecision>,
+) -> Result<ChannelBindingPlan, BindingRefusal> {
+    if !manifest.capabilities.contains(&PluginCapability::Channel) {
+        return Err(BindingRefusal::NotAChannelPackage);
+    }
+    zeroclaw_config::helpers::validate_alias_key(alias).map_err(BindingRefusal::InvalidAlias)?;
+    if let Some(section) = degraded_binding_section(config, alias) {
+        return Err(BindingRefusal::DegradedConfig { section });
+    }
+
+    let create_binding = match config.channels.plugin.get(alias) {
+        None => true,
+        Some(binding) if binding.package == manifest.name => false,
+        Some(binding) => {
+            return Err(BindingRefusal::AliasOwnedByOtherPackage {
+                owner: binding.package.clone(),
+            });
+        }
+    };
+
+    // The alias grammar is stricter than the instance identity rules and the
+    // package is one the host admitted, so this derivation does not fail in
+    // practice. If the identity rules ever reject the binding, the refusal
+    // is the alias's, with the constructor's own message.
+    let row = channel_instance_row(manifest, alias)
+        .map_err(|error| BindingRefusal::InvalidAlias(error.to_string()))?
+        .map(|row| plan_row(config, manifest, &row, egress))
+        .transpose()?;
+
+    Ok(ChannelBindingPlan {
+        alias: alias.to_string(),
+        create_binding,
+        row,
+    })
+}
+
+/// Step 5 of [`plan_channel_binding`] for an instance that owns a row.
+fn plan_row(
+    config: &Config,
+    manifest: &PluginManifest,
+    row: &PluginInstanceRow,
+    egress: Option<EgressDecision>,
+) -> Result<RowPlan, BindingRefusal> {
+    let declared = declared_hosts_for_row(manifest, row);
+    if config
+        .plugins
+        .entries
+        .iter()
+        .any(|entry| entry.name == row.key)
+    {
+        return Ok(RowPlan {
+            key: row.key.clone(),
+            create: false,
+            seed: Vec::new(),
+            declared,
+            decision_ignored: egress.is_some(),
+        });
+    }
+    let seed = if declared.is_empty() {
+        Vec::new()
+    } else {
+        match egress {
+            Some(EgressDecision::SeedDeclared) => canonical_hosts(&declared),
+            Some(EgressDecision::Withhold) => Vec::new(),
+            None => {
+                return Err(BindingRefusal::EgressDecisionRequired {
+                    declared: canonical_hosts(&declared),
+                });
+            }
+        }
+    };
+    Ok(RowPlan {
+        key: row.key.clone(),
+        create: true,
+        seed,
+        declared,
+        decision_ignored: false,
+    })
+}
+
+/// The section the loader dropped, if any, that binding `alias` would write
+/// into, as `degraded_security` or `degraded_sections` records it.
+fn degraded_binding_section(config: &Config, alias: &str) -> Option<String> {
+    let own_table = format!("channels.plugin.{alias}");
+    let written = [
+        zeroclaw_config::migration::WHOLE_CONFIG_SENTINEL,
+        "plugins",
+        "channels",
+        "channels.plugin",
+        own_table.as_str(),
+    ];
+    config
+        .degraded_security
+        .iter()
+        .chain(&config.degraded_sections)
+        .find(|section| written.contains(&section.as_str()))
+        .cloned()
+}
+
+/// Carry out `plan` on `config` for `package`, marking every path it writes
+/// dirty. Never saves: the caller owns the one `save_dirty`, which is what
+/// lets `plugin install` persist a package's tool row and its channel
+/// instance together.
+///
+/// A created binding gets `package` and nothing else, so it takes the schema
+/// default `enabled = true`. A created row gets the plan's seed as its
+/// `egress_hosts`, the same dirty-path write install seeding uses.
+/// `egress_allow_private` is never written: a private-address carve-out stays
+/// operator-authored.
+///
+/// # Errors
+///
+/// A config write error, and a binding or row the plan found absent that
+/// exists by now. Writing into either would take over another package's alias
+/// or extend an existing grant, so the plan must be made again.
+pub fn apply_channel_binding(
+    config: &mut Config,
+    package: &str,
+    plan: &ChannelBindingPlan,
+) -> anyhow::Result<()> {
+    if plan.create_binding {
+        let created = config
+            .create_map_key("channels.plugin", &plan.alias)
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            created,
+            "the channel binding plugin.{} appeared after it was planned",
+            plan.alias
+        );
+        config.set_prop(&format!("channels.plugin.{}.package", plan.alias), package)?;
+        config.mark_dirty(&format!("channels.plugin.{}", plan.alias));
+    }
+    if let Some(row) = plan.row.as_ref().filter(|row| row.create) {
+        let created = config
+            .create_map_key("plugins.entries", &row.key)
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            created,
+            "the config entry '{}' appeared after it was planned",
+            row.key
+        );
+        config.mark_dirty(&format!("plugins.entries.{}", row.key));
+        if !row.seed.is_empty() {
+            config.set_prop(&egress_hosts_path(&row.key), &row.seed.join(","))?;
+        }
+    }
+    Ok(())
+}
+
+/// One entry of a manifest's `config_schema.required` list, as the readiness
+/// report shows it. It carries a name and three facts, never a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredKey {
+    /// The property name exactly as the manifest spells it: publisher text.
+    pub name: String,
+    /// The property is marked `x-secret: true`.
+    pub secret: bool,
+    /// The instance row's config map holds a value for it.
+    pub set: bool,
+    /// The name follows the portable plugin key grammar, so a printed
+    /// `config set plugins.entries.<key>.config.<name>` can address it.
+    /// Admission holds only secret names to that grammar.
+    pub addressable: bool,
+}
+
+/// The keys `manifest`'s `config_schema` requires, in schema order, each
+/// marked set or missing against `entry`, the instance's `[[plugins.entries]]`
+/// row (`None` when it has none). A manifest without a schema requires
+/// nothing.
+#[must_use]
+pub fn required_keys(
+    manifest: &PluginManifest,
+    entry: Option<&PluginEntryConfig>,
+) -> Vec<RequiredKey> {
+    let Some(schema) = manifest.config_schema.as_ref() else {
+        return Vec::new();
+    };
+    let properties = schema.get("properties").and_then(Value::as_object);
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|name| RequiredKey {
+            name: name.to_string(),
+            secret: properties
+                .and_then(|properties| properties.get(name))
+                .and_then(|property| property.get("x-secret"))
+                == Some(&Value::Bool(true)),
+            set: entry.is_some_and(|entry| entry.config.contains_key(name)),
+            addressable: zeroclaw_api::plugin_key::is_valid_portable_plugin_key(name),
+        })
+        .collect()
+}
+
+/// The runtime's own verdict on the configuration of `alias`'s instance.
+///
+/// Runs `zeroclaw_plugins::config::resolve_plugin_config` over the config map
+/// of `entry`, the instance's `[[plugins.entries]]` row (`None` when it has
+/// none), with the scope the activation plan builds for the binding: the
+/// channel capability, the alias, and the manifest's permissions as the grant
+/// set. What it accepts is what the instance receives when it starts.
+///
+/// # Errors
+///
+/// The resolver's message. It names schema paths and property names, never a
+/// value. Control characters in it are escaped, because a property name is
+/// publisher text and the message is printed to the operator's terminal.
+pub fn config_verdict(
+    manifest: &PluginManifest,
+    alias: &str,
+    entry: Option<&PluginEntryConfig>,
+) -> Result<(), String> {
+    PluginInstanceScope::from_manifest(
+        manifest,
+        PluginCapability::Channel,
+        alias,
+        manifest.permissions.iter().copied(),
+    )
+    .and_then(|scope| {
+        zeroclaw_plugins::config::resolve_plugin_config(
+            manifest,
+            &scope,
+            entry.map(|entry| &entry.config),
+        )
+    })
+    .map(drop)
+    .map_err(|error| escape_control_characters(&error.to_string()))
+}
+
+/// `text` with every control character written as its escape sequence.
+fn escape_control_characters(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+/// `zeroclaw --config-dir '<dir>' config set '<path>' ['<value>']`, rendered
+/// for `dialect`: the command that sets one property of the configuration
+/// the operator inspected.
+///
+/// Every argument is quoted literally, as the egress commands quote theirs:
+/// a path can carry publisher text (a schema property name) or config text
+/// (an alias). Without a value `config set` prompts for one, masked for a
+/// secret field, so a secret never has to be typed on the command line.
+#[must_use]
+pub fn config_set_command_for(
+    dialect: ShellDialect,
+    config_dir: &Path,
+    path: &str,
+    value: Option<&str>,
+) -> String {
+    let dir = config_dir.to_string_lossy();
+    let mut arguments = vec![dir.as_ref(), path];
+    arguments.extend(value);
+    let (dialect, marker) = dialect.command_form(&arguments);
+    let mut command = format!(
+        "{marker}{} config set {}",
+        zeroclaw_invocation_for(dialect, config_dir),
+        dialect.quote_literal(path)
+    );
+    if let Some(value) = value {
+        command.push(' ');
+        command.push_str(&dialect.quote_literal(value));
+    }
+    command
+}
+
+/// `zeroclaw --config-dir '<dir>' plugin bind '<package>' --channel-alias
+/// <alias>`, rendered for `dialect`: the binding ceremony for `package`.
+///
+/// With `alias` the command binds that alias, quoted like every other
+/// argument. Without one it ends in the literal placeholder `<alias>`, for the
+/// operator to replace with the alias they choose.
+#[must_use]
+pub fn plugin_bind_command_for(
+    dialect: ShellDialect,
+    config_dir: &Path,
+    package: &str,
+    alias: Option<&str>,
+) -> String {
+    let dir = config_dir.to_string_lossy();
+    let mut arguments = vec![dir.as_ref(), package];
+    arguments.extend(alias);
+    let (dialect, marker) = dialect.command_form(&arguments);
+    format!(
+        "{marker}{} plugin bind {} --channel-alias {}",
+        zeroclaw_invocation_for(dialect, config_dir),
+        dialect.quote_literal(package),
+        alias.map_or_else(
+            || "<alias>".to_string(),
+            |alias| dialect.quote_literal(alias)
+        )
+    )
 }
