@@ -1203,7 +1203,22 @@ pub async fn handle_delete_map_key(
 /// or live ACP sessions), else scrub config refs + remove the entry via
 /// `delete_with_cascade`, archive the workspace, run the owned-state cascade
 /// (export-then-delete memory/cron/acp + clear session attribution), and persist.
-async fn delete_agent_cascade(
+fn delete_agent_cascade<'a>(
+    state: &'a AppState,
+    principal: &'a RequestPrincipal,
+    working: zeroclaw_config::schema::Config,
+    alias: &'a str,
+    guard: ConfigWriteGuard,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + 'a>> {
+    // Allocate the heavy recovery future outside the caller's async frame.
+    // Boxing only at the await site still reserves construction space in the
+    // shared map-key handler, even for channel/provider requests.
+    Box::pin(delete_agent_cascade_inner(
+        state, principal, working, alias, guard,
+    ))
+}
+
+async fn delete_agent_cascade_inner(
     state: &AppState,
     principal: &RequestPrincipal,
     mut working: zeroclaw_config::schema::Config,
@@ -3507,6 +3522,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_map_key_handler_cascades_model_provider_and_persists() {
+        assert_delete_map_key_handler_cascades_model_provider_and_persists().await;
+    }
+
+    async fn assert_delete_map_key_handler_cascades_model_provider_and_persists() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
         config
@@ -3606,6 +3625,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_map_key_handler_cascades_channel_and_persists() {
+        assert_delete_map_key_handler_cascades_channel_and_persists().await;
+    }
+
+    async fn assert_delete_map_key_handler_cascades_channel_and_persists() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
         config.create_map_key("channels.discord", "main").unwrap();
@@ -3651,6 +3674,27 @@ mod tests {
         drop(cfg);
         let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
         assert!(!written.contains("discord.main"));
+    }
+
+    #[test]
+    fn delete_map_key_cascades_on_two_mib_stack() {
+        std::thread::Builder::new()
+            .name("map-key-delete-small-stack".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                // Neither the fixture nor the actual handler future is boxed
+                // here: only the production boundary bounds its stack usage.
+                runtime
+                    .block_on(assert_delete_map_key_handler_cascades_model_provider_and_persists());
+                runtime.block_on(assert_delete_map_key_handler_cascades_channel_and_persists());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[tokio::test]
