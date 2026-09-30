@@ -3317,6 +3317,17 @@ enum PluginCommands {
         /// (skips the install-time load-check)
         #[arg(long)]
         no_verify: bool,
+        /// Also bind the installed channel package to a
+        /// `[channels.plugin.<alias>]` instance and create its config entry,
+        /// as `plugin bind` does, in the same transaction as the install
+        #[arg(long)]
+        channel_alias: Option<String>,
+        /// Egress for the bound instance's new config entry: `declared` grants
+        /// the destinations the package manifest declares, `none` binds with
+        /// no network reach. Required with `--channel-alias` when the manifest
+        /// declares destinations and the entry does not exist yet.
+        #[arg(long, value_enum, requires = "channel_alias")]
+        egress: Option<EgressDecisionArg>,
     },
     /// Remove an installed plugin
     Remove {
@@ -3696,13 +3707,17 @@ fn installed_instance_rows(
     )?)
 }
 
-/// The rows `plugin install` seeds, in the shape [`seed_plugin_config_entries`]
-/// takes: the default tool binding's, and no channel row.
+/// The rows `plugin install` seeds through [`stage_plugin_config_entries`], in
+/// the shape it takes: the default tool binding's row, never a channel row.
 ///
-/// Install has only ever seeded the default tool binding. A channel instance's
-/// row is not created here, even for an alias bound before the install:
-/// `plugin info` prints its key, and `plugin list` reports any declared
-/// destination it lacks with the command that creates the row.
+/// Install splits the work. It seeds the package's tool row here, by the rule
+/// the tool ceremony has always applied. A channel instance's row belongs to
+/// its binding: with `--channel-alias`, install binds that alias and seeds the
+/// instance's row through the binding ceremony, in the same save. Without the
+/// flag no channel row is created, even for an alias bound before the
+/// install: `plugin bind` creates it, `plugin info` prints its key, and
+/// `plugin list` reports any declared destination it lacks with the command
+/// that creates the row.
 #[cfg(feature = "plugins-wasm")]
 fn tool_binding_entries(
     rows: Vec<crate::plugins::channel_instance::PluginInstanceRow>,
@@ -3711,38 +3726,6 @@ fn tool_binding_entries(
         .filter(|row| !row.is_channel())
         .map(|row| (row.capability, row.key))
         .collect()
-}
-
-/// The destinations `plugin_name`'s manifest **declares** (its `[egress]`
-/// table), resolved from the admitted manifest at use time.
-///
-/// This is the declaration, never a grant: nothing here confers network reach.
-/// An unknown plugin and a plugin that declares nothing give the same answer —
-/// an empty list — because "declares nothing" is the same state as "no
-/// `[egress]` table".
-///
-/// A declaration also counts only with a transport that can use it:
-/// `http_client`, the one the host governs today. Without it the declared
-/// hosts are not seeded, because a row persists across `plugin remove`, and a
-/// grant seeded for a version that could not reach the network would silently
-/// become live reach when a later version of the same package adds
-/// `http_client`. That later install then meets an existing row, which is
-/// never extended, so the operator grants it deliberately. `plugin list`
-/// applies the same rule to the default tool binding's row through
-/// [`crate::plugins::channel_instance::row_has_usable_transport`], which also
-/// holds the wider rule a channel row follows.
-#[cfg(feature = "plugins-wasm")]
-fn declared_egress_hosts(
-    host: &zeroclaw::plugins::host::PluginHost,
-    plugin_name: &str,
-) -> Vec<String> {
-    host.manifest(plugin_name)
-        .filter(|m| {
-            m.permissions
-                .contains(&zeroclaw::plugins::PluginPermission::HttpClient)
-        })
-        .map(|m| m.egress.hosts.clone())
-        .unwrap_or_default()
 }
 
 /// Print the destinations a freshly seeded instance row was granted, one line
@@ -4968,7 +4951,19 @@ fn render_egress_gap_plan(
     lines
 }
 
-/// Seed `[[plugins.entries]]` blocks for a freshly installed plugin's canonical
+/// What [`stage_plugin_config_entries`] staged for the save that follows it.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug, Default)]
+struct StagedPluginConfigEntries {
+    /// Rows this install created and marked dirty.
+    created: Vec<String>,
+    /// Rows that already existed. Nothing about them was written.
+    existing: Vec<String>,
+    /// The canonical declaration each created row was granted.
+    granted: Vec<String>,
+}
+
+/// Stage `[[plugins.entries]]` blocks for a freshly installed plugin's canonical
 /// default instance keys, carrying the manifest's declared egress destinations
 /// into each row this call creates. `config set
 /// plugins.entries.<instance-key>.config.<key>` routes through natural-key path
@@ -4980,15 +4975,20 @@ fn render_egress_gap_plan(
 /// guidance as `plugin list` — including its rule that a deployment-wide
 /// refusal is reported once, on its own, with no row steps that could not
 /// take effect. The operator's old row remains untouched.
+///
+/// Nothing is saved here. The created rows are marked dirty for the caller's
+/// one `save_dirty`, which `plugin install --channel-alias` shares with the
+/// channel instance it binds, and [`report_seeded_plugin_config_entries`]
+/// prints the outcome once that save has succeeded.
 #[cfg(feature = "plugins-wasm")]
-async fn seed_plugin_config_entries(
+fn stage_plugin_config_entries(
     config: &mut crate::config::schema::Config,
     package: &str,
     entries: &[(zeroclaw::plugins::PluginCapability, String)],
     declared_egress: &[String],
-) -> Result<()> {
+) -> Result<StagedPluginConfigEntries> {
     if entries.is_empty() {
-        return Ok(());
+        return Ok(StagedPluginConfigEntries::default());
     }
 
     let whole_config_degraded = config
@@ -5009,7 +5009,7 @@ async fn seed_plugin_config_entries(
                 )
             );
         }
-        return Ok(());
+        return Ok(StagedPluginConfigEntries::default());
     }
 
     let mut created = Vec::new();
@@ -5055,9 +5055,9 @@ async fn seed_plugin_config_entries(
             .map_err(anyhow::Error::msg)?
         {
             config.mark_dirty(&format!("plugins.entries.{instance_key}"));
-            created.push(instance_key);
+            created.push(instance_key.clone());
         } else {
-            existing.push(instance_key);
+            existing.push(instance_key.clone());
         }
     }
 
@@ -5081,25 +5081,39 @@ async fn seed_plugin_config_entries(
         }
     }
 
-    if !created.is_empty() {
-        Box::pin(config.save_dirty()).await?;
-        for instance_key in &created {
-            println!(
-                "{}",
-                ta(
-                    "cli-plugin-config-entry-seeded",
-                    &[("name", instance_key)],
-                    "Seeded config entry. Set plugin config values with \
-                     `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
-                )
-            );
-            print_egress_grant_ceremony(
-                egress_command_config_dir(config),
-                package,
-                instance_key,
-                &granted,
-            );
-        }
+    Ok(StagedPluginConfigEntries {
+        created,
+        existing,
+        granted,
+    })
+}
+
+/// Print what [`stage_plugin_config_entries`] staged, once the save has
+/// succeeded, in the order install has always printed it: each created row
+/// with the grant it was given, then the rows that already existed.
+#[cfg(feature = "plugins-wasm")]
+fn report_seeded_plugin_config_entries(
+    config: &crate::config::schema::Config,
+    package: &str,
+    staged: &StagedPluginConfigEntries,
+    declared_egress: &[String],
+) {
+    for instance_key in &staged.created {
+        println!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seeded",
+                &[("name", instance_key)],
+                "Seeded config entry. Set plugin config values with \
+                 `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+            )
+        );
+        print_egress_grant_ceremony(
+            egress_command_config_dir(config),
+            package,
+            instance_key,
+            &staged.granted,
+        );
     }
 
     // Rows that already existed — an upgrade, a reinstall, or an
@@ -5107,15 +5121,14 @@ async fn seed_plugin_config_entries(
     // and leave `egress_hosts` exactly as the operator left it. A
     // deployment-wide refusal is reported once, here, and the per-row report
     // then stays silent for the same reason `plugin list` does.
-    if !existing.is_empty()
+    if !staged.existing.is_empty()
         && let Some(line) = egress_deployment_gap_line(config)
     {
         println!("{line}");
     }
-    for instance_key in existing {
+    for instance_key in &staged.existing {
         report_existing_egress_grant(config, package, instance_key, declared_egress);
     }
-    Ok(())
 }
 
 /// Publish a plugin and seed its config entries as one transaction.
@@ -5139,39 +5152,91 @@ async fn seed_plugin_config_entries(
 /// `announce_installed` prints the call site's own "installed" message once the
 /// publish *and* the seeding have both succeeded, so the two install paths keep
 /// their distinct user-facing text and a rolled-back install never reports
-/// success first.
+/// success first. The seeded rows' report comes before it, as it always has.
+///
+/// With `channel`, the same transaction binds a channel instance of the
+/// package, exactly as `plugin bind` does: the tool rows are staged, the
+/// binding and its row are planned against the published manifest and
+/// applied, and one `save_dirty` persists them together, so a failure anywhere
+/// rolls the package back with nothing persisted. Without one, a package that
+/// provides a channel still binds nothing.
+///
+/// Returns the channel lines the caller prints after the announcement: the
+/// binding report and readiness for `channel`, or, for a channel package
+/// installed without one, the line naming the command that binds an instance.
+/// A package without the channel capability returns none, so a tool install
+/// prints exactly what it always has.
 #[cfg(feature = "plugins-wasm")]
 async fn publish_and_seed_plugin(
     host: &mut zeroclaw::plugins::host::PluginHost,
     config: &mut crate::config::schema::Config,
     admitted: zeroclaw::plugins::host::AdmittedSource,
+    channel: Option<ChannelBindingRequest>,
     announce_installed: impl FnOnce(&str),
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    use crate::plugins::channel_instance::{
+        apply_channel_binding, declared_hosts_for_row, instance_rows, plan_channel_binding,
+    };
+
     // A fresh publish: the package is now on disk and in the loaded set. An
     // already-present package fails here, before any copy, so nothing past this
     // point ever runs against a package this call did not itself publish.
     let name = host.install_admitted(admitted)?;
 
-    let seed_result: Result<()> = async {
-        let config_entries = tool_binding_entries(installed_instance_rows(config, host, &name)?);
-        let declared = declared_egress_hosts(host, &name);
-        Box::pin(seed_plugin_config_entries(
-            config,
-            &name,
-            &config_entries,
-            &declared,
-        ))
-        .await?;
+    let seed_result: Result<Vec<String>> = async {
+        let manifest = host
+            .manifest(&name)
+            .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
+        let rows = instance_rows(config, manifest)?;
+        // The default tool binding's declaration, under that row's own
+        // transport rule.
+        let declared = rows
+            .iter()
+            .find(|row| !row.is_channel())
+            .map(|row| declared_hosts_for_row(manifest, row))
+            .unwrap_or_default();
+        let staged =
+            stage_plugin_config_entries(config, &name, &tool_binding_entries(rows), &declared)?;
+        let binding = match &channel {
+            Some(request) => {
+                let plan = plan_channel_binding(config, manifest, &request.alias, request.egress)
+                    .map_err(|refusal| {
+                    anyhow::Error::msg(binding_refusal_line(&name, &request.alias, &refusal))
+                })?;
+                apply_channel_binding(config, &name, &plan)?;
+                Some((plan, request.egress))
+            }
+            None => None,
+        };
+        if !staged.created.is_empty()
+            || binding
+                .as_ref()
+                .is_some_and(|(plan, _)| plan.writes_config())
+        {
+            Box::pin(config.save_dirty()).await?;
+        }
+        // Reports only from here on: nothing past the save may fail, or the
+        // rollback would remove a package whose config is already saved. The
+        // seeded rows are reported first, as install has always printed them.
+        report_seeded_plugin_config_entries(config, &name, &staged, &declared);
         // Only now is the install committed: a seed refusal below rolls the
         // publish back, and an install that is about to be undone must never
         // have announced success.
         announce_installed(&name);
-        Ok(())
+        Ok(match &binding {
+            Some((plan, decision)) => {
+                channel_binding_report_lines(config, host, manifest, plan, *decision)
+            }
+            None => channel_bind_hint_line(config, manifest)
+                .into_iter()
+                .collect(),
+        })
     }
     .await;
 
-    let Err(seed_err) = seed_result else {
-        return Ok(());
+    let seed_err = match seed_result {
+        Ok(channel_lines) => return Ok(channel_lines),
+        Err(seed_err) => seed_err,
     };
 
     // Seeding failed after a fresh publish: undo the publish so the state is
@@ -5187,6 +5252,61 @@ async fn publish_and_seed_plugin(
              it with `zeroclaw plugin remove {name}` before retrying"
         ))),
     }
+}
+
+/// `plugin install --channel-alias <alias> [--egress declared|none]`: the
+/// channel instance to bind in the install transaction, and the decision on
+/// its new row's declared destinations.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug, Clone)]
+struct ChannelBindingRequest {
+    alias: String,
+    egress: Option<crate::plugins::channel_instance::EgressDecision>,
+}
+
+/// Install an admitted source: refuse a channel request the binding ceremony
+/// would refuse, run the install-time load check, then publish and seed as one
+/// transaction ([`publish_and_seed_plugin`]).
+///
+/// The channel refusal comes first, before the load check and before anything
+/// is published, so it leaves nothing to roll back. The plan is made again
+/// inside the transaction against the published manifest, which is the one
+/// admitted here, so the two agree.
+#[cfg(feature = "plugins-wasm")]
+async fn install_admitted_source(
+    host: &mut zeroclaw::plugins::host::PluginHost,
+    config: &mut crate::config::schema::Config,
+    admitted: zeroclaw::plugins::host::AdmittedSource,
+    channel: Option<ChannelBindingRequest>,
+    limits: zeroclaw::plugins::component::PluginLimits,
+    no_verify: bool,
+    announce_installed: impl FnOnce(&str),
+) -> Result<Vec<String>> {
+    if let Some(request) = &channel {
+        let manifest = admitted.manifest();
+        crate::plugins::channel_instance::plan_channel_binding(
+            config,
+            manifest,
+            &request.alias,
+            request.egress,
+        )
+        .map_err(|refusal| {
+            anyhow::Error::msg(binding_refusal_line(
+                &manifest.name,
+                &request.alias,
+                &refusal,
+            ))
+        })?;
+    }
+    verify_plugin_loads_or_bail(&admitted, limits, no_verify).await?;
+    Box::pin(publish_and_seed_plugin(
+        host,
+        config,
+        admitted,
+        channel,
+        announce_installed,
+    ))
+    .await
 }
 
 #[derive(Subcommand, Debug)]
@@ -10649,21 +10769,29 @@ Add pricing to the active provider profile or supply a catalog entry."
                 source,
                 registry,
                 no_verify,
+                channel_alias,
+                egress,
             } => {
                 if plugin_registry::looks_like_url(&source) {
                     bail!(
                         "`zeroclaw plugin install <url>` is not supported; use `--registry <url>` with a plugin name, or install a local plugin path"
                     );
                 }
+                let channel = channel_alias.map(|alias| ChannelBindingRequest {
+                    alias,
+                    egress: egress.map(Into::into),
+                });
                 let mut host = plugin_host_with_configured_security(&config)?;
                 let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
-                if plugin_registry::is_local_plugin_source(&source) {
+                let channel_lines = if plugin_registry::is_local_plugin_source(&source) {
                     let admitted = host.admit_source(&source)?;
-                    verify_plugin_loads_or_bail(&admitted, limits, no_verify).await?;
-                    Box::pin(publish_and_seed_plugin(
+                    Box::pin(install_admitted_source(
                         &mut host,
                         &mut config,
                         admitted,
+                        channel,
+                        limits,
+                        no_verify,
                         |_name| {
                             println!(
                                 "{}",
@@ -10675,7 +10803,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                             );
                         },
                     ))
-                    .await?;
+                    .await?
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -10694,11 +10822,13 @@ Add pricing to the active provider profile or supply a catalog entry."
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
                     let admitted = host.admit_source(&plugin_dir)?;
-                    verify_plugin_loads_or_bail(&admitted, limits, no_verify).await?;
-                    Box::pin(publish_and_seed_plugin(
+                    Box::pin(install_admitted_source(
                         &mut host,
                         &mut config,
                         admitted,
+                        channel,
+                        limits,
+                        no_verify,
                         |_name| {
                             println!(
                                 "{}",
@@ -10713,7 +10843,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                             );
                         },
                     ))
-                    .await?;
+                    .await?
+                };
+                for line in channel_lines {
+                    println!("{line}");
                 }
                 Ok(())
             }
@@ -18804,6 +18937,24 @@ type = "string"
         )
     }
 
+    /// Install's seeding of a package's tool rows without a package to
+    /// publish: stage the rows, save once, then report, as
+    /// `publish_and_seed_plugin` does around any channel binding it adds.
+    #[cfg(feature = "plugins-wasm")]
+    async fn seed_plugin_config_entries(
+        config: &mut crate::config::schema::Config,
+        package: &str,
+        entries: &[(zeroclaw::plugins::PluginCapability, String)],
+        declared_egress: &[String],
+    ) -> Result<()> {
+        let staged = stage_plugin_config_entries(config, package, entries, declared_egress)?;
+        if !staged.created.is_empty() {
+            Box::pin(config.save_dirty()).await?;
+        }
+        report_seeded_plugin_config_entries(config, package, &staged, declared_egress);
+        Ok(())
+    }
+
     /// Read the `[[plugins.entries]]` table named `name` back off disk.
     #[cfg(feature = "plugins-wasm")]
     fn entry_on_disk(path: &std::path::Path, name: &str) -> toml::Table {
@@ -21527,6 +21678,7 @@ type = "string"
             &mut host,
             &mut config,
             admitted,
+            None,
             |_| {},
         ))
         .await
@@ -21687,6 +21839,7 @@ type = "string"
             &mut host,
             &mut config,
             admitted,
+            None,
             |_| {},
         ))
         .await
@@ -21710,6 +21863,7 @@ type = "string"
             &mut host,
             &mut config,
             admitted,
+            None,
             |_| {},
         ))
         .await
@@ -21771,6 +21925,7 @@ type = "string"
             &mut host,
             &mut config1,
             admitted,
+            None,
             |_name| {},
         ))
         .await
@@ -21803,6 +21958,7 @@ type = "string"
             &mut host,
             &mut config2,
             admitted,
+            None,
             |_name| {},
         ))
         .await
@@ -21883,6 +22039,7 @@ hosts = ["api.example.com", "api2.example.com"]
             &mut host,
             &mut config,
             admitted,
+            None,
             |_name| announced.set(true),
         ))
         .await
@@ -22040,6 +22197,7 @@ hosts = ["api.example.com", "api2.example.com"]
             &mut host,
             &mut config,
             admitted,
+            None,
             |_name| announced.set(true),
         ))
         .await
@@ -22085,6 +22243,7 @@ hosts = ["api.example.com", "api2.example.com"]
             &mut host,
             &mut config,
             admitted,
+            None,
             |_name| announced.set(true),
         ))
         .await
@@ -22208,5 +22367,311 @@ hosts = ["api.example.com", "api2.example.com"]
             b_after.contains("gitea.b.example.net"),
             "premise: profile B's operator-only grant is on disk: {b_after}"
         );
+    }
+
+    /// `plugin install --channel-alias` binds the channel instance inside the
+    /// install transaction: the mixed package's tool row is seeded by its own
+    /// rule, the binding and the channel row by the binding ceremony, and one
+    /// save persists all three.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn install_with_channel_alias_binds_and_seeds_in_one_save() {
+        use crate::plugins::channel_instance::EgressDecision;
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = package_manifest_toml(
+            "chat-bridge",
+            &["tool", "channel"],
+            &["http_client"],
+            &["api.example.com"],
+        );
+        let source = write_plugin_source(&manifest_toml);
+        let manifest = manifest_from_toml(&manifest_toml);
+        let tool_key = expected_instance_key(&manifest);
+        let channel_key = expected_channel_instance_key(&manifest, "operations");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let admitted = host
+            .admit_source(source.path().to_str().expect("utf-8 source path"))
+            .expect("admit the source");
+        let announced = std::cell::Cell::new(false);
+
+        let lines = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            Some(ChannelBindingRequest {
+                alias: "operations".to_string(),
+                egress: Some(EgressDecision::SeedDeclared),
+            }),
+            |_| announced.set(true),
+        ))
+        .await
+        .expect("install");
+
+        assert!(announced.get() && host.get_plugin("chat-bridge").is_some());
+        assert_eq!(config.channels.plugin.len(), 1, "one binding");
+        assert_eq!(
+            binding_on_disk(&config.config_path, "operations")
+                .and_then(|binding| binding.get("package").cloned()),
+            Some(toml::Value::String("chat-bridge".to_string()))
+        );
+        // One save applies its dirty paths in no fixed order, so the rows it
+        // creates together land on disk in either order.
+        let mut rows_on_disk = entry_names_on_disk(&config.config_path);
+        rows_on_disk.sort();
+        let mut expected_rows = vec![tool_key.clone(), channel_key.clone()];
+        expected_rows.sort();
+        assert_eq!(
+            rows_on_disk, expected_rows,
+            "the tool row and one channel row"
+        );
+        for key in [&tool_key, &channel_key] {
+            assert_eq!(
+                granted_on_disk(&config.config_path, key),
+                vec!["api.example.com"],
+                "each row is granted its declaration: {key}"
+            );
+        }
+        assert!(config.dirty_paths.is_empty(), "the one save wrote it all");
+        assert_eq!(
+            lines.first(),
+            Some(&ta(
+                "cli-plugin-channel-bound",
+                &[("alias", "operations"), ("name", "chat-bridge")],
+                "",
+            ))
+        );
+        assert_eq!(
+            lines.last(),
+            Some(&ta(
+                "cli-plugin-channel-restart-note",
+                &[("alias", "operations")],
+                "",
+            )),
+            "the channel report ends with the readiness block"
+        );
+    }
+
+    /// A channel request the binding ceremony would refuse fails the install
+    /// before the load check and before anything is published: no package
+    /// directory, no loaded plugin, no announcement, and config untouched.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn install_with_channel_alias_refuses_before_publish_when_the_decision_is_missing() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let source = write_plugin_source(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let before = std::fs::read(&config.config_path).expect("read config");
+        let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let admitted = host
+            .admit_source(source.path().to_str().expect("utf-8 source path"))
+            .expect("admit the source");
+        let announced = std::cell::Cell::new(false);
+
+        let error = Box::pin(install_admitted_source(
+            &mut host,
+            &mut config,
+            admitted,
+            Some(ChannelBindingRequest {
+                alias: "operations".to_string(),
+                egress: None,
+            }),
+            limits,
+            // The refusal precedes the load check; skipping it anyway keeps
+            // this test from ever instantiating the stub component.
+            true,
+            |_| announced.set(true),
+        ))
+        .await
+        .expect_err("a missing decision refuses the install");
+
+        assert_eq!(
+            error.to_string(),
+            ta(
+                "cli-plugin-channel-egress-decision-required",
+                &[
+                    ("name", "chat-bridge"),
+                    ("alias", "operations"),
+                    ("count", "1"),
+                    ("hosts", "api.example.com"),
+                ],
+                "",
+            )
+        );
+        assert!(
+            !plugins.path().join("chat-bridge").exists(),
+            "nothing was published"
+        );
+        assert!(host.get_plugin("chat-bridge").is_none());
+        assert!(!announced.get());
+        assert_eq!(
+            std::fs::read(&config.config_path).expect("read config"),
+            before
+        );
+        assert!(config.channels.plugin.is_empty() && config.plugins.entries.is_empty());
+    }
+
+    /// The install transaction covers the channel binding. A save that fails
+    /// after the package is published rolls the package back and persists
+    /// neither the tool row nor the binding nor the channel row; a retry
+    /// against a clean config is a fresh install that binds exactly once.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn install_seed_failure_with_a_channel_request_rolls_back_and_persists_nothing_and_retry_binds_once()
+     {
+        use crate::plugins::channel_instance::EgressDecision;
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = package_manifest_toml(
+            "chat-bridge",
+            &["tool", "channel"],
+            &["http_client"],
+            &["api.example.com"],
+        );
+        let source = write_plugin_source(&manifest_toml);
+        let source_arg = source
+            .path()
+            .to_str()
+            .expect("utf-8 source path")
+            .to_string();
+        let manifest = manifest_from_toml(&manifest_toml);
+        let channel_key = expected_channel_instance_key(&manifest, "operations");
+        let request = || {
+            Some(ChannelBindingRequest {
+                alias: "operations".to_string(),
+                egress: Some(EgressDecision::SeedDeclared),
+            })
+        };
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+
+        // The one save fails on a dirty path that resolves nowhere, as in the
+        // tool-only rollback test.
+        let dir1 = tempfile::tempdir().expect("config dir 1");
+        let mut config1 = config_in_dir(dir1.path());
+        let before = std::fs::read(&config1.config_path).expect("read config");
+        config1.mark_dirty("cost.rates.providers.models.openai.ghost-model.input_per_mtok");
+        let announced = std::cell::Cell::new(false);
+        let admitted = host.admit_source(&source_arg).expect("admit the source");
+        let error = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config1,
+            admitted,
+            request(),
+            |_| announced.set(true),
+        ))
+        .await
+        .expect_err("the save fails on the poisoned dirty path");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("rolled back"), "{rendered}");
+        assert!(!announced.get(), "a rolled-back install never announces");
+        assert!(
+            !plugins.path().join("chat-bridge").exists()
+                && host.get_plugin("chat-bridge").is_none(),
+            "the published package is rolled back"
+        );
+        assert_eq!(
+            std::fs::read(&config1.config_path).expect("read config"),
+            before,
+            "nothing is persisted: no tool row, no binding, no channel row"
+        );
+
+        let dir2 = tempfile::tempdir().expect("config dir 2");
+        let mut config2 = config_in_dir(dir2.path());
+        let admitted = host.admit_source(&source_arg).expect("admit the source");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config2,
+            admitted,
+            request(),
+            |_| {},
+        ))
+        .await
+        .expect("the retry is a fresh install, not AlreadyLoaded");
+        assert!(host.get_plugin("chat-bridge").is_some());
+        assert_eq!(config2.channels.plugin.len(), 1, "exactly one binding");
+        assert!(binding_on_disk(&config2.config_path, "operations").is_some());
+        assert_eq!(
+            entry_names_on_disk(&config2.config_path)
+                .iter()
+                .filter(|name| **name == channel_key)
+                .count(),
+            1,
+            "exactly one channel row"
+        );
+    }
+
+    /// Install without `--channel-alias` binds nothing for a channel package,
+    /// as before: no binding and no row. Its only addition is the line naming
+    /// the command that binds an instance, which a package without the
+    /// channel capability does not get.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn install_without_channel_alias_prints_the_bind_hint_for_a_channel_package() {
+        use crate::plugins::channel_instance::plugin_bind_command_for;
+        use crate::plugins::egress_ceremony::ShellDialect;
+        use zeroclaw::plugins::host::PluginHost;
+
+        for (package, capability) in [("chat-bridge", "channel"), ("weather-tool", "tool")] {
+            let source = write_plugin_source(&package_manifest_toml(
+                package,
+                &[capability],
+                &["http_client"],
+                &["api.example.com"],
+            ));
+            let tmp = tempfile::tempdir().expect("config dir");
+            let mut config = config_in_dir(tmp.path());
+            let plugins = tempfile::tempdir().expect("plugins dir");
+            let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+            let admitted = host
+                .admit_source(source.path().to_str().expect("utf-8 source path"))
+                .expect("admit the source");
+
+            let lines = Box::pin(publish_and_seed_plugin(
+                &mut host,
+                &mut config,
+                admitted,
+                None,
+                |_| {},
+            ))
+            .await
+            .expect("install");
+
+            if capability == "channel" {
+                let command = plugin_bind_command_for(
+                    ShellDialect::host(),
+                    egress_command_config_dir(&config),
+                    package,
+                    None,
+                );
+                assert!(command.ends_with("--channel-alias <alias>"), "{command}");
+                assert_eq!(
+                    lines,
+                    vec![ta(
+                        "cli-plugin-channel-bind-hint",
+                        &[("name", package), ("command", &command)],
+                        "",
+                    )]
+                );
+                assert!(
+                    config.channels.plugin.is_empty() && config.plugins.entries.is_empty(),
+                    "a channel package installed without an alias binds and seeds nothing"
+                );
+            } else {
+                assert!(lines.is_empty(), "no hint for a tool package: {lines:#?}");
+            }
+        }
     }
 }

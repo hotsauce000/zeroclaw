@@ -259,8 +259,9 @@ pub fn channel_instance_row(
 /// shipped with, `http_client` only, which predates the WebSocket and socket
 /// transports. Widening it changes what `plugin install` grants and what
 /// `plugin list` reports for tool packages already installed, so it is left to
-/// a change of its own; the CLI's install-time `declared_egress_hosts` applies
-/// the same tool rule.
+/// a change of its own. What `plugin install` and `plugin bind` seed and what
+/// `plugin list` reports all come from [`declared_hosts_for_row`], so each
+/// follows this rule and no other.
 #[must_use]
 pub fn row_has_usable_transport(manifest: &PluginManifest, row: &PluginInstanceRow) -> bool {
     if row.is_channel() {
