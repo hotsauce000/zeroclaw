@@ -511,6 +511,28 @@ async fn supervise_owned<T>(
 where
     T: Send + 'static,
 {
+    supervise_owned_with_runtime_builder(deadline, tracker, operation, execution_admission, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    })
+    .await
+}
+
+async fn supervise_owned_with_runtime_builder<T, B>(
+    deadline: Duration,
+    tracker: OwnedWorkerTracker,
+    operation: OwnedOperation<T>,
+    execution_admission: Option<AgentExecutionAdmission>,
+    mut build_runtime: B,
+) -> Result<T, OwnedSupervisionError>
+where
+    T: Send + 'static,
+    B: FnMut() -> std::io::Result<tokio::runtime::Runtime> + Send + 'static,
+{
+    let settlement_owner = crate::tools::send_message_to_peer::PeerSettlementOwner::new(
+        tokio::runtime::Handle::current(),
+    );
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = CancelOwnedWorkerOnDrop(cancellation.clone());
     let worker_cancellation = cancellation.clone();
@@ -523,35 +545,44 @@ where
             let _active_worker = active_worker;
             let _claim_owner = claim_owner;
             let _execution_admission = execution_admission;
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
+            let runtime = match build_runtime() {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     let _ = tx.send(OwnedWorkerOutcome::RuntimeBuild(error));
                     return;
                 }
             };
-            let operation = operation(worker_cancellation.clone());
-            let outcome = runtime.block_on(async move {
-                tokio::select! {
-                    biased;
-                    () = worker_cancellation.cancelled() => {
-                        OwnedWorkerOutcome::CancellationAcknowledged
-                    },
-                    value = operation => OwnedWorkerOutcome::Completed {
-                        value,
-                        completed_at: std::time::Instant::now(),
-                    },
+            // Build cleanup capability before any durable peer registration.
+            let settlement_runtime = match build_runtime() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = tx.send(OwnedWorkerOutcome::RuntimeBuild(error));
+                    return;
                 }
-            });
+            };
+            // Only root construction/poll may unwind here. All retained owners
+            // and both runtimes stay outside so cleanup still precedes release.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let operation = settlement_owner.scope(operation(worker_cancellation.clone()));
+                runtime.block_on(async move {
+                    tokio::select! {
+                        biased;
+                        () = worker_cancellation.cancelled() => {
+                            OwnedWorkerOutcome::CancellationAcknowledged
+                        },
+                        value = operation => OwnedWorkerOutcome::Completed {
+                            value,
+                            completed_at: std::time::Instant::now(),
+                        },
+                    }
+                })
+            }));
             // Sending the acknowledgement only after the operation future is
             // dropped and the private runtime is shut down is load-bearing:
             // the durable caller must not release its claim while runtime-owned
             // provider/tool/delivery work can still make progress.
             drop(runtime);
-            let outcome = match outcome {
+            let outcome = outcome.map(|outcome| match outcome {
                 OwnedWorkerOutcome::Completed { value, .. } => {
                     // Record completion timestamp after the private runtime is dropped
                     // so teardown delays cannot disguise post-deadline execution as on-time.
@@ -561,8 +592,15 @@ where
                     }
                 }
                 other => other,
-            };
-            let _ = tx.send(outcome);
+            });
+            // No execution task remains. Produced results cannot be discarded
+            // by cancellation, and acknowledgement cannot precede their CAS.
+            settlement_runtime.block_on(settlement_owner.drain());
+            drop(settlement_runtime);
+            if let Ok(outcome) = outcome {
+                let _ = tx.send(outcome);
+            }
+            // Root panic preserves WorkerStopped via sender drop, after drain.
         })
         .map_err(OwnedSupervisionError::ThreadSpawn)?;
 
@@ -587,6 +625,22 @@ where
     debug_assert!(deadline_elapsed);
     cancellation.cancel();
     owned_worker_result(rx.await, true)
+}
+
+#[cfg(test)]
+pub(crate) async fn supervise_peer_test<T: Send + 'static>(
+    config: &Config,
+    operation: OwnedOperation<T>,
+    admission: Option<AgentExecutionAdmission>,
+) -> anyhow::Result<T> {
+    supervise_owned(
+        Duration::from_secs(30),
+        OwnedWorkerTracker::for_config(config),
+        operation,
+        admission,
+    )
+    .await
+    .map_err(|error| anyhow::Error::msg(format!("{error:?}")))
 }
 
 fn owned_worker_result<T>(
@@ -8117,6 +8171,48 @@ mod tests {
             assert_eq!(settled.as_str(), expected_token);
             release_claim(&config, &job.id, &settled).unwrap();
             assert!(lifecycle.begin_delete(TEST_AGENT).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_runtime_startup_failure_precedes_all_operation_effects() {
+        for failed_builder in [1, 2] {
+            let directory = TempDir::new().expect("isolated config");
+            let config = test_config(&directory).await;
+            let tracker = OwnedWorkerTracker::for_config(&config);
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = calls.clone();
+            let mut builds = 0;
+            let result = supervise_owned_with_runtime_builder(
+                Duration::from_secs(10),
+                tracker.clone(),
+                Box::new(move |_| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async {})
+                }),
+                None,
+                move || {
+                    builds += 1;
+                    if builds == failed_builder {
+                        return Err(std::io::Error::other("injected runtime startup failure"));
+                    }
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                },
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(OwnedSupervisionError::RuntimeBuild(_))
+            ));
+            tracker.wait_for_drain().await;
+            assert_eq!(tracker.active_count(), 0);
+            assert_eq!(
+                observed.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "operation cannot create or dispatch before both runtimes exist"
+            );
         }
     }
 

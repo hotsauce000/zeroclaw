@@ -377,32 +377,35 @@ pub struct DelegateTool {
 #[derive(Clone)]
 enum DelegationCancellation {
     Local(CancellationToken),
-    RunOwned(CancellationToken),
+    RunOwned(
+        CancellationToken,
+        Option<crate::tools::send_message_to_peer::PeerSettlementOwner>,
+    ),
 }
 
 impl DelegationCancellation {
     fn token(&self) -> &CancellationToken {
         match self {
-            Self::Local(token) | Self::RunOwned(token) => token,
+            Self::Local(token) | Self::RunOwned(token, _) => token,
         }
     }
 
     fn child(&self) -> Self {
         match self {
             Self::Local(token) => Self::Local(token.child_token()),
-            Self::RunOwned(token) => Self::RunOwned(token.child_token()),
+            Self::RunOwned(token, owner) => Self::RunOwned(token.child_token(), owner.clone()),
         }
     }
 
     fn run_owned_token(&self) -> Option<CancellationToken> {
         match self {
             Self::Local(_) => None,
-            Self::RunOwned(token) => Some(token.clone()),
+            Self::RunOwned(token, _) => Some(token.clone()),
         }
     }
 
     fn is_run_owned(&self) -> bool {
-        matches!(self, Self::RunOwned(_))
+        matches!(self, Self::RunOwned(..))
     }
 }
 
@@ -655,7 +658,10 @@ impl DelegateTool {
     /// closed: a detached task would outlive the run's private runtime and
     /// escape the claim boundary that releases the job.
     pub fn with_run_owned_cancellation_token(mut self, token: CancellationToken) -> Self {
-        self.cancellation = DelegationCancellation::RunOwned(token);
+        self.cancellation = DelegationCancellation::RunOwned(
+            token,
+            crate::tools::send_message_to_peer::PeerSettlementOwner::current(),
+        );
         self
     }
 
@@ -1900,27 +1906,7 @@ impl DelegateTool {
                 "background delegation requires a durable task store; root config is unavailable",
             ));
         };
-        type ControlPlaneCell =
-            tokio::sync::OnceCell<crate::control_plane::ControlPlaneRecoveryOwner>;
-        static CONTROL_PLANES: std::sync::OnceLock<
-            parking_lot::Mutex<HashMap<PathBuf, Arc<ControlPlaneCell>>>,
-        > = std::sync::OnceLock::new();
-        let cell = CONTROL_PLANES
-            .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
-            .lock()
-            .entry(data_dir.clone())
-            .or_insert_with(|| Arc::new(ControlPlaneCell::new()))
-            .clone();
-        cell.get_or_try_init(|| async {
-            let owner = crate::control_plane::ControlPlaneRecoveryOwner::start(&data_dir).await?;
-            std::mem::drop(owner.spawn_reaper(
-                crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
-                CancellationToken::new(),
-            ));
-            Ok::<_, anyhow::Error>(owner)
-        })
-        .await
-        .map(|owner| owner.handle().clone())
+        crate::control_plane::non_daemon_control_plane(&data_dir).await
     }
 
     fn serialize_result<T: serde::Serialize>(result: &T) -> anyhow::Result<Vec<u8>> {
@@ -2639,6 +2625,30 @@ impl DelegateTool {
     }
 
     async fn execute_sync_with_target_admission(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+        admission: DelegateAdmission,
+        execution_admission: Option<AgentExecutionAdmission>,
+    ) -> anyhow::Result<ToolResult> {
+        let owner = match &self.cancellation {
+            DelegationCancellation::RunOwned(_, owner) => owner.clone(),
+            DelegationCancellation::Local(_) => None,
+        };
+        let execution: std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<ToolResult>> + Send + '_>,
+        > = Box::pin(self.execute_sync_with_target_admission_inner(
+            agent_name,
+            prompt,
+            args,
+            admission,
+            execution_admission,
+        ));
+        crate::tools::send_message_to_peer::scope_peer_settlements(owner, execution).await
+    }
+
+    async fn execute_sync_with_target_admission_inner(
         &self,
         agent_name: &str,
         prompt: &str,
@@ -3750,74 +3760,83 @@ impl DelegateTool {
                 )
                 .map(|ctx| (agent_name.clone(), ctx));
 
+            // Spawn macros evaluate their future expression inside the new
+            // task. Capture the run owner here, before task-local scope is lost.
+            let settlement_owner =
+                crate::tools::send_message_to_peer::PeerSettlementOwner::current();
             handles.push(zeroclaw_spawn::spawn!(
-                async move {
-                    let inner = DelegateTool {
-                        agents,
-                        security,
-                        global_credential,
-                        provider_runtime_options,
-                        depth,
-                        max_delegation_depth,
-                        background_task_management,
-                        operator_approval_available,
-                        parent_tools,
-                        runtime,
-                        multimodal_config,
-                        delegate_config,
-                        workspace_dir,
-                        cancellation,
-                        memory,
-                        providers_models,
-                        risk_profiles,
-                        runtime_profiles,
-                        skill_bundles,
-                        root_config,
-                        live_config,
-                        execution_capability,
-                        caller_alias,
-                        originator_chain,
-                        task_control_plane,
-                        prebuilt_cost_ctx,
-                        inherited_cost_tracker,
-                    };
-                    let agent_name_for_return = agent_name.clone();
-                    let result = ExecutionTreeBudget::scope_optional(
-                        inherited_budget,
-                        TOOL_LOOP_THREAD_ID.scope(
-                            thread_scope,
-                            crate::sop::active_scope::with_inherited_headless_step_scope(
-                                step_scope,
-                                scope_delegate_session_key(session_key, async move {
-                                    crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                                        .scope(receipt_scope, async move {
-                                            let worker: std::pin::Pin<
-                                                Box<
-                                                    dyn std::future::Future<
-                                                            Output = anyhow::Result<ToolResult>,
-                                                        > + Send
-                                                        + '_,
-                                                >,
-                                            > = Box::pin(inner.execute_sync_with_target_admission(
-                                                &agent_name,
-                                                &prompt,
-                                                &args_clone,
-                                                DelegateAdmission::Required,
-                                                target_execution_admission,
-                                            ));
-                                            worker.await
-                                        })
-                                        .await
-                                }),
+                crate::tools::send_message_to_peer::scope_peer_settlements(
+                    settlement_owner,
+                    async move {
+                        let inner = DelegateTool {
+                            agents,
+                            security,
+                            global_credential,
+                            provider_runtime_options,
+                            depth,
+                            max_delegation_depth,
+                            background_task_management,
+                            operator_approval_available,
+                            parent_tools,
+                            runtime,
+                            multimodal_config,
+                            delegate_config,
+                            workspace_dir,
+                            cancellation,
+                            memory,
+                            providers_models,
+                            risk_profiles,
+                            runtime_profiles,
+                            skill_bundles,
+                            root_config,
+                            live_config,
+                            execution_capability,
+                            caller_alias,
+                            originator_chain,
+                            task_control_plane,
+                            prebuilt_cost_ctx,
+                            inherited_cost_tracker,
+                        };
+                        let agent_name_for_return = agent_name.clone();
+                        let result = ExecutionTreeBudget::scope_optional(
+                            inherited_budget,
+                            TOOL_LOOP_THREAD_ID.scope(
+                                thread_scope,
+                                crate::sop::active_scope::with_inherited_headless_step_scope(
+                                    step_scope,
+                                    scope_delegate_session_key(session_key, async move {
+                                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                            .scope(receipt_scope, async move {
+                                                let worker: std::pin::Pin<
+                                                    Box<
+                                                        dyn std::future::Future<
+                                                                Output = anyhow::Result<ToolResult>,
+                                                            > + Send
+                                                            + '_,
+                                                    >,
+                                                > = Box::pin(
+                                                    inner.execute_sync_with_target_admission(
+                                                        &agent_name,
+                                                        &prompt,
+                                                        &args_clone,
+                                                        DelegateAdmission::Required,
+                                                        target_execution_admission,
+                                                    ),
+                                                );
+                                                worker.await
+                                            })
+                                            .await
+                                    }),
+                                ),
                             ),
-                        ),
-                    )
-                    .await;
-                    (agent_name_for_return, result)
-                }
-                .instrument(::zeroclaw_log::attribution_span!(
-                    &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
-                ))
+                        )
+                        .await;
+                        (agent_name_for_return, result)
+                    }
+                    .instrument(::zeroclaw_log::attribution_span!(
+                        &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
+                    ))
+                )
             ));
         }
 
