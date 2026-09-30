@@ -1360,24 +1360,34 @@ fn all_tools_with_runtime_on_thread(
                     Some(live) => {
                         let live = Arc::clone(live);
                         let alias = agent_alias.to_string();
-                        DiscordArchiveScope::live(Arc::new(move || {
-                            let cfg = live.read();
-                            let owned: std::collections::BTreeSet<String> = cfg
+                        DiscordArchiveScope::live(Arc::new(move |effect| {
+                            let Some(cfg) = live.try_read() else {
+                                return;
+                            };
+                            let mut namespaces: Vec<String> = cfg
                                 .channel_refs_owned_by_agent(&alias)
                                 .into_iter()
                                 .filter(|r| r.starts_with("discord."))
                                 .collect();
-                            let enabled = cfg.agents.values().filter(|a| a.enabled).count();
-                            zeroclaw_tools::discord_search::DiscordArchiveGrant {
-                                owned_channel_refs: owned,
-                                include_unattributed: enabled <= 1,
+                            if cfg.agents.values().filter(|agent| agent.enabled).count() == 1
+                                && cfg.agents.get(&alias).is_some_and(|agent| agent.enabled)
+                            {
+                                namespaces.push("default".to_string());
                             }
+                            effect(&namespaces);
                         }))
                     }
                     None => {
                         let enabled_agent_count =
                             root_config.agents.values().filter(|a| a.enabled).count();
-                        DiscordArchiveScope::new(owned_discord_refs, enabled_agent_count <= 1)
+                        DiscordArchiveScope::new(
+                            owned_discord_refs,
+                            enabled_agent_count == 1
+                                && root_config
+                                    .agents
+                                    .get(agent_alias)
+                                    .is_some_and(|agent| agent.enabled),
+                        )
                     }
                 };
                 tool_arcs.push(Arc::new(DiscordSearchTool::for_agent(
@@ -1965,11 +1975,17 @@ fn all_tools_with_runtime_on_thread(
                 let alias = agent_alias.to_string();
                 SessionOwnershipScope::with_live_channels(
                     agent_alias,
-                    Arc::new(move || {
-                        live.read()
+                    Arc::new(move |effect| {
+                        // Never wait for a policy writer while holding storage. A writer
+                        // may itself need that storage; unavailable authority fails closed.
+                        let Some(config) = live.try_read() else {
+                            return;
+                        };
+                        let channels = config
                             .channel_refs_owned_by_agent(&alias)
                             .into_iter()
-                            .collect()
+                            .collect();
+                        effect(&channels);
                     }),
                 )
             }
@@ -4698,7 +4714,7 @@ permissions = ["http_client"]
             &Default::default(),
             "owner",
             Arc::new(NativeRuntime::new()),
-            mem,
+            Arc::clone(&mem),
             None,
             None,
             &Default::default(),
@@ -4818,6 +4834,78 @@ permissions = ["http_client"]
             .await
             .unwrap();
         assert!(legacy.success && !legacy.output.contains("legacymarker"));
+        // A retained disabled/removed caller must not inherit the sole *other*
+        // enabled agent's exception. Exercise the actual factory for that peer.
+        {
+            let mut cfg = live.write();
+            cfg.agents.get_mut("owner").unwrap().enabled = false;
+            cfg.agents.get_mut("peer").unwrap().channels = vec!["discord.archive".into()];
+        }
+        let peer_config = live.read().clone();
+        let peer_tools = all_tools_with_runtime(
+            Arc::new(peer_config.clone()),
+            &security,
+            &Default::default(),
+            "peer",
+            Arc::new(NativeRuntime::new()),
+            Arc::clone(&mem),
+            None,
+            None,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &peer_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(live.clone()),
+        )
+        .unwrap()
+        .tools;
+        let peer_search = peer_tools
+            .iter()
+            .find(|tool| tool.name() == "discord_search")
+            .unwrap();
+        let result = peer_search
+            .execute(serde_json::json!({"query":"legacymarker"}))
+            .await
+            .unwrap();
+        assert!(result.success && result.output.contains("legacymarker"));
+        for state in ["disabled", "removed", "zero-enabled"] {
+            if state == "removed" {
+                live.write().agents.remove("owner");
+            }
+            if state == "zero-enabled" {
+                live.write().agents.get_mut("peer").unwrap().enabled = false;
+            }
+            let result = tool("discord_search")
+                .execute(serde_json::json!({"query":"legacymarker"}))
+                .await
+                .unwrap();
+            assert!(
+                !result.output.contains("legacymarker"),
+                "{state}: {}",
+                result.output
+            );
+        }
+        let result = peer_search
+            .execute(serde_json::json!({"query":"legacymarker"}))
+            .await
+            .unwrap();
+        assert!(!result.output.contains("legacymarker"));
+        live.write()
+            .agents
+            .insert("owner".into(), config.agents["owner"].clone());
+        let restored = tool("discord_search")
+            .execute(serde_json::json!({"query":"legacymarker"}))
+            .await
+            .unwrap();
+        assert!(restored.success && restored.output.contains("legacymarker"));
     }
 
     /// End-to-end wiring check for the cross-agent session repro: session

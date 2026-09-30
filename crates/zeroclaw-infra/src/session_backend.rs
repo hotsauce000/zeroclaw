@@ -128,16 +128,20 @@ pub fn check_session_ownership(
     Err(SessionOwnershipDenial::Unattributed)
 }
 
+/// Synchronous live channel authority. The resolver retains its policy read
+/// guard while invoking the effect. Backends call this only after acquiring
+/// storage admission; callbacks must not acquire storage or cross an await.
+pub type ChannelAuthority = dyn Fn(&mut dyn FnMut(&BTreeSet<String>)) + Send + Sync;
+
 /// Outcome of an ownership claim on a session key.
 ///
-/// `Foreign` carries the owner that refused the claim so the caller can
-/// audit which agent actually holds the transcript, rather than only that
-/// the claim failed.
+/// `Foreign` carries the persisted ownership refusal for auditing. It can
+/// describe an explicit agent, a foreign channel, or missing attribution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionOwnerClaim {
-    /// The session was unowned, or already owned by the claiming alias.
+    /// The session was absent or its trusted persisted ownership allowed the claim.
     Claimed,
-    /// Another agent owns it; the claim was refused and nothing was written.
+    /// Persisted ownership refused the claim; nothing was written.
     Foreign(String),
 }
 
@@ -200,6 +204,43 @@ pub trait SessionBackend: Send + Sync {
     ) -> std::io::Result<ScopedSessionAccess<()>> {
         Ok(ScopedSessionAccess::Denied(
             SessionOwnershipDenial::AtomicCheckUnavailable,
+        ))
+    }
+
+    /// Resolve live policy under storage admission and retain it through access.
+    fn load_with_authority(
+        &self,
+        _session_key: &str,
+        _agent_alias: &str,
+        _authority: &ChannelAuthority,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        Ok(ScopedSessionAccess::Denied(
+            SessionOwnershipDenial::AtomicCheckUnavailable,
+        ))
+    }
+
+    /// Resolve live policy under storage admission and retain it through access.
+    fn append_with_authority(
+        &self,
+        _session_key: &str,
+        _message: &ChatMessage,
+        _agent_alias: &str,
+        _authority: &ChannelAuthority,
+    ) -> std::io::Result<ScopedSessionAccess<()>> {
+        Ok(ScopedSessionAccess::Denied(
+            SessionOwnershipDenial::AtomicCheckUnavailable,
+        ))
+    }
+
+    /// List metadata with the same persisted/live policy boundary as history.
+    fn list_with_authority(
+        &self,
+        _agent_alias: &str,
+        _authority: &ChannelAuthority,
+    ) -> std::io::Result<Vec<SessionMetadata>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "session backend cannot atomically list scoped ownership",
         ))
     }
 
@@ -324,8 +365,8 @@ pub trait SessionBackend: Send + Sync {
         Ok(())
     }
 
-    /// Claim ownership of a session for `agent_alias`, but only if it is
-    /// unowned or already owned by that alias.
+    /// Claim an absent session or one explicitly owned by `agent_alias`.
+    /// Channel-only ownership requires `claim_session_with_authority`.
     ///
     /// This exists because routing an inbound message to an agent is not
     /// permission to seize a transcript another agent already owns. Two
@@ -336,18 +377,35 @@ pub trait SessionBackend: Send + Sync {
     /// An unconditional write turns either case into a silent ownership
     /// transfer, after which the reader checks pass against the wrong owner.
     ///
-    /// Backends that record attribution MUST decide the claim inside the
-    /// mutating statement rather than read-then-write, so two concurrent
-    /// inbound turns cannot both observe "unowned" and both claim.
+    /// Backends MUST decide the claim and mutation in one storage critical
+    /// section, so concurrent inbound turns cannot both observe an absent
+    /// session and claim it independently.
     ///
-    /// The default is `Claimed`: a backend that stores no attribution has no
-    /// ownership to defend and must not start refusing traffic.
+    /// Without a channel authority, only absent or explicitly same-agent
+    /// sessions can be claimed. Unsupported backends fail closed.
     fn claim_session_agent_alias(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<SessionOwnerClaim> {
+        self.claim_session_with_authority(session_key, agent_alias, &|effect| {
+            effect(&BTreeSet::new())
+        })
+    }
+
+    /// Claim an inbound session without overwriting channel-only legacy ownership.
+    /// Unsupported backends fail closed. Existing unattributed transcripts are
+    /// not new sessions and cannot be claimed without trusted ownership.
+    fn claim_session_with_authority(
         &self,
         _session_key: &str,
         _agent_alias: &str,
+        _authority: &ChannelAuthority,
     ) -> std::io::Result<SessionOwnerClaim> {
-        Ok(SessionOwnerClaim::Claimed)
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "session backend cannot atomically claim scoped ownership",
+        ))
     }
 
     /// Get the agent alias associated with a session, if recorded.

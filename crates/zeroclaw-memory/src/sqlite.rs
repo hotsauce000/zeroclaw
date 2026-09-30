@@ -53,6 +53,43 @@ pub struct SqliteMemory {
     search_mode: SearchMode,
 }
 
+/// Runs a synchronous archive effect while retaining live policy authority.
+/// Called only after SQLite admission; must not acquire storage or await.
+pub type NamespaceAuthority = dyn Fn(&mut dyn FnMut(&[String])) + Send + Sync;
+
+#[derive(Clone)]
+enum NamespaceScope {
+    Fixed(Vec<String>),
+    Live(Arc<NamespaceAuthority>),
+}
+
+fn with_namespaces(
+    scope: Option<&NamespaceScope>,
+    effect: &mut impl FnMut(Option<&[String]>) -> anyhow::Result<Vec<MemoryEntry>>,
+) -> anyhow::Result<Vec<MemoryEntry>> {
+    match scope {
+        None => effect(None),
+        Some(NamespaceScope::Fixed(names)) => {
+            if names.is_empty() {
+                Ok(Vec::new())
+            } else {
+                effect(Some(names))
+            }
+        }
+        Some(NamespaceScope::Live(authority)) => {
+            let mut result = Err(anyhow::Error::msg("archive authority unavailable"));
+            authority(&mut |names| {
+                result = if names.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    effect(Some(names))
+                };
+            });
+            result
+        }
+    }
+}
+
 impl SqliteMemory {
     pub fn new(alias: &str, workspace_dir: &Path) -> anyhow::Result<Self> {
         Self::with_embedder(
@@ -1025,16 +1062,20 @@ impl SqliteMemory {
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
-        allowed_namespaces: Option<&[String]>,
+        namespaces: Option<NamespaceScope>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let conn = self.conn.clone();
         let sid = session_id.map(String::from);
         let since_owned = since.map(String::from);
         let until_owned = until.map(String::from);
-        let namespaces = allowed_namespaces.map(<[String]>::to_vec);
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let conn = conn.lock();
+            let mut locked = conn.lock();
+            let conn = locked.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+            // Pin a real SQLite read snapshot before policy admission, including
+            // waits caused by another connection's database lock.
+            conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0))?;
+            with_namespaces(namespaces.as_ref(), &mut |namespaces| {
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
@@ -1061,7 +1102,7 @@ impl SqliteMemory {
                 param_values.push(Box::new(u.to_string()));
                 idx += 1;
             }
-            if let Some(namespaces) = namespaces.as_deref()
+            if let Some(namespaces) = namespaces
                 && !namespaces.is_empty()
             {
                 let namespace_placeholders = (0..namespaces.len())
@@ -1110,6 +1151,7 @@ impl SqliteMemory {
                 results.push(row?);
             }
             Ok(results)
+            })
         })
         .await?
     }
@@ -1122,11 +1164,8 @@ impl SqliteMemory {
         since: Option<&str>,
         until: Option<&str>,
         allowed_agent_ids: Option<Vec<String>>,
-        allowed_namespaces: Option<Vec<String>>,
+        allowed_namespaces: Option<NamespaceScope>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        if allowed_namespaces.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(Vec::new());
-        }
         let allowed_agent_ids = allowed_agent_ids.unwrap_or_default();
         // Time-only query: list by time range when no keywords.
         // Treat only a bare "*" as the same recent-entry request; keep
@@ -1138,13 +1177,7 @@ impl SqliteMemory {
                 self.count().await?.max(limit)
             };
             let raw = self
-                .recall_by_time_only(
-                    recall_limit,
-                    session_id,
-                    since,
-                    until,
-                    allowed_namespaces.as_deref(),
-                )
+                .recall_by_time_only(recall_limit, session_id, since, until, allowed_namespaces)
                 .await?;
             if allowed_agent_ids.is_empty() {
                 return Ok(raw);
@@ -1177,10 +1210,14 @@ impl SqliteMemory {
         let keyword_weight = self.keyword_weight;
         let search_mode = self.search_mode.clone();
         let allowed = allowed_agent_ids;
-        let allowed_namespaces = allowed_namespaces.unwrap_or_default();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let conn = conn.lock();
+            let mut locked = conn.lock();
+            let conn = locked.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+            // Pin a real SQLite read snapshot before policy admission, including
+            // waits caused by another connection's database lock.
+            conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0))?;
+            with_namespaces(allowed_namespaces.as_ref(), &mut |namespace_filter| {
             let session_ref = sid.as_deref();
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
@@ -1188,11 +1225,6 @@ impl SqliteMemory {
                 None
             } else {
                 Some(allowed.as_slice())
-            };
-            let namespace_filter = if allowed_namespaces.is_empty() {
-                None
-            } else {
-                Some(allowed_namespaces.as_slice())
             };
             // The vector stage is live only when an embedder produced a query
             // vector; it selects the scoped FTS variant. The BM25-only path
@@ -1540,6 +1572,7 @@ impl SqliteMemory {
 
             results.truncate(limit);
             Ok(results)
+            })
         })
         .await?
     }
@@ -1566,7 +1599,30 @@ impl SqliteMemory {
             since,
             until,
             None,
-            Some(allowed_namespaces.to_vec()),
+            Some(NamespaceScope::Fixed(allowed_namespaces.to_vec())),
+        )
+        .await
+    }
+
+    /// Search under live authority acquired after the blocking worker and DB
+    /// mutex wait. Namespace filtering remains inside SQL before ranking/limit.
+    pub async fn recall_with_namespace_authority(
+        &self,
+        authority: Arc<NamespaceAuthority>,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_scoped(
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            None,
+            Some(NamespaceScope::Live(authority)),
         )
         .await
     }
@@ -6844,6 +6900,118 @@ mod tests {
             assert_eq!(
                 again_keys, snapshot,
                 "list() must yield a deterministic order across reads"
+            );
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn namespace_authority_waits_for_real_storage_before_disclosure() {
+        for query in ["", "*", "needle"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let memory = Arc::new(SqliteMemory::new("agent", tmp.path()).unwrap());
+            memory
+                .store_with_metadata(
+                    "private",
+                    "needle private",
+                    MemoryCategory::Core,
+                    None,
+                    Some("discord.owner"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let policy = Arc::new(parking_lot::RwLock::new(vec!["discord.owner".to_string()]));
+            let policy_reader = Arc::clone(&policy);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let authority: Arc<NamespaceAuthority> = Arc::new(move |effect| {
+                let grant = policy_reader.read();
+                entered_tx.send(()).unwrap();
+                effect(&grant);
+            });
+            let handle = {
+                let _conn = memory.conn.lock();
+                let worker_memory = Arc::clone(&memory);
+                let handle = tokio::spawn(async move {
+                    worker_memory
+                        .recall_with_namespace_authority(authority, query, 1, None, None, None)
+                        .await
+                        .unwrap()
+                });
+                assert!(
+                    entered_rx
+                        .recv_timeout(std::time::Duration::from_millis(50))
+                        .is_err()
+                );
+                policy.write().clear();
+                handle
+            };
+            assert!(handle.await.unwrap().is_empty());
+            let visible = memory
+                .recall_in_namespaces(&["discord.owner".to_string()], query, 1, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(visible.len(), 1);
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn namespace_authority_follows_external_sqlite_read_wait() {
+        for query in ["", "needle"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let memory = Arc::new(SqliteMemory::new("agent", tmp.path()).unwrap());
+            memory
+                .store_with_metadata(
+                    "private",
+                    "needle private",
+                    MemoryCategory::Core,
+                    None,
+                    Some("discord.owner"),
+                    None,
+                )
+                .await
+                .unwrap();
+            memory
+                .conn
+                .lock()
+                .pragma_update(None, "journal_mode", "DELETE")
+                .unwrap();
+            let blocker = Connection::open(tmp.path().join("memory/brain.db")).unwrap();
+            blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            let policy = Arc::new(parking_lot::RwLock::new(vec!["discord.owner".to_string()]));
+            let reader = Arc::clone(&policy);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let authority: Arc<NamespaceAuthority> = Arc::new(move |effect| {
+                let grant = reader.read();
+                entered_tx.send(()).unwrap();
+                effect(&grant);
+            });
+            let worker_memory = Arc::clone(&memory);
+            let task = tokio::spawn(async move {
+                worker_memory
+                    .recall_with_namespace_authority(authority, query, 1, None, None, None)
+                    .await
+                    .unwrap()
+            });
+            assert!(
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err()
+            );
+            policy.write().clear();
+            blocker.execute_batch("ROLLBACK").unwrap();
+            assert!(task.await.unwrap().is_empty());
+            assert_eq!(
+                memory
+                    .recall_in_namespaces(
+                        &["discord.owner".to_string()],
+                        query,
+                        1,
+                        None,
+                        None,
+                        None
+                    )
+                    .await
+                    .unwrap()
+                    .len(),
+                1
             );
         }
     }

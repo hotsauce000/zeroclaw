@@ -687,19 +687,40 @@ impl SessionBackend for SessionStore {
         agent_alias: &str,
         channel_ids: &BTreeSet<String>,
     ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        let channel_ids = channel_ids.clone();
+        self.load_with_authority(session_key, agent_alias, &move |effect| {
+            effect(&channel_ids)
+        })
+    }
+
+    fn load_with_authority(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+        authority: &crate::session_backend::ChannelAuthority,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
         let _guard = self.mutation_lock.lock();
-        let Some(metadata) = self.metadata_for_session(session_key) else {
-            return Ok(ScopedSessionAccess::Missing);
-        };
-        if let Err(denial) = check_session_ownership(
-            metadata.agent_alias.as_deref(),
-            metadata.channel_id.as_deref(),
-            agent_alias,
-            channel_ids,
-        ) {
-            return Ok(ScopedSessionAccess::Denied(denial));
-        }
-        Ok(ScopedSessionAccess::Granted(self.load(session_key)))
+        let mut result = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "channel authority unavailable",
+        ));
+        authority(&mut |channel_ids| {
+            result = (|| {
+                let Some(metadata) = self.metadata_for_session(session_key) else {
+                    return Ok(ScopedSessionAccess::Missing);
+                };
+                if let Err(denial) = check_session_ownership(
+                    metadata.agent_alias.as_deref(),
+                    metadata.channel_id.as_deref(),
+                    agent_alias,
+                    channel_ids,
+                ) {
+                    return Ok(ScopedSessionAccess::Denied(denial));
+                }
+                Ok(ScopedSessionAccess::Granted(self.load(session_key)))
+            })();
+        });
+        result
     }
 
     fn append_if_owned(
@@ -709,20 +730,42 @@ impl SessionBackend for SessionStore {
         agent_alias: &str,
         channel_ids: &BTreeSet<String>,
     ) -> std::io::Result<ScopedSessionAccess<()>> {
+        let channel_ids = channel_ids.clone();
+        self.append_with_authority(session_key, message, agent_alias, &move |effect| {
+            effect(&channel_ids)
+        })
+    }
+
+    fn append_with_authority(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        agent_alias: &str,
+        authority: &crate::session_backend::ChannelAuthority,
+    ) -> std::io::Result<ScopedSessionAccess<()>> {
         let _guard = self.mutation_guard()?;
-        let Some(metadata) = self.metadata_for_session(session_key) else {
-            return Ok(ScopedSessionAccess::Missing);
-        };
-        if let Err(denial) = check_session_ownership(
-            metadata.agent_alias.as_deref(),
-            metadata.channel_id.as_deref(),
-            agent_alias,
-            channel_ids,
-        ) {
-            return Ok(ScopedSessionAccess::Denied(denial));
-        }
-        self.append_unlocked(session_key, message)?;
-        Ok(ScopedSessionAccess::Granted(()))
+        let mut result = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "channel authority unavailable",
+        ));
+        authority(&mut |channel_ids| {
+            result = (|| {
+                let Some(metadata) = self.metadata_for_session(session_key) else {
+                    return Ok(ScopedSessionAccess::Missing);
+                };
+                if let Err(denial) = check_session_ownership(
+                    metadata.agent_alias.as_deref(),
+                    metadata.channel_id.as_deref(),
+                    agent_alias,
+                    channel_ids,
+                ) {
+                    return Ok(ScopedSessionAccess::Denied(denial));
+                }
+                self.append_unlocked(session_key, message)?;
+                Ok(ScopedSessionAccess::Granted(()))
+            })();
+        });
+        result
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
@@ -785,6 +828,34 @@ impl SessionBackend for SessionStore {
 
     fn list_sessions(&self) -> Vec<String> {
         self.list_sessions()
+    }
+
+    fn list_with_authority(
+        &self,
+        agent_alias: &str,
+        authority: &crate::session_backend::ChannelAuthority,
+    ) -> std::io::Result<Vec<SessionMetadata>> {
+        let _guard = self.mutation_lock.lock();
+        let mut result = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "channel authority unavailable",
+        ));
+        authority(&mut |channels| {
+            result = Ok(self
+                .list_sessions_with_metadata()
+                .into_iter()
+                .filter(|meta| {
+                    check_session_ownership(
+                        meta.agent_alias.as_deref(),
+                        meta.channel_id.as_deref(),
+                        agent_alias,
+                        channels,
+                    )
+                    .is_ok()
+                })
+                .collect());
+        });
+        result
     }
 
     fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
@@ -867,32 +938,60 @@ impl SessionBackend for SessionStore {
         })
     }
 
+    fn claim_session_with_authority(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+        authority: &crate::session_backend::ChannelAuthority,
+    ) -> std::io::Result<crate::session_backend::SessionOwnerClaim> {
+        use crate::session_backend::SessionOwnerClaim;
+        let _guard = self.mutation_guard()?;
+        let ownership = self
+            .metadata_for_session(session_key)
+            .map(|metadata| (metadata.agent_alias, metadata.channel_id));
+        let mut claim = SessionOwnerClaim::Foreign("unavailable authority".into());
+        let mut result = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "channel authority unavailable",
+        ));
+        authority(&mut |channels| {
+            result = (|| {
+                if agent_alias.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "empty session owner",
+                    ));
+                }
+                if let Some((owner, channel)) = &ownership
+                    && let Err(denial) = check_session_ownership(
+                        owner.as_deref().filter(|value| !value.is_empty()),
+                        channel.as_deref().filter(|value| !value.is_empty()),
+                        agent_alias,
+                        channels,
+                    )
+                {
+                    claim = SessionOwnerClaim::Foreign(format!("{denial:?}"));
+                    return Ok(());
+                }
+                self.update_metadata_unlocked(session_key, |metadata| {
+                    metadata.agent_alias = Some(agent_alias.to_string());
+                })?;
+                claim = SessionOwnerClaim::Claimed;
+                Ok(())
+            })();
+        });
+        result?;
+        Ok(claim)
+    }
+
     fn claim_session_agent_alias(
         &self,
         session_key: &str,
         agent_alias: &str,
     ) -> std::io::Result<crate::session_backend::SessionOwnerClaim> {
-        use crate::session_backend::SessionOwnerClaim;
-
-        // Read and write under one guard so a concurrent claim in this
-        // process cannot interleave between the two. The guard is an
-        // in-process mutex, so this is not a cross-process claim; the SQLite
-        // backend decides it in the statement and is the one that holds under
-        // concurrent writers.
-        let _guard = self.mutation_guard()?;
-        let existing = self
-            .read_metadata(session_key)?
-            .and_then(|metadata| metadata.agent_alias)
-            .filter(|owner| !owner.is_empty());
-        if let Some(owner) = existing
-            && owner != agent_alias
-        {
-            return Ok(SessionOwnerClaim::Foreign(owner));
-        }
-        self.update_metadata_unlocked(session_key, |metadata| {
-            metadata.agent_alias = (!agent_alias.is_empty()).then(|| agent_alias.to_string());
-        })?;
-        Ok(SessionOwnerClaim::Claimed)
+        self.claim_session_with_authority(session_key, agent_alias, &|effect| {
+            effect(&BTreeSet::new())
+        })
     }
 
     fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
@@ -1861,5 +1960,92 @@ mod tests {
         let messages = backend.load("s1");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "pre-replace turn");
+    }
+    #[test]
+    fn live_authority_resolves_after_actual_storage_wait() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        for operation in ["load", "append", "list", "claim"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
+            store
+                .append("legacy", &ChatMessage::user("private bytes"))
+                .unwrap();
+            store
+                .set_session_context(
+                    "legacy",
+                    crate::session_backend::SessionContext {
+                        channel_id: Some("discord.owner"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let policy = Arc::new(parking_lot::RwLock::new(BTreeSet::from([
+                "discord.owner".to_string()
+            ])));
+            let blocked = store.mutation_lock.lock();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let worker_store = Arc::clone(&store);
+            let worker_policy = Arc::clone(&policy);
+            let worker = std::thread::spawn(move || {
+                let authority = move |effect: &mut dyn FnMut(&BTreeSet<String>)| {
+                    let grant = worker_policy.read();
+                    entered_tx.send(()).unwrap();
+                    effect(&grant);
+                };
+                match operation {
+                    "load" => assert!(matches!(
+                        worker_store
+                            .load_with_authority("legacy", "owner", &authority)
+                            .unwrap(),
+                        ScopedSessionAccess::Denied(_)
+                    )),
+                    "append" => assert!(matches!(
+                        worker_store
+                            .append_with_authority(
+                                "legacy",
+                                &ChatMessage::user("forbidden"),
+                                "owner",
+                                &authority
+                            )
+                            .unwrap(),
+                        ScopedSessionAccess::Denied(_)
+                    )),
+                    "list" => assert!(
+                        worker_store
+                            .list_with_authority("owner", &authority)
+                            .unwrap()
+                            .is_empty()
+                    ),
+                    "claim" => assert!(matches!(
+                        worker_store
+                            .claim_session_with_authority("legacy", "owner", &authority)
+                            .unwrap(),
+                        crate::session_backend::SessionOwnerClaim::Foreign(_)
+                    )),
+                    _ => unreachable!(),
+                }
+            });
+            assert!(
+                entered_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "policy must not be captured ahead of storage"
+            );
+            policy.write().clear();
+            drop(blocked);
+            worker.join().unwrap();
+            assert_eq!(store.load("legacy").len(), 1);
+            assert_eq!(store.get_session_agent_alias("legacy").unwrap(), None);
+            let grant = BTreeSet::from(["discord.owner".to_string()]);
+            assert!(matches!(
+                store.load_if_owned("legacy", "owner", &grant).unwrap(),
+                ScopedSessionAccess::Granted(_)
+            ));
+            assert!(matches!(
+                store
+                    .append_if_owned("legacy", &ChatMessage::user("allowed"), "owner", &grant)
+                    .unwrap(),
+                ScopedSessionAccess::Granted(())
+            ));
+        }
     }
 }

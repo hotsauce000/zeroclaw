@@ -8698,7 +8698,22 @@ fn stamp_session_routing_context(
         room_id,
         sender_id: Some(msg.sender.as_str()).filter(|s| !s.is_empty()),
     };
-    match store.claim_session_agent_alias(history_key, ctx.agent_alias.as_str()) {
+    let live = Arc::clone(&ctx.live_config);
+    let alias = ctx.agent_alias.to_string();
+    match store.claim_session_with_authority(
+        history_key,
+        ctx.agent_alias.as_str(),
+        &move |effect| {
+            let Some(config) = live.try_read() else {
+                return;
+            };
+            let channels = config
+                .channel_refs_owned_by_agent(&alias)
+                .into_iter()
+                .collect();
+            effect(&channels);
+        },
+    ) {
         Ok(zeroclaw_infra::session_backend::SessionOwnerClaim::Claimed) => {}
         Ok(zeroclaw_infra::session_backend::SessionOwnerClaim::Foreign(owner)) => {
             ::zeroclaw_log::record!(
@@ -8708,7 +8723,7 @@ fn stamp_session_routing_context(
                     .with_attrs(::serde_json::json!({
                         "history_key": history_key,
                         "routed_agent": ctx.agent_alias.as_str(),
-                        "owning_agent": owner,
+                        "ownership_denial": owner,
                         "error_key": "session_owner_conflict",
                     })),
                 "Inbound message routed to an agent that does not own this session; refusing the turn"
@@ -21209,6 +21224,144 @@ temperature = 0.3
         );
     }
 
+    #[tokio::test]
+    async fn inbound_legacy_collision_preserves_owner_before_model_and_passive_append() {
+        for backend_name in ["sqlite", "jsonl"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store: Arc<dyn SessionBackend> =
+                Arc::from(zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap());
+            let mut config = Config::default();
+            config.agents.clear();
+            for (agent, channel) in [("agent-a", "a"), ("agent-b", "a_b")] {
+                config.agents.insert(
+                    agent.into(),
+                    zeroclaw_config::schema::AliasedAgentConfig {
+                        enabled: true,
+                        channels: vec![format!("webhook.{channel}").into()],
+                        ..Default::default()
+                    },
+                );
+                config.channels.webhook.insert(
+                    channel.into(),
+                    zeroclaw_config::schema::WebhookConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                );
+            }
+            let provider = Arc::new(HistoryCaptureModelProvider::default());
+            let ctx = Arc::new(ChannelRuntimeContext {
+                session_store: Some(Arc::clone(&store)),
+                agent_alias: Arc::new("agent-b".into()),
+                model_provider: provider.clone(),
+                max_tool_iterations: 1,
+                live_config: Arc::new(RwLock::new(config)),
+                ..(*router_test_ctx()).clone()
+            });
+            let msg = ChannelMessage {
+                id: "collision".into(),
+                sender: "alice".into(),
+                reply_target: "b".into(),
+                content: "Summarize the prior discussion".into(),
+                channel: "webhook".into(),
+                channel_alias: Some("a_b".into()),
+                thread_ts: Some("b".into()),
+                ..Default::default()
+            };
+            let key = runtime_conversation_history_key(&ctx, &msg);
+            let original_msg = ChannelMessage {
+                channel_alias: Some("a".into()),
+                reply_target: "b_b".into(),
+                ..msg.clone()
+            };
+            assert_eq!(runtime_conversation_history_key(&ctx, &original_msg), key);
+
+            store
+                .append(&key, &ChatMessage::user("A_ONLY_SECRET"))
+                .unwrap();
+            store
+                .set_session_context(
+                    &key,
+                    zeroclaw_infra::session_backend::SessionContext {
+                        channel_id: Some("webhook.a"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            for passive in [false, true] {
+                process_channel_message(
+                    Arc::clone(&ctx),
+                    ChannelMessage {
+                        passive_context: passive,
+                        ..msg.clone()
+                    },
+                    CancellationToken::new(),
+                )
+                .await;
+                assert!(provider.calls.lock().unwrap().is_empty());
+                assert_eq!(store.load(&key).len(), 1);
+                assert_eq!(store.load(&key)[0].content, "A_ONLY_SECRET");
+                let metadata = store.get_session_metadata(&key).unwrap();
+                assert_eq!(metadata.agent_alias, None);
+                assert_eq!(metadata.channel_id.as_deref(), Some("webhook.a"));
+                assert!(
+                    ctx.conversation_histories
+                        .lock()
+                        .unwrap()
+                        .peek(&key)
+                        .is_none()
+                );
+            }
+            let owner = Arc::new(ChannelRuntimeContext {
+                agent_alias: Arc::new("agent-a".into()),
+                ..(*ctx).clone()
+            });
+            for invalid in ["disabled", "ambiguous", "unknown"] {
+                let saved = owner.live_config.read().clone();
+                {
+                    let mut cfg = owner.live_config.write();
+                    match invalid {
+                        "disabled" => cfg.channels.webhook.get_mut("a").unwrap().enabled = false,
+                        "ambiguous" => cfg
+                            .agents
+                            .get_mut("agent-b")
+                            .unwrap()
+                            .channels
+                            .push("webhook.a".into()),
+                        "unknown" => {
+                            cfg.channels.webhook.remove("a");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                assert!(
+                    !stamp_session_routing_context(&owner, &msg, &key),
+                    "{invalid}"
+                );
+                assert_eq!(store.get_session_agent_alias(&key).unwrap(), None);
+                *owner.live_config.write() = saved;
+            }
+            // Non-vacuous provider control: own legacy history reaches a real turn.
+            process_channel_message(Arc::clone(&owner), original_msg, CancellationToken::new())
+                .await;
+            assert!(!provider.calls.lock().unwrap().is_empty());
+            assert!(
+                provider
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .any(|(_, text)| text.contains("A_ONLY_SECRET"))
+            );
+            assert_eq!(
+                store.get_session_agent_alias(&key).unwrap().as_deref(),
+                Some("agent-a")
+            );
+            assert!(stamp_session_routing_context(&ctx, &msg, "genuinely-new"));
+        }
+    }
+
     /// Two conversations can normalize onto one storage key, and an operator
     /// reassigning a channel points the next message at a transcript another
     /// agent owns. Routing decides which agent answers; it must not decide
@@ -21223,14 +21376,9 @@ temperature = 0.3
         session_store
             .append("webhook_a_b_b_b_alice", &ChatMessage::user("A_ONLY_SECRET"))
             .unwrap();
-        let claim_a = session_store
-            .claim_session_agent_alias("webhook_a_b_b_b_alice", "agent-a")
+        session_store
+            .set_session_agent_alias("webhook_a_b_b_b_alice", "agent-a")
             .unwrap();
-        assert_eq!(
-            claim_a,
-            zeroclaw_infra::session_backend::SessionOwnerClaim::Claimed,
-            "the first claim on an unowned session must succeed"
-        );
 
         // Agent B is routed onto the same computed key.
         let ctx_b = ChannelRuntimeContext {

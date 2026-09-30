@@ -20,9 +20,8 @@ static TOOL_DESCRIPTION: OnceLock<String> = OnceLock::new();
 /// Discord alias; each row's `namespace` records the ChannelRef
 /// (`discord.<alias>`) of the channel that archived it. An agent reads
 /// rows whose namespace is one of its owned channel refs, plus
-/// unattributed legacy rows when the install has at most one enabled
-/// agent (a sole agent owns everything; in multi-agent installs legacy
-/// rows fail closed).
+/// unattributed legacy rows only for the currently enabled sole agent.
+/// Disabled/removed callers and zero/multiple enabled agents fail closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// The archive namespaces one agent may search, and whether legacy
 /// unattributed rows are included.
@@ -40,7 +39,7 @@ pub struct DiscordArchiveGrant {
 /// the session. Resolving per call is what makes revocation take effect.
 enum ArchiveGrantSource {
     Fixed(DiscordArchiveGrant),
-    Live(Arc<dyn Fn() -> DiscordArchiveGrant + Send + Sync>),
+    Live(Arc<zeroclaw_memory::sqlite::NamespaceAuthority>),
 }
 
 pub struct DiscordArchiveScope {
@@ -66,26 +65,26 @@ impl DiscordArchiveScope {
         }
     }
 
-    /// A grant resolved from canonical config on every call.
-    pub fn live(resolve: Arc<dyn Fn() -> DiscordArchiveGrant + Send + Sync>) -> Self {
+    /// Live authority invoked after storage admission. The callback retains
+    /// its policy guard through the supplied synchronous effect.
+    pub fn live(resolve: Arc<zeroclaw_memory::sqlite::NamespaceAuthority>) -> Self {
         Self {
             source: ArchiveGrantSource::Live(resolve),
         }
     }
 
-    fn allowed_namespaces(&self) -> Vec<String> {
-        let grant = match &self.source {
-            ArchiveGrantSource::Fixed(grant) => DiscordArchiveGrant {
-                owned_channel_refs: grant.owned_channel_refs.clone(),
-                include_unattributed: grant.include_unattributed,
-            },
-            ArchiveGrantSource::Live(resolve) => resolve(),
-        };
-        let mut namespaces: Vec<String> = grant.owned_channel_refs.into_iter().collect();
-        if grant.include_unattributed {
-            namespaces.push(LEGACY_NAMESPACE.to_string());
+    fn authority(&self) -> Arc<zeroclaw_memory::sqlite::NamespaceAuthority> {
+        match &self.source {
+            ArchiveGrantSource::Live(authority) => Arc::clone(authority),
+            ArchiveGrantSource::Fixed(grant) => {
+                let mut namespaces: Vec<String> =
+                    grant.owned_channel_refs.iter().cloned().collect();
+                if grant.include_unattributed {
+                    namespaces.push(LEGACY_NAMESPACE.to_string());
+                }
+                Arc::new(move |effect| effect(&namespaces))
+            }
         }
-        namespaces
     }
 }
 
@@ -227,13 +226,16 @@ impl Tool for DiscordSearchTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(10, |v| v as usize);
 
-        let allowed_namespaces = self
-            .archive_scope
-            .as_ref()
-            .map(DiscordArchiveScope::allowed_namespaces);
-        let recalled = if let Some(allowed_namespaces) = allowed_namespaces.as_deref() {
+        let recalled = if let Some(scope) = &self.archive_scope {
             self.discord_memory
-                .recall_in_namespaces(allowed_namespaces, query, limit, channel_id, since, until)
+                .recall_with_namespace_authority(
+                    scope.authority(),
+                    query,
+                    limit,
+                    channel_id,
+                    since,
+                    until,
+                )
                 .await
         } else {
             self.discord_memory

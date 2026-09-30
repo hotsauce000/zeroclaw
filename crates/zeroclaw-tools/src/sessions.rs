@@ -12,9 +12,11 @@ use zeroclaw_infra::acp_session_store::{
     AcpSessionAccess, AcpSessionData, AcpSessionStore, AcpSessionSummary,
 };
 use zeroclaw_infra::session_backend::{
-    ScopedSessionAccess, SessionBackend, SessionMetadata, SessionOwnershipDenial,
-    check_session_ownership,
+    ScopedSessionAccess, SessionBackend, SessionOwnershipDenial, check_session_ownership,
 };
+
+#[cfg(test)]
+use zeroclaw_infra::session_backend::SessionMetadata;
 
 static SESSIONS_LIST_DESCRIPTION: OnceLock<String> = OnceLock::new();
 static SESSIONS_HISTORY_DESCRIPTION: OnceLock<String> = OnceLock::new();
@@ -195,14 +197,28 @@ fn resolve_existing_session_key(backend: &dyn SessionBackend, session_id: &str) 
 #[derive(Clone)]
 enum OwnedChannels {
     Fixed(BTreeSet<String>),
-    Live(Arc<dyn Fn() -> BTreeSet<String> + Send + Sync>),
+    Live(Arc<zeroclaw_infra::session_backend::ChannelAuthority>),
 }
 
 impl OwnedChannels {
+    fn authority(&self) -> Arc<zeroclaw_infra::session_backend::ChannelAuthority> {
+        match self {
+            Self::Fixed(channels) => {
+                let channels = channels.clone();
+                Arc::new(move |effect| effect(&channels))
+            }
+            Self::Live(authority) => Arc::clone(authority),
+        }
+    }
+
     fn resolve(&self) -> BTreeSet<String> {
         match self {
             Self::Fixed(ids) => ids.clone(),
-            Self::Live(resolve) => resolve(),
+            Self::Live(resolve) => {
+                let mut channels = BTreeSet::new();
+                resolve(&mut |current| channels = current.clone());
+                channels
+            }
         }
     }
 }
@@ -248,7 +264,7 @@ impl SessionOwnershipScope {
     /// Channel ownership resolved from canonical config on every check.
     pub fn with_live_channels(
         agent_alias: impl Into<String>,
-        resolve: Arc<dyn Fn() -> BTreeSet<String> + Send + Sync>,
+        resolve: Arc<zeroclaw_infra::session_backend::ChannelAuthority>,
     ) -> Self {
         Self {
             agent_alias: agent_alias.into(),
@@ -302,6 +318,7 @@ impl SessionOwnershipScope {
     /// Non-erroring form of the same three-tier ownership predicate, for
     /// filtering listings: agent match, else owned-channel match, else not
     /// owned (unattributed sessions are not owned by anyone).
+    #[cfg(test)]
     fn owns_metadata(&self, metadata: &SessionMetadata) -> bool {
         check_session_ownership(
             metadata.agent_alias.as_deref(),
@@ -398,15 +415,14 @@ impl Tool for SessionsListTool {
 
         // Ownership-filter before the limit so foreign sessions cannot
         // crowd owned sessions out of a capped listing.
-        let mut metadata: Vec<SessionListEntry> = self
-            .backend
-            .list_sessions_with_metadata()
+        let metadata = match &self.ownership_scope {
+            Some(scope) => self
+                .backend
+                .list_with_authority(&scope.agent_alias, scope.channel_ids.authority().as_ref())?,
+            None => self.backend.list_sessions_with_metadata(),
+        };
+        let mut metadata: Vec<SessionListEntry> = metadata
             .into_iter()
-            .filter(|meta| {
-                self.ownership_scope
-                    .as_ref()
-                    .is_none_or(|scope| scope.owns_metadata(meta))
-            })
             .map(|meta| SessionListEntry {
                 channel: meta.key.split("__").next().unwrap_or(&meta.key).to_string(),
                 key: meta.key,
@@ -603,10 +619,10 @@ impl Tool for SessionsHistoryTool {
                         error: None,
                     });
                 };
-                match self.backend.load_if_owned(
+                match self.backend.load_with_authority(
                     &target_session_key,
                     &scope.agent_alias,
-                    &scope.channel_ids.resolve(),
+                    scope.channel_ids.authority().as_ref(),
                 ) {
                     Ok(ScopedSessionAccess::Granted(messages)) => messages,
                     Ok(ScopedSessionAccess::Missing) => Vec::new(),
@@ -863,11 +879,11 @@ impl Tool for SessionsSendTool {
 
         let chat_msg = zeroclaw_api::model_provider::ChatMessage::user(message);
         let access = match &self.ownership_scope {
-            Some(scope) => self.backend.append_if_owned(
+            Some(scope) => self.backend.append_with_authority(
                 &target_session_key,
                 &chat_msg,
                 &scope.agent_alias,
-                &scope.channel_ids.resolve(),
+                scope.channel_ids.authority().as_ref(),
             ),
             None => self
                 .backend
@@ -1335,56 +1351,92 @@ mod tests {
             self.inner.append(key, msg)
         }
 
-        fn load_if_owned(
+        fn load_with_authority(
             &self,
             key: &str,
             agent_alias: &str,
-            channel_ids: &BTreeSet<String>,
+            authority: &zeroclaw_infra::session_backend::ChannelAuthority,
         ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
             let metadata = self.metadata.lock().unwrap();
-            let Some(session) = metadata
-                .get(key)
-                .cloned()
-                .or_else(|| self.inner.get_session_metadata(key))
-            else {
-                return Ok(ScopedSessionAccess::Missing);
-            };
-            if let Err(denial) = check_session_ownership(
-                session.agent_alias.as_deref(),
-                session.channel_id.as_deref(),
-                agent_alias,
-                channel_ids,
-            ) {
-                return Ok(ScopedSessionAccess::Denied(denial));
-            }
-            Ok(ScopedSessionAccess::Granted(self.inner.load(key)))
+            let mut result = Err(std::io::Error::other("authority unavailable"));
+            authority(&mut |channel_ids| {
+                result = (|| {
+                    let Some(session) = metadata
+                        .get(key)
+                        .cloned()
+                        .or_else(|| self.inner.get_session_metadata(key))
+                    else {
+                        return Ok(ScopedSessionAccess::Missing);
+                    };
+                    if let Err(denial) = check_session_ownership(
+                        session.agent_alias.as_deref(),
+                        session.channel_id.as_deref(),
+                        agent_alias,
+                        channel_ids,
+                    ) {
+                        return Ok(ScopedSessionAccess::Denied(denial));
+                    }
+                    Ok(ScopedSessionAccess::Granted(self.inner.load(key)))
+                })();
+            });
+            result
         }
 
-        fn append_if_owned(
+        fn append_with_authority(
             &self,
             key: &str,
             msg: &ChatMessage,
             agent_alias: &str,
-            channel_ids: &BTreeSet<String>,
+            authority: &zeroclaw_infra::session_backend::ChannelAuthority,
         ) -> std::io::Result<ScopedSessionAccess<()>> {
             let metadata = self.metadata.lock().unwrap();
-            let Some(session) = metadata
-                .get(key)
-                .cloned()
-                .or_else(|| self.inner.get_session_metadata(key))
-            else {
-                return Ok(ScopedSessionAccess::Missing);
-            };
-            if let Err(denial) = check_session_ownership(
-                session.agent_alias.as_deref(),
-                session.channel_id.as_deref(),
-                agent_alias,
-                channel_ids,
-            ) {
-                return Ok(ScopedSessionAccess::Denied(denial));
-            }
-            self.inner.append(key, msg)?;
-            Ok(ScopedSessionAccess::Granted(()))
+            let mut result = Err(std::io::Error::other("authority unavailable"));
+            authority(&mut |channel_ids| {
+                result = (|| {
+                    let Some(session) = metadata
+                        .get(key)
+                        .cloned()
+                        .or_else(|| self.inner.get_session_metadata(key))
+                    else {
+                        return Ok(ScopedSessionAccess::Missing);
+                    };
+                    if let Err(denial) = check_session_ownership(
+                        session.agent_alias.as_deref(),
+                        session.channel_id.as_deref(),
+                        agent_alias,
+                        channel_ids,
+                    ) {
+                        return Ok(ScopedSessionAccess::Denied(denial));
+                    }
+                    self.inner.append(key, msg)?;
+                    Ok(ScopedSessionAccess::Granted(()))
+                })();
+            });
+            result
+        }
+
+        fn list_with_authority(
+            &self,
+            agent_alias: &str,
+            authority: &zeroclaw_infra::session_backend::ChannelAuthority,
+        ) -> std::io::Result<Vec<SessionMetadata>> {
+            let mut result = Vec::new();
+            authority(&mut |channels| {
+                result = self
+                    .list_sessions_with_metadata()
+                    .into_iter()
+                    .filter(|meta| {
+                        check_session_ownership(
+                            meta.agent_alias.as_deref(),
+                            meta.channel_id.as_deref(),
+                            agent_alias,
+                            channels,
+                        )
+                        .is_ok()
+                    })
+                    .collect();
+            });
+            Ok(result)
         }
 
         fn remove_last(&self, key: &str) -> std::io::Result<bool> {
@@ -1468,26 +1520,26 @@ mod tests {
             self.inner.append(key, msg)
         }
 
-        fn load_if_owned(
+        fn load_with_authority(
             &self,
             key: &str,
             agent_alias: &str,
-            channel_ids: &BTreeSet<String>,
+            authority: &zeroclaw_infra::session_backend::ChannelAuthority,
         ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
             self.pause();
-            self.inner.load_if_owned(key, agent_alias, channel_ids)
+            self.inner.load_with_authority(key, agent_alias, authority)
         }
 
-        fn append_if_owned(
+        fn append_with_authority(
             &self,
             key: &str,
             msg: &ChatMessage,
             agent_alias: &str,
-            channel_ids: &BTreeSet<String>,
+            authority: &zeroclaw_infra::session_backend::ChannelAuthority,
         ) -> std::io::Result<ScopedSessionAccess<()>> {
             self.pause();
             self.inner
-                .append_if_owned(key, msg, agent_alias, channel_ids)
+                .append_with_authority(key, msg, agent_alias, authority)
         }
 
         fn remove_last(&self, key: &str) -> std::io::Result<bool> {
@@ -2235,6 +2287,79 @@ mod tests {
                     .all(|message| message.content != "must not cross ownership"),
                 "backend={backend_name}: {messages:?}"
             );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retained_tools_resolve_channel_grant_after_backend_admission() {
+        for backend_name in ["sqlite", "jsonl"] {
+            for send in [false, true] {
+                for revoked in [false, true] {
+                    let tmp = TempDir::new().unwrap();
+                    let inner =
+                        zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+                    inner
+                        .append("gw_shared", &ChatMessage::user("channel private history"))
+                        .unwrap();
+                    inner
+                        .set_session_context(
+                            "gw_shared",
+                            zeroclaw_infra::session_backend::SessionContext {
+                                channel_id: Some("discord.owner"),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    let policy = Arc::new(std::sync::RwLock::new(BTreeSet::from([
+                        "discord.owner".to_string(),
+                    ])));
+                    let reader = Arc::clone(&policy);
+                    let scope = SessionOwnershipScope::with_live_channels(
+                        "owner",
+                        Arc::new(move |effect| effect(&reader.read().unwrap())),
+                    );
+                    let (access_ready, access_rx) = std::sync::mpsc::sync_channel(0);
+                    let (resume_tx, resume_access) = std::sync::mpsc::sync_channel(0);
+                    let backend: Arc<dyn SessionBackend> = Arc::new(PauseBeforeAccessBackend {
+                        inner: Arc::clone(&inner),
+                        access_ready,
+                        resume_access: Mutex::new(resume_access),
+                    });
+                    let tool: Arc<dyn Tool> = if send {
+                        Arc::new(SessionsSendTool::for_agent(backend, test_security(), scope))
+                    } else {
+                        Arc::new(SessionsHistoryTool::for_agent(
+                            backend,
+                            test_security(),
+                            scope,
+                        ))
+                    };
+                    let task = zeroclaw_spawn::spawn!(async move {
+                        tool.execute(json!({"session_id":"shared", "message":"new message"}))
+                            .await
+                            .unwrap()
+                    });
+                    access_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap();
+                    if revoked {
+                        policy.write().unwrap().clear();
+                    }
+                    resume_tx.send(()).unwrap();
+                    let result = task.await.unwrap();
+                    assert_eq!(
+                        result.success, !revoked,
+                        "{backend_name} send={send} revoked={revoked}: {result:?}"
+                    );
+                    if revoked {
+                        assert!(!result.output.contains("channel private history"));
+                    }
+                    assert_eq!(
+                        inner.load("gw_shared").len(),
+                        if send && !revoked { 2 } else { 1 }
+                    );
+                }
+            }
         }
     }
 
@@ -3290,7 +3415,7 @@ mod tests {
         // retained agent's tool would be.
         let scope = SessionOwnershipScope::with_live_channels(
             "agent-a",
-            Arc::new(move || reader.read().unwrap().clone()),
+            Arc::new(move |effect| effect(&reader.read().unwrap())),
         );
 
         let metadata = session_metadata("s1", None, Some("discord.ops"), 1);
