@@ -488,6 +488,18 @@ fn reject_masked_secret_value(
     Ok(())
 }
 
+/// The API error for a set-prop that refused to create the entry it names. A
+/// reserved or retired agent alias is the caller's to change (400); an
+/// unreadable recovery journal is a server fault (500).
+fn vivify_refusal_error(refusal: &zeroclaw_config::schema::VivifyRefusal) -> ConfigApiError {
+    use zeroclaw_config::schema::VivifyRefusal;
+    let code = match refusal {
+        VivifyRefusal::Reserved | VivifyRefusal::Retired { .. } => ConfigApiCode::ValidationFailed,
+        VivifyRefusal::RecoveryUnreadable(_) => ConfigApiCode::InternalError,
+    };
+    ConfigApiError::new(code, refusal.to_string())
+}
+
 /// `POST /api/channels/bind` request body. The GUI/HTTP equivalent of
 /// `zeroclaw channel bind-<type> <identity> --alias <alias>`: authorize an
 /// operator-named identity on one channel alias without the in-chat
@@ -797,16 +809,10 @@ pub async fn handle_prop_put(
 ) -> Response {
     let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let mut new_config = state.config.read().clone();
-    if new_config.ensure_map_key_for_path(&body.path) {
-        // Refused to vivify the reserved `default` agent: surface the same
-        // reserved error the explicit create surfaces do, not a generic 404.
-        return error_response(
-            ConfigApiError::new(
-                ConfigApiCode::ValidationFailed,
-                "alias `default` is reserved and cannot be created",
-            )
-            .with_path(&body.path),
-        );
+    if let Err(refusal) = new_config.ensure_map_key_for_path_checked(&body.path) {
+        // Refused to vivify the entry: surface the same error the explicit
+        // create surfaces do, not a generic 404.
+        return error_response(vivify_refusal_error(&refusal).with_path(&body.path));
     }
     let info = match lookup_prop_field(&new_config, &body.path) {
         Some(info) => info,
@@ -1455,6 +1461,18 @@ pub async fn handle_map_key(
                         format!("alias `{a}` is reserved and cannot be created"),
                     )
                     .with_path(format!("{path}.{key}")),
+                );
+            }
+            Err(e @ zeroclaw_config::alias_refs::CreateError::Retired { .. }) => {
+                return error_response(
+                    ConfigApiError::new(ConfigApiCode::ValidationFailed, e.to_string())
+                        .with_path(format!("{path}.{key}")),
+                );
+            }
+            Err(e @ zeroclaw_config::alias_refs::CreateError::RecoveryUnreadable(_)) => {
+                return error_response(
+                    ConfigApiError::new(ConfigApiCode::InternalError, e.to_string())
+                        .with_path(format!("{path}.{key}")),
                 );
             }
             Err(zeroclaw_config::alias_refs::CreateError::Invalid(msg)) => {
@@ -2200,16 +2218,15 @@ pub async fn handle_patch(
 
     for (idx, op) in ops.iter().enumerate() {
         let path = json_pointer_to_dotted(&op.path);
-        if matches!(op.op.as_str(), "add" | "replace") && working.ensure_map_key_for_path(&path) {
-            // Refused to vivify the reserved `default` agent: surface the same
-            // reserved error the explicit create surfaces do, not a generic 404.
+        if matches!(op.op.as_str(), "add" | "replace")
+            && let Err(refusal) = working.ensure_map_key_for_path_checked(&path)
+        {
+            // Refused to vivify the entry: surface the same error the explicit
+            // create surfaces do, not a generic 404.
             return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::ValidationFailed,
-                    "alias `default` is reserved and cannot be created",
-                )
-                .with_path(&path)
-                .with_op_index(idx),
+                vivify_refusal_error(&refusal)
+                    .with_path(&path)
+                    .with_op_index(idx),
             );
         }
         let info = lookup_prop_field(&working, &path);

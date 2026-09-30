@@ -3114,6 +3114,8 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, key) {
             Ok(created) => created,
             Err(zeroclaw_config::alias_refs::CreateError::Reserved(_)) => return Ok(false),
+            // A retired alias or an unreadable recovery journal is an error the
+            // operator must see, never the reserved case's silent no-op.
             Err(e) => return Err(anyhow::Error::msg(e.to_string())),
         };
     if created {
@@ -9524,17 +9526,21 @@ Add pricing to the active provider profile or supply a catalog entry."
                         raw_path.to_string()
                     };
                     if matches!(op_name, "add" | "replace")
-                        && config.ensure_map_or_list_key_for_path(&path)
+                        && let Err(refusal) = config.ensure_map_or_list_key_for_path_checked(&path)
                     {
-                        let err = ConfigApiError::new(
-                            ConfigApiCode::ValidationFailed,
-                            "alias `default` is reserved and cannot be created",
-                        )
-                        .with_path(&path)
-                        .with_op_index(idx);
-                        let human = format!(
-                            "op[{idx}] `{op_name}` on `{path}`: alias `default` is reserved and cannot be created"
-                        );
+                        let code = match refusal {
+                            zeroclaw_config::schema::VivifyRefusal::RecoveryUnreadable(_) => {
+                                ConfigApiCode::InternalError
+                            }
+                            zeroclaw_config::schema::VivifyRefusal::Reserved
+                            | zeroclaw_config::schema::VivifyRefusal::Retired { .. } => {
+                                ConfigApiCode::ValidationFailed
+                            }
+                        };
+                        let err = ConfigApiError::new(code, refusal.to_string())
+                            .with_path(&path)
+                            .with_op_index(idx);
+                        let human = format!("op[{idx}] `{op_name}` on `{path}`: {refusal}");
                         config_patch_fail_json_or_human(json, err, human)?;
                     }
                     let comment = match object.get("comment") {
@@ -15920,6 +15926,47 @@ mod tests {
             config.agents.contains_key("researcher"),
             "researcher alias should have been created"
         );
+    }
+
+    #[test]
+    fn ensure_map_key_for_prop_path_errors_on_an_agent_alias_a_rename_retired() {
+        use zeroclaw_config::agent_recovery_journal::{
+            AgentRecoveryJournal, RecoveryOperation, RecoveryPhase, RecoveryRecord,
+        };
+
+        let data_dir = tempfile::tempdir().expect("temp data dir");
+        let journal = AgentRecoveryJournal::for_data_dir(data_dir.path());
+        let guard = journal
+            .lock(std::time::Duration::ZERO)
+            .expect("lock the journal");
+        journal
+            .upsert(
+                &guard,
+                RecoveryRecord {
+                    operation: RecoveryOperation::Rename,
+                    from: "researcher".to_string(),
+                    to: "analyst".to_string(),
+                    phase: RecoveryPhase::Committed,
+                    source_workspace: None,
+                    armed_at: "2026-01-01T00:00:00+00:00".to_string(),
+                },
+            )
+            .expect("arm the journal");
+        let mut config = Config {
+            data_dir: data_dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        // Unlike the reserved `default` agent, a retired alias is an error the
+        // operator sees, not a silent no-op.
+        let err = ensure_map_key_for_prop_path(&mut config, "agents.researcher.enabled")
+            .expect_err("a retired agent alias must not be materialized");
+        assert!(
+            err.to_string()
+                .contains("retired by an unfinished agent rename"),
+            "{err}"
+        );
+        assert!(!config.agents.contains_key("researcher"));
     }
 
     #[test]

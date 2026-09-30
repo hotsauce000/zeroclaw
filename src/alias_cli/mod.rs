@@ -106,7 +106,8 @@ fn create_entry(config: &mut Config, section: &str, alias: &str) -> Result<()> {
     // Shared guarded boundary: refuses the reserved `default` agent here too (an
     // operator create surface), and delegates unchanged for every other section.
     // The Reserved rejection is localized via Fluent like the delete/rename guards
-    // below; Invalid (unknown section) keeps its pre-existing bare error.
+    // below; Invalid (unknown section) keeps its pre-existing bare error, and the
+    // recovery-journal refusals surface the config crate's error text.
     let created = match alias_refs::create_map_key_checked(config, section, alias) {
         Ok(created) => created,
         Err(alias_refs::CreateError::Reserved(_)) => bail!(
@@ -116,6 +117,10 @@ fn create_entry(config: &mut Config, section: &str, alias: &str) -> Result<()> {
                 "the `default` agent is reserved and cannot be created"
             )
         ),
+        Err(
+            e @ (alias_refs::CreateError::Retired { .. }
+            | alias_refs::CreateError::RecoveryUnreadable(_)),
+        ) => return Err(anyhow::Error::msg(e.to_string())),
         Err(alias_refs::CreateError::Invalid(msg)) => return Err(anyhow::Error::msg(msg)),
     };
     if created {

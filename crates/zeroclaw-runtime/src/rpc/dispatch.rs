@@ -7754,13 +7754,16 @@ impl RpcDispatcher {
         prop: &str,
         value: &Value,
     ) -> Result<(), JsonRpcError> {
-        if config.ensure_map_key_for_path(prop) {
-            // Refused to vivify the reserved `default` agent: return a
-            // reserved error rather than a downstream "Unknown property".
-            return Err(rpc_err(
-                INVALID_PARAMS,
-                "alias `default` is reserved and cannot be created",
-            ));
+        if let Err(refusal) = config.ensure_map_key_for_path_checked(prop) {
+            // Refused to vivify the entry: return that refusal rather than a
+            // downstream "Unknown property". Only an unreadable recovery
+            // journal is a server fault.
+            let code = match refusal {
+                zeroclaw_config::schema::VivifyRefusal::RecoveryUnreadable(_) => INTERNAL_ERROR,
+                zeroclaw_config::schema::VivifyRefusal::Reserved
+                | zeroclaw_config::schema::VivifyRefusal::Retired { .. } => INVALID_PARAMS,
+            };
+            return Err(rpc_err(code, refusal.to_string()));
         }
         let info = config.prop_fields().into_iter().find(|f| f.name == prop);
         // Polymorphic value: strings pass through, everything else coerced.
@@ -8225,7 +8228,15 @@ impl RpcDispatcher {
             // path cannot author an `agents.default` the rename guard then traps.
             let created =
                 zeroclaw_config::alias_refs::create_map_key_checked(config, &req.path, &req.key)
-                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+                    .map_err(|e| {
+                        let code = match e {
+                            zeroclaw_config::alias_refs::CreateError::RecoveryUnreadable(_) => {
+                                INTERNAL_ERROR
+                            }
+                            _ => INVALID_PARAMS,
+                        };
+                        rpc_err(code, e.to_string())
+                    })?;
             if created {
                 config.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
