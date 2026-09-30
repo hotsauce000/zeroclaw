@@ -6930,7 +6930,7 @@ mod tests {
             let handle = {
                 let _conn = memory.conn.lock();
                 let worker_memory = Arc::clone(&memory);
-                let handle = tokio::spawn(async move {
+                let handle = zeroclaw_spawn::spawn!(async move {
                     worker_memory
                         .recall_with_namespace_authority(authority, query, 1, None, None, None)
                         .await
@@ -6984,7 +6984,7 @@ mod tests {
                 effect(&grant);
             });
             let worker_memory = Arc::clone(&memory);
-            let task = tokio::spawn(async move {
+            let task = zeroclaw_spawn::spawn!(async move {
                 worker_memory
                     .recall_with_namespace_authority(authority, query, 1, None, None, None)
                     .await

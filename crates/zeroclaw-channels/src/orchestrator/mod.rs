@@ -21229,7 +21229,7 @@ temperature = 0.3
         for backend_name in ["sqlite", "jsonl"] {
             let tmp = tempfile::tempdir().unwrap();
             let store: Arc<dyn SessionBackend> =
-                Arc::from(zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap());
+                zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
             let mut config = Config::default();
             config.agents.clear();
             for (agent, channel) in [("agent-a", "a"), ("agent-b", "a_b")] {
