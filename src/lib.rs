@@ -205,7 +205,7 @@ Examples:
         #[arg(long, value_name = "DEVICE_ID", conflicts_with_all = ["new", "rotate"])]
         rotate_device: Option<String>,
 
-        /// With --new: bind the code to this [users.<name>] roster entry, so
+        /// With `--new`: bind the code to this `[users.<name>]` roster entry, so
         /// the device that redeems it authenticates as that user
         #[arg(
             long,
