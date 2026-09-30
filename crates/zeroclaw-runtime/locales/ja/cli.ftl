@@ -799,6 +799,7 @@ cli-plugin-installed-from = プラグインを {$source} からインストー�
 cli-plugin-installed-name-version = プラグイン {$name} v{$version} をインストールしました
 cli-plugin-config-entry-seeded = '{$name}' の [[plugins.entries]] を作成しました。プラグイン設定値は `zeroclaw config set plugins.entries.{$name}.config.<key>` で設定してください。
 cli-plugin-config-entry-key = 設定エントリキー ({$capability}): {$key}
+cli-plugin-config-entry-key-channel = 設定エントリキー (チャネル plugin.{$alias}): {$key}
 cli-plugin-config-entry-seed-skipped = 警告: '{$name}' の設定エントリ作成をスキップしました: ディスク上の [plugins] セクションが不正です。修復し、`name = "{$name}"` を含む [[plugins.entries]] ブロックを追加してから、`zeroclaw config set plugins.entries.{$name}.config.<key>` で値を設定してください。
 cli-plugin-egress-seeded = マニフェストの宣言に基づき '{$name}' に送信先を許可しました ({$count} 件):
 cli-plugin-egress-destination = → {$host}
@@ -829,6 +830,7 @@ cli-config-section-retired-wati = 警告: 廃止された WATI チャネル設�
 cli-config-section-retired-node-transport = 警告: 廃止された `[node_transport]` 設定は、レガシー HMAC ノードトランスポートが削除されたため無視されます。config.toml からこのセクションを削除してください。
 cli-plugin-removed = プラグイン '{$name}' を削除しました。
 cli-plugin-removed-grant-kept = 設定エントリ '{$key}' は送信許可 ({$grants}) とともに残ります。後で '{$name}' としてインストールされるパッケージはこれを引き継ぎます。許可を取り消すには '{$key}' という名前の [[plugins.entries]] 行を削除してください。
+cli-plugin-removed-binding-kept = チャネルバインディング plugin.{$alias} は引き続き '{$name}' を指しています。同じ名前のパッケージが再びインストールされるまで無効のままです。このバインディングを取り除くには [channels.plugin.{$alias}] テーブルを削除してください。
 cli-plugin-not-found = プラグイン '{$name}' が見つかりません。
 cli-plugin-legacy-detected = 注意: レガシーな場所 ({$path}) にあるプラグインはエージェントに読み込まれません。`zeroclaw plugin migrate` を実行して {$target} に移動してください。
 cli-plugin-migrated = {$count} 個のプラグインを {$path} から {$target} に移動しました。

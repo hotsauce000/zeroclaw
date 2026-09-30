@@ -1476,6 +1476,81 @@ mod tests {
         }
     }
 
+    /// The channel instance lines of `plugin info` and `plugin remove`.
+    ///
+    /// Both name a `[channels.plugin.<alias>]` binding the operator has to find
+    /// in their config file, so every catalogue must keep the binding in its
+    /// config spelling, `plugin.<alias>`, next to the key or package it is
+    /// about, and the removal line must keep the `[channels.plugin.<alias>]`
+    /// table it tells the operator to delete. A catalogue that omits a key
+    /// ships the raw `{key}` sentinel, and one that copies English ships an
+    /// untranslated line; both fail here.
+    #[test]
+    fn plugin_channel_instance_cli_strings_are_translated_in_every_locale() {
+        const ALIAS: &str = "operations";
+        const KEY: &str = "zpi1_fixture";
+        const PACKAGE: &str = "chat-bridge";
+        const BINDING: &str = "plugin.operations";
+        const TABLE: &str = "[channels.plugin.operations]";
+
+        /// One parity case: the Fluent key, its arguments, and the substrings
+        /// every locale's rendering must contain.
+        type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+        let cases: [ParityCase; 2] = [
+            (
+                "cli-plugin-config-entry-key-channel",
+                &[("alias", ALIAS), ("key", KEY)],
+                &[BINDING, KEY],
+            ),
+            (
+                "cli-plugin-removed-binding-kept",
+                &[("name", PACKAGE), ("alias", ALIAS)],
+                &[BINDING, TABLE, PACKAGE],
+            ),
+        ];
+
+        let english_source = include_str!("../locales/en/cli.ftl");
+        for (key, args, expected_parts) in cases {
+            let english = format_ftl_message(english_source, "en", key, args)
+                .unwrap_or_else(|| panic!("{key} should format in en"));
+            assert!(
+                !english.trim().is_empty(),
+                "{key} must not be empty in en; got {english:?}"
+            );
+
+            for (source, locale) in [
+                (include_str!("../locales/en/cli.ftl"), "en"),
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+                // The removal line names the binding on its own, not only
+                // inside the table it says to delete.
+                if key == "cli-plugin-removed-binding-kept" {
+                    assert!(
+                        value.replace(TABLE, "").contains(BINDING),
+                        "{key} in {locale} should name {BINDING:?} outside {TABLE:?}; got: {value:?}"
+                    );
+                }
+                if locale != "en" {
+                    assert_ne!(
+                        value, english,
+                        "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+                    );
+                }
+            }
+        }
+    }
+
     /// The `plugin info` / `plugin list --verify` load verdicts.
     ///
     /// These strings are the answer to "why does my plugin not show up", so a

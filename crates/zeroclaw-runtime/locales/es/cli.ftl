@@ -801,6 +801,7 @@ cli-plugin-installed-from = Complemento instalado desde {$source}
 cli-plugin-installed-name-version = Complemento instalado {$name} v{$version}
 cli-plugin-config-entry-seeded = Se creó [[plugins.entries]] para '{$name}'. Establece los valores de configuración del plugin con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-key = Clave de configuración ({$capability}): {$key}
+cli-plugin-config-entry-key-channel = Clave de configuración (canal plugin.{$alias}): {$key}
 cli-plugin-config-entry-seed-skipped = advertencia: se omitió crear la entrada de configuración para '{$name}': la sección [plugins] en disco está mal formada. Repárala, agrega un bloque [[plugins.entries]] con `name = "{$name}"`, y luego establece valores con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-egress-seeded = Se concedió salida de red a '{$name}' según la declaración de su manifiesto ({$count} destino(s)):
 cli-plugin-egress-destination = → {$host}
@@ -831,6 +832,7 @@ cli-config-section-retired-wati = advertencia: la sección de configuración de 
 cli-config-section-retired-node-transport = advertencia: la configuración obsoleta de `[node_transport]` se ignora porque se eliminó el transporte de nodos HMAC heredado. Elimina la sección de config.toml.
 cli-plugin-removed = Complemento '{$name}' eliminado.
 cli-plugin-removed-grant-kept = Su entrada de configuración '{$key}' se conserva, con su concesión de salida ({$grants}): un paquete instalado después como '{$name}' la hereda. Elimine la fila [[plugins.entries]] llamada '{$key}' para retirar la concesión.
+cli-plugin-removed-binding-kept = La vinculación de canal plugin.{$alias} todavía nombra '{$name}'. Permanece inactiva hasta que se vuelva a instalar un paquete con ese nombre; elimine la tabla [channels.plugin.{$alias}] para retirarla.
 cli-plugin-not-found = No se encontró el complemento '{$name}'.
 cli-plugin-legacy-detected = Nota: los complementos en una ubicación heredada ({$path}) no se cargan en el agente. Ejecuta `zeroclaw plugin migrate` para moverlos a {$target}.
 cli-plugin-migrated = Se movieron {$count} complemento(s) de {$path} a {$target}.

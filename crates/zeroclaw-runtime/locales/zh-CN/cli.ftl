@@ -800,6 +800,7 @@ cli-plugin-installed-from = 已从 {$source} 安装插件
 cli-plugin-installed-name-version = 已安装插件 {$name} v{$version}
 cli-plugin-config-entry-seeded = 已为 '{$name}' 创建 [[plugins.entries]]。使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置插件配置值。
 cli-plugin-config-entry-key = 配置条目键（{$capability}）：{$key}
+cli-plugin-config-entry-key-channel = 配置条目键（渠道 plugin.{$alias}）：{$key}
 cli-plugin-config-entry-seed-skipped = 警告：已跳过为 '{$name}' 创建配置条目：磁盘上的 [plugins] 部分格式不正确。请修复它，添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块，然后使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置值。
 cli-plugin-egress-seeded = 已根据清单声明为“{$name}”授予出站目标（{$count} 个）：
 cli-plugin-egress-destination = → {$host}
@@ -830,6 +831,7 @@ cli-config-section-retired-wati = 警告：已弃用的 WATI 频道配置部分 
 cli-config-section-retired-node-transport = 警告：已弃用的 `[node_transport]` 配置将被忽略，因为旧版 HMAC 节点传输已移除。请从 config.toml 中删除该部分。
 cli-plugin-removed = 已移除插件“{$name}”。
 cli-plugin-removed-grant-kept = 其配置条目“{$key}”及其出站授权（{$grants}）会被保留：之后以“{$name}”安装的软件包将继承它。删除名为“{$key}”的 [[plugins.entries]] 行即可撤销该授权。
+cli-plugin-removed-binding-kept = 渠道绑定 plugin.{$alias} 仍指向“{$name}”。在再次安装同名软件包之前，它不会生效；删除 [channels.plugin.{$alias}] 表即可移除该绑定。
 cli-plugin-not-found = 未找到插件“{$name}”。
 cli-plugin-legacy-detected = 注意：位于旧位置（{$path}）的插件未被代理加载。请运行 `zeroclaw plugin migrate` 将其移动到 {$target}。
 cli-plugin-migrated = 已将 {$count} 个插件从 {$path} 移动到 {$target}。

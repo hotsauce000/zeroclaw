@@ -804,6 +804,7 @@ cli-plugin-installed-from = Plugin installé depuis {$source}
 cli-plugin-installed-name-version = Plugin {$name} v{$version} installé
 cli-plugin-config-entry-seeded = [[plugins.entries]] initialisé pour '{$name}'. Définissez les valeurs de configuration du plugin avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-key = Clé de configuration ({$capability}) : {$key}
+cli-plugin-config-entry-key-channel = Clé de configuration (canal plugin.{$alias}) : {$key}
 cli-plugin-config-entry-seed-skipped = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : la section [plugins] sur disque est mal formée. Réparez-la, ajoutez un bloc [[plugins.entries]] avec `name = "{$name}"`, puis définissez les valeurs avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-egress-seeded = Sortie réseau accordée à « {$name} » d'après la déclaration de son manifeste ({$count} destination(s)) :
 cli-plugin-egress-destination = → {$host}
@@ -834,6 +835,7 @@ cli-config-section-retired-wati = avertissement : la section de configuration de
 cli-config-section-retired-node-transport = avertissement : la section de configuration obsolète `[node_transport]` est ignorée, car le transport de nœuds HMAC hérité a été supprimé. Supprimez la section du fichier config.toml.
 cli-plugin-removed = Plugin « {$name} » supprimé.
 cli-plugin-removed-grant-kept = Son entrée de configuration « {$key} » est conservée, avec son autorisation de sortie ({$grants}) : un paquet installé plus tard sous le nom « {$name} » en hérite. Supprimez la ligne [[plugins.entries]] nommée « {$key} » pour retirer l'autorisation.
+cli-plugin-removed-binding-kept = La liaison de canal plugin.{$alias} désigne toujours « {$name} ». Elle reste inactive jusqu'à ce qu'un paquet de ce nom soit réinstallé ; supprimez la table [channels.plugin.{$alias}] pour la retirer.
 cli-plugin-not-found = Plugin « {$name} » introuvable.
 cli-plugin-legacy-detected = Remarque : les plugins situés à un emplacement hérité ({$path}) ne sont pas chargés par l'agent. Exécutez `zeroclaw plugin migrate` pour les déplacer vers {$target}.
 cli-plugin-migrated = {$count} plugin(s) déplacé(s) de {$path} vers {$target}.
