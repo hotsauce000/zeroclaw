@@ -7,8 +7,11 @@ use crate::cron::{
     claim_job_with_token, clear_stale_locks, due_jobs, next_run_for_schedule, release_claim,
     skip_missed_run, sync_declarative_jobs,
 };
+use crate::live_config_authority::{
+    AgentExecutionAdmission, AgentExecutionCapability, AgentExecutionSelection,
+};
 use crate::security::SecurityPolicy;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use std::process::Stdio;
@@ -465,6 +468,7 @@ pub(crate) async fn run_blocked_owned_worker_for_test(
                 }
             })
         }),
+        None,
     )
     .await;
 }
@@ -497,6 +501,7 @@ async fn supervise_owned<T>(
     deadline: Duration,
     tracker: OwnedWorkerTracker,
     operation: OwnedOperation<T>,
+    execution_admission: Option<AgentExecutionAdmission>,
 ) -> Result<T, OwnedSupervisionError>
 where
     T: Send + 'static,
@@ -512,6 +517,7 @@ where
         .spawn(move || {
             let _active_worker = active_worker;
             let _claim_owner = claim_owner;
+            let _execution_admission = execution_admission;
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -771,8 +777,20 @@ pub async fn deliver_and_classify_run_result(
     config: &Config,
     job: &CronJob,
     success: bool,
+    output: String,
+    context: CronDeliveryContext,
+) -> CronDeliveryOutcome {
+    deliver_and_classify_run_result_with_admission(config, job, success, output, context, None)
+        .await
+}
+
+async fn deliver_and_classify_run_result_with_admission(
+    config: &Config,
+    job: &CronJob,
+    success: bool,
     mut output: String,
     context: CronDeliveryContext,
+    execution_admission: Option<AgentExecutionAdmission>,
 ) -> CronDeliveryOutcome {
     // The execution axis is fixed before delivery runs: a later delivery
     // failure can downgrade the rollup `status`, never the execution fact.
@@ -805,6 +823,7 @@ pub async fn deliver_and_classify_run_result(
                     .await
                 })
             }),
+            execution_admission.clone(),
         )
         .await
         {
@@ -875,18 +894,48 @@ pub async fn run_manual_job(
     context: CronDeliveryContext,
     event_tx: &EventBroadcast,
 ) -> ManualCronRunResult {
-    run_manual_job_inner(config, job, context, event_tx, None, false).await
+    run_manual_job_with_selection(config, job, context, event_tx, None).await
 }
 
-pub(crate) async fn run_manual_job_with_runtime(
+/// The selection witness must be captured before reading `job` from storage.
+pub async fn run_manual_job_with_selection(
+    config: &Config,
+    job: &CronJob,
+    context: CronDeliveryContext,
+    event_tx: &EventBroadcast,
+    execution_selection: Option<AgentExecutionSelection>,
+) -> ManualCronRunResult {
+    run_manual_job_inner(
+        config,
+        job,
+        context,
+        event_tx,
+        None,
+        false,
+        execution_selection,
+    )
+    .await
+}
+
+pub(crate) async fn run_manual_job_with_runtime_and_selection(
     config: &Config,
     job: &CronJob,
     context: CronDeliveryContext,
     event_tx: &EventBroadcast,
     runtime: &dyn RuntimeAdapter,
     approved: bool,
+    execution_selection: Option<AgentExecutionSelection>,
 ) -> ManualCronRunResult {
-    run_manual_job_inner(config, job, context, event_tx, Some(runtime), approved).await
+    run_manual_job_inner(
+        config,
+        job,
+        context,
+        event_tx,
+        Some(runtime),
+        approved,
+        execution_selection,
+    )
+    .await
 }
 
 async fn run_manual_job_inner(
@@ -896,66 +945,94 @@ async fn run_manual_job_inner(
     event_tx: &EventBroadcast,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
+    execution_selection: Option<AgentExecutionSelection>,
 ) -> ManualCronRunResult {
     let started_at = Utc::now();
-    // Resolve the executing identity exactly as execution will (a migrated
-    // row's empty `agent_alias` falls back to config ownership); the record
-    // must report that identity, or honest absence when none resolves.
-    let executing_agent = resolve_owning_agent(config, job).map(str::to_string);
-    // A job with no single owner is refused before anything runs, exactly as
-    // the scheduled path refuses it: nothing is delivered under no identity,
-    // and no run row is written (an owner-less row under a live job is the
-    // state reserved for quarantined history whose job is gone). The job's
-    // last-run summary still records the refusal so operators can see it.
-    if executing_agent.is_none() {
-        let finished_at = Utc::now();
-        let output = format!("cron job {id:?}: {NO_OWNER_MESSAGE}", id = job.id);
-        if let Err(e) = super::store::record_last_run_with_status(
-            config,
-            &job.id,
-            finished_at,
-            "error",
-            &output,
-        ) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-                "manual cron trigger: failed to record refusal"
-            );
-        }
-        if let Some(tx) = event_tx {
-            let _ = tx.send(serde_json::json!({
-                "type": "cron_result",
-                "job_id": job.id,
-                "success": false,
-                "output": &output,
-                "manual": true,
-                "timestamp": finished_at.to_rfc3339(),
-            }));
-        }
-        return ManualCronRunResult {
-            job_id: job.id.clone(),
-            success: false,
-            status: "error".to_string(),
-            output,
-            duration_ms: (finished_at - started_at).num_milliseconds(),
-            started_at,
-            finished_at,
+    let (agent_alias, execution_admission, effective_config) =
+        match resolve_execution_target(config, job, execution_selection.as_ref()) {
+            Ok(target) => target,
+            Err(error) => {
+                if resolve_owning_agent(config, job).is_none() {
+                    let output = format!("cron job {id:?}: {NO_OWNER_MESSAGE}", id = job.id);
+                    let finished_at = Utc::now();
+                    if let Err(e) = super::store::record_last_run_with_status(
+                        config,
+                        &job.id,
+                        finished_at,
+                        "error",
+                        &output,
+                    ) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})
+                            ),
+                            "manual cron trigger: failed to record refusal"
+                        );
+                    }
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(serde_json::json!({
+                            "type": "cron_result",
+                            "job_id": job.id,
+                            "success": false,
+                            "output": &output,
+                            "manual": true,
+                            "timestamp": finished_at.to_rfc3339(),
+                        }));
+                    }
+                    return ManualCronRunResult {
+                        job_id: job.id.clone(),
+                        success: false,
+                        status: "error".to_string(),
+                        output,
+                        duration_ms: (finished_at - started_at).num_milliseconds(),
+                        started_at,
+                        finished_at,
+                    };
+                }
+                return ManualCronRunResult {
+                    job_id: job.id.clone(),
+                    success: false,
+                    status: "error".to_string(),
+                    output: format!("cron target admission failed: {error}"),
+                    duration_ms: 0,
+                    started_at,
+                    finished_at: Utc::now(),
+                };
+            }
         };
-    }
-    let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
+    let executing_agent = Some(agent_alias);
+    let (success, output) = execute_job_now_with_runtime(
+        &effective_config,
+        job,
+        runtime,
+        approved,
+        execution_admission.clone(),
+    )
+    .await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
-    let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
+    let outcome = deliver_and_classify_run_result_with_admission(
+        &effective_config,
+        job,
+        success,
+        output,
+        context,
+        execution_admission.clone(),
+    )
+    .await;
 
     let run_principal = zeroclaw_api::ingress::InternalPrincipal::Cron {
         job_id: job.id.clone(),
         job_name: job.name.clone(),
     };
     if let Err(e) = persist_manual_run_result(
-        config,
+        &effective_config,
         job,
         started_at,
         finished_at,
@@ -1012,6 +1089,15 @@ pub async fn run(
     config: Config,
     event_tx: EventBroadcast,
     cancel: CancellationToken,
+) -> Result<()> {
+    run_with_capability(config, event_tx, cancel, None).await
+}
+
+pub async fn run_with_capability(
+    config: Config,
+    event_tx: EventBroadcast,
+    cancel: CancellationToken,
+    execution_capability: Option<AgentExecutionCapability>,
 ) -> Result<()> {
     let owned_workers = OwnedWorkerTracker::for_config(&config);
     let active_workers = owned_workers.active_count();
@@ -1104,7 +1190,7 @@ pub async fn run(
     }
 
     if config.scheduler.catch_up_on_startup {
-        catch_up_overdue_jobs(&config, &event_tx).await;
+        catch_up_overdue_jobs(&config, &event_tx, execution_capability.clone()).await;
     } else {
         ::zeroclaw_log::record!(
             INFO,
@@ -1120,7 +1206,12 @@ pub async fn run(
                 // Keep scheduler liveness fresh even when there are no due jobs.
                 crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
-                let jobs = match due_jobs(&config, Utc::now()) {
+                let execution_selection = execution_capability.as_ref()
+                    .map(AgentExecutionCapability::capture_selection);
+                let selection_config = execution_selection.as_ref()
+                    .map(|selection| selection.config_handle().read().clone());
+                let config = selection_config.as_ref().unwrap_or(&config);
+                let jobs = match due_jobs(config, Utc::now()) {
                     Ok(jobs) => jobs,
                     Err(e) => {
                         crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
@@ -1135,8 +1226,15 @@ pub async fn run(
                     }
                 };
 
-                let jobs = claim_due_jobs(&config, jobs);
-                process_claimed_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
+                let jobs = claim_due_jobs(config, jobs);
+                process_claimed_jobs(
+                    config,
+                    jobs,
+                    SCHEDULER_COMPONENT,
+                    &event_tx,
+                    execution_selection,
+                )
+                .await;
             }
             _ = cancel.cancelled() => {
                 crate::health::mark_component_ok(SCHEDULER_COMPONENT);
@@ -1153,10 +1251,51 @@ pub async fn run(
 
 use super::store::{NO_OWNER_MESSAGE, resolve_owning_agent};
 
+fn resolve_execution_target(
+    config: &Config,
+    job: &CronJob,
+    execution_selection: Option<&AgentExecutionSelection>,
+) -> Result<(String, Option<AgentExecutionAdmission>, Config)> {
+    // Resolve against the config used to select this payload. A later owner
+    // must not inherit work that was queued for a different agent.
+    let agent_alias = resolve_owning_agent(config, job)
+        .map(str::to_owned)
+        .with_context(|| {
+            format!(
+                "cron job {:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
+                job.id
+            )
+        })?;
+    let execution_admission = execution_selection
+        .map(|selection| selection.resolve_and_admit(&agent_alias))
+        .transpose()?;
+    let effective_config = execution_admission
+        .as_ref()
+        .map(|admission| admission.config().as_ref().clone())
+        .unwrap_or_else(|| config.clone());
+    anyhow::ensure!(
+        resolve_owning_agent(&effective_config, job) == Some(agent_alias.as_str()),
+        "cron job {:?} changed owning agent after selection",
+        job.id
+    );
+    Ok((agent_alias, execution_admission, effective_config))
+}
+
 /// Fetch **all** overdue jobs (ignoring `max_tasks`) and execute them.
 /// Called once at scheduler startup so that jobs missed during downtime
 /// (e.g. late boot, daemon restart) are caught up immediately.
-async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
+async fn catch_up_overdue_jobs(
+    config: &Config,
+    event_tx: &EventBroadcast,
+    execution_capability: Option<AgentExecutionCapability>,
+) {
+    let execution_selection = execution_capability
+        .as_ref()
+        .map(AgentExecutionCapability::capture_selection);
+    let selection_config = execution_selection
+        .as_ref()
+        .map(|selection| selection.config_handle().read().clone());
+    let config = selection_config.as_ref().unwrap_or(config);
     let now = Utc::now();
     let jobs = match all_overdue_jobs(config, now) {
         Ok(jobs) => jobs,
@@ -1189,7 +1328,14 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
     );
 
     let jobs = claim_due_jobs(config, jobs);
-    process_claimed_jobs(config, jobs, SCHEDULER_COMPONENT, event_tx).await;
+    process_claimed_jobs(
+        config,
+        jobs,
+        SCHEDULER_COMPONENT,
+        event_tx,
+        execution_selection,
+    )
+    .await;
 
     ::zeroclaw_log::record!(
         INFO,
@@ -1265,7 +1411,7 @@ async fn skip_missed_jobs_on_startup(config: &Config) {
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
-    execute_job_now_with_runtime(config, job, None, false).await
+    execute_job_now_with_runtime(config, job, None, false, None).await
 }
 
 async fn execute_job_now_with_runtime(
@@ -1273,6 +1419,7 @@ async fn execute_job_now_with_runtime(
     job: &CronJob,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
+    execution_admission: Option<AgentExecutionAdmission>,
 ) -> (bool, String) {
     // Reject orphaned declarative jobs: a declarative row whose canonical
     // config declaration has been removed must not execute through any
@@ -1308,6 +1455,7 @@ async fn execute_job_now_with_runtime(
         job,
         runtime,
         approved,
+        execution_admission,
     ))
     .instrument(span)
     .await
@@ -1342,7 +1490,13 @@ async fn execute_job_with_retry(
     job: &CronJob,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
+    execution_admission: Option<AgentExecutionAdmission>,
 ) -> (bool, String) {
+    if let Some(admission) = execution_admission.as_ref()
+        && let Err(error) = admission.revalidate()
+    {
+        return (false, format!("cron target admission failed: {error}"));
+    }
     let owned_runtime = if matches!(job.job_type, JobType::Shell) && runtime.is_none() {
         match crate::platform::create_runtime(&config.runtime) {
             Ok(runtime) => Some(runtime),
@@ -1358,6 +1512,11 @@ async fn execute_job_with_retry(
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
+        if let Some(admission) = execution_admission.as_ref()
+            && let Err(error) = admission.revalidate()
+        {
+            return (false, format!("cron target admission failed: {error}"));
+        }
         let (success, output) = match job.job_type {
             JobType::Shell => {
                 let Some(runtime) = runtime else {
@@ -1368,7 +1527,16 @@ async fn execute_job_with_retry(
                 };
                 run_job_command_with_runtime(config, runtime, security, job, approved).await
             }
-            JobType::Agent => Box::pin(run_agent_job(config, security, agent_alias, job)).await,
+            JobType::Agent => {
+                Box::pin(run_agent_job(
+                    config,
+                    security,
+                    agent_alias,
+                    job,
+                    execution_admission.clone(),
+                ))
+                .await
+            }
         };
         last_output = output;
 
@@ -1437,6 +1605,7 @@ async fn process_claimed_jobs(
     jobs: Vec<ClaimedJob>,
     component: &str,
     event_tx: &EventBroadcast,
+    execution_selection: Option<AgentExecutionSelection>,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
@@ -1444,13 +1613,27 @@ async fn process_claimed_jobs(
     let max_concurrent = config.scheduler.max_concurrent.max(1);
     let mut in_flight = stream::iter(jobs.into_iter().filter_map(|claimed| {
         let ClaimedJob { job, claim } = claimed;
-        let Some(agent_alias) = resolve_owning_agent(config, &job) else {
+        if resolve_owning_agent(config, &job).is_none() {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(super::store::ownership_refusal_attrs(config, &job)), NO_OWNER_MESSAGE);
             let _ = release_claim(config, &job.id, &claim);
             return None;
-        };
-        let agent_alias = agent_alias.to_owned();
-        let security = match SecurityPolicy::for_agent(config, &agent_alias) {
+        }
+        let (agent_alias, execution_admission, execution_config) =
+            match resolve_execution_target(config, &job, execution_selection.as_ref()) {
+                Ok(target) => target,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"job_id": job.id, "error": error.to_string()})),
+                        "Cron job: target admission failed"
+                    );
+                    let _ = release_claim(config, &job.id, &claim);
+                    return None;
+                }
+            };
+        let security = match SecurityPolicy::for_agent(&execution_config, &agent_alias) {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent": agent_alias, "error": format!("{}", e)})), "Cron job: failed to build SecurityPolicy for owning agent");
@@ -1458,23 +1641,25 @@ async fn process_claimed_jobs(
                 return None;
             }
         };
-        let config = config.clone();
+        let config = execution_config;
         let component = component.to_owned();
         Some(async move {
-            Box::pin(execute_and_persist_claimed_job(
+            let result = Box::pin(execute_and_persist_claimed_job(
                 &config,
                 security.as_ref(),
                 &agent_alias,
                 &job,
                 &claim,
                 &component,
+                execution_admission.clone(),
             ))
-            .await
+            .await;
+            (result, execution_admission)
         })
     }))
     .buffer_unordered(max_concurrent);
 
-    while let Some((job_id, success, output)) = in_flight.next().await {
+    while let Some(((job_id, success, output), _execution_admission)) = in_flight.next().await {
         if !success {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1503,6 +1688,7 @@ async fn process_due_jobs(
     jobs: Vec<CronJob>,
     component: &str,
     event_tx: &EventBroadcast,
+    execution_selection: Option<AgentExecutionSelection>,
 ) {
     let claimed = jobs
         .into_iter()
@@ -1512,7 +1698,7 @@ async fn process_due_jobs(
             ClaimedJob { job, claim }
         })
         .collect();
-    process_claimed_jobs(config, claimed, component, event_tx).await;
+    process_claimed_jobs(config, claimed, component, event_tx, execution_selection).await;
 }
 
 async fn execute_and_persist_claimed_job(
@@ -1522,7 +1708,22 @@ async fn execute_and_persist_claimed_job(
     job: &CronJob,
     claim: &CronClaimToken,
     component: &str,
+    execution_admission: Option<AgentExecutionAdmission>,
 ) -> (String, bool, String) {
+    if let Some(admission) = execution_admission.as_ref() {
+        if let Err(error) = admission.revalidate() {
+            let _ = release_claim(config, &job.id, claim);
+            return (
+                job.id.clone(),
+                false,
+                format!("cron target admission failed: {error}"),
+            );
+        }
+    }
+    let effective_config = execution_admission
+        .as_ref()
+        .map(|a| a.config())
+        .unwrap_or_else(|| Arc::new(config.clone()));
     super::store::claim_scope::scope(claim.clone(), async {
         crate::health::mark_component_ok(component);
         warn_if_high_frequency_agent_job(job);
@@ -1530,18 +1731,19 @@ async fn execute_and_persist_claimed_job(
         let started_at = Utc::now();
         let span = zeroclaw_log::attribution_span!(job);
         let (success, output) = Box::pin(execute_job_with_retry(
-            config,
+            &effective_config,
             security,
             agent_alias,
             job,
             None,
             false,
+            execution_admission.clone(),
         ))
         .instrument(span)
         .await;
         let finished_at = Utc::now();
         let result = Box::pin(persist_claimed_job_result(
-            config,
+            &effective_config,
             job,
             agent_alias,
             success,
@@ -1549,6 +1751,7 @@ async fn execute_and_persist_claimed_job(
             started_at,
             finished_at,
             claim,
+            execution_admission.clone(),
         ))
         .await;
 
@@ -1564,10 +1767,20 @@ async fn execute_and_persist_job(
     agent_alias: &str,
     job: &CronJob,
     component: &str,
+    execution_admission: Option<AgentExecutionAdmission>,
 ) -> (String, bool, String) {
     let claim = crate::cron::store::current_claim_for_test(config, &job.id)
         .expect("test job must be claimed before execution");
-    execute_and_persist_claimed_job(config, security, agent_alias, job, &claim, component).await
+    execute_and_persist_claimed_job(
+        config,
+        security,
+        agent_alias,
+        job,
+        &claim,
+        component,
+        execution_admission,
+    )
+    .await
 }
 
 /// Resolve the wall-clock deadline for an agent cron job's `agent::run`
@@ -1722,9 +1935,18 @@ async fn run_agent_job(
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
+    execution_admission: Option<AgentExecutionAdmission>,
 ) -> (bool, String) {
     let timeout = resolve_agent_job_timeout(config, agent_alias);
-    run_agent_job_with_timeout(config, security, agent_alias, job, timeout).await
+    run_agent_job_with_timeout(
+        config,
+        security,
+        agent_alias,
+        job,
+        timeout,
+        execution_admission,
+    )
+    .await
 }
 
 async fn run_agent_job_with_timeout(
@@ -1733,6 +1955,7 @@ async fn run_agent_job_with_timeout(
     agent_alias: &str,
     job: &CronJob,
     timeout: Duration,
+    execution_admission: Option<AgentExecutionAdmission>,
 ) -> (bool, String) {
     if !security.can_act() {
         return (
@@ -1760,9 +1983,6 @@ async fn run_agent_job_with_timeout(
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
-    let mut cron_config = config.clone();
-    cron_config.memory.auto_save = false;
-
     // Assign a unique run ID for tracing. Isolated jobs also use it in the
     // session path so failed-run memory purge stays scoped per execution.
     // Main-target jobs reuse the stable `main` session path documented in
@@ -1787,6 +2007,7 @@ async fn run_agent_job_with_timeout(
         // `uses_memory = false` fully opts the job out of the engine's
         // memory-context injection (stateless digest jobs)...
         suppress_memory_inject: !job.uses_memory,
+        suppress_memory_auto_save: true,
         // ...and makes the run memory-free end to end: the loop binds a
         // `NoneMemory` backend and drops the persistent memory tools, so a
         // `uses_memory = false` job can neither recall/store through a real
@@ -1797,6 +2018,7 @@ async fn run_agent_job_with_timeout(
         // `agent::run` is the correct choice. The daemon heartbeat
         // worker is the only `mcp_registry` supplier.
         mcp_registry: None,
+        execution_admission: execution_admission.clone(),
         // Initiating principal, resolved from the job's stored config at
         // dispatch and immutable for the turn's lifetime.
         internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
@@ -1806,6 +2028,7 @@ async fn run_agent_job_with_timeout(
         // A `[[cron]]` job runs a prompt, not a SOP step. SOP cron triggers
         // are a separate surface driven by the SOP maintenance tick.
         sop_step_scope: None,
+        ..crate::agent::loop_::AgentRunOverrides::default()
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -1889,6 +2112,7 @@ async fn run_agent_job_with_timeout(
                         .instrument(subagent_span),
                     )
                 }),
+                execution_admission.clone(),
             )
             .await;
 
@@ -1983,6 +2207,7 @@ struct PendingPersist {
     delivery: DeliveryDisposition,
     executing_agent: String,
     worker_owner: ActiveOwnedWorkerGuard,
+    execution_admission: Option<AgentExecutionAdmission>,
 }
 
 /// Write one completed result durably. Synchronous SQLite work; the caller
@@ -1990,6 +2215,8 @@ struct PendingPersist {
 /// Returns whether the combined history and state write committed.
 fn write_pending_persist(pending: PendingPersist) -> bool {
     let _worker_owner = &pending.worker_owner;
+    // Same admitted turn remains owned through SQL and fallback settlement.
+    let _execution_admission = &pending.execution_admission;
     if let Err(e) = persist_run_result(
         &pending.config,
         &pending.job,
@@ -2091,14 +2318,16 @@ async fn persist_claimed_job_result(
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     claim: &CronClaimToken,
+    execution_admission: Option<AgentExecutionAdmission>,
 ) -> ClaimedJobResult {
     let duration_ms = (finished_at - started_at).num_milliseconds();
-    let outcome = deliver_and_classify_run_result(
+    let outcome = deliver_and_classify_run_result_with_admission(
         config,
         job,
         success,
         output.to_string(),
         CronDeliveryContext::Scheduled,
+        execution_admission.clone(),
     )
     .await;
 
@@ -2130,6 +2359,7 @@ async fn persist_claimed_job_result(
         delivery: outcome.delivery,
         executing_agent: executing_agent.to_string(),
         worker_owner: OwnedWorkerTracker::for_config(config).register(),
+        execution_admission,
     };
     #[cfg(test)]
     let persist_block = TEST_PERSIST_BLOCK.try_with(|duration| *duration).ok();
@@ -2267,6 +2497,7 @@ async fn persist_job_result(
         started_at,
         finished_at,
         &claim,
+        None,
     )
     .await
     .success
@@ -2604,7 +2835,7 @@ async fn run_job_command_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cron::{self, DeliveryConfig};
+    use crate::cron::{self, DeliveryConfig, claim_job, release_job};
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
@@ -3446,6 +3677,7 @@ mod tests {
             &job,
             None,
             false,
+            None,
         ))
         .await;
         assert!(success);
@@ -3470,6 +3702,7 @@ mod tests {
             &job,
             None,
             false,
+            None,
         ))
         .await;
         assert!(!success);
@@ -3516,7 +3749,7 @@ mod tests {
         let security = test_security(&config);
 
         let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+            Box::pin(run_agent_job(&config, &security, "test-agent", &job, None)).await;
         assert!(!success);
         assert!(!output.trim().is_empty());
         assert!(!output.contains("agent job failed:"));
@@ -3603,7 +3836,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (success, output) = Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job)).await;
+        let (success, output) =
+            Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job, None)).await;
         assert!(!success);
         let expected = crate::i18n::get_required_cli_string("turn-context-window-exceeded-error");
         assert_eq!(output, expected);
@@ -3721,14 +3955,29 @@ mod tests {
         job.allowed_tools = Some(vec!["shell".into()]);
         job.uses_memory = false;
 
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let admission = Some(authority.execution_capability().admit(TEST_AGENT).unwrap());
         let (success, output) = Box::pin(execute_job_with_retry(
-            &config, &security, TEST_AGENT, &job, None, false,
+            &config,
+            &security,
+            TEST_AGENT,
+            &job,
+            None,
+            false,
+            admission.clone(),
         ))
         .await;
         assert!(success, "retrying cron agent run failed: {output}");
         assert_eq!(output, "done");
 
-        let sequential = Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job)).await;
+        let sequential = Box::pin(run_agent_job(
+            &config,
+            &security,
+            TEST_AGENT,
+            &job,
+            admission.clone(),
+        ))
+        .await;
         assert!(
             sequential.0,
             "repeated cron agent run failed: {:?}",
@@ -3736,9 +3985,9 @@ mod tests {
         );
 
         let (concurrent_a, concurrent_b, concurrent_c) = tokio::join!(
-            run_agent_job(&config, &security, TEST_AGENT, &job),
-            run_agent_job(&config, &security, TEST_AGENT, &job),
-            run_agent_job(&config, &security, TEST_AGENT, &job),
+            run_agent_job(&config, &security, TEST_AGENT, &job, admission.clone()),
+            run_agent_job(&config, &security, TEST_AGENT, &job, admission.clone()),
+            run_agent_job(&config, &security, TEST_AGENT, &job, admission.clone()),
         );
         for result in [concurrent_a, concurrent_b, concurrent_c] {
             assert!(result.0, "concurrent cron agent run failed: {:?}", result.1);
@@ -3776,7 +4025,7 @@ mod tests {
         let security = test_security(&config);
 
         let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+            Box::pin(run_agent_job(&config, &security, "test-agent", &job, None)).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -3860,6 +4109,7 @@ mod tests {
             TEST_AGENT,
             &job,
             Duration::from_millis(750),
+            None,
         ))
         .await;
         let elapsed = started.elapsed();
@@ -3912,7 +4162,7 @@ mod tests {
         let security = test_security(&config);
         let component = unique_component("agent-timeout-release");
         let (job_id, success, output) = Box::pin(execute_and_persist_job(
-            &config, &security, TEST_AGENT, &job, &component,
+            &config, &security, TEST_AGENT, &job, &component, None,
         ))
         .await;
 
@@ -4100,7 +4350,7 @@ mod tests {
             TEST_PURGE_MEMORY.scope(
                 stalling_memory,
                 Box::pin(execute_and_persist_job(
-                    &config, &security, TEST_AGENT, &job, &component,
+                    &config, &security, TEST_AGENT, &job, &component, None,
                 )),
             ),
         )
@@ -4194,6 +4444,7 @@ mod tests {
                                 TEST_AGENT,
                                 &run_job,
                                 &component,
+                                None,
                             )),
                         ),
                     ),
@@ -4596,6 +4847,7 @@ mod tests {
                     7_u8
                 })
             }),
+            None,
         )
         .await;
 
@@ -4625,6 +4877,7 @@ mod tests {
                         42_u8
                     })
                 }),
+                None,
             )
             .await
         });
@@ -4653,6 +4906,7 @@ mod tests {
                         Result::<(), String>::Err("ordinary provider failure".into())
                     })
                 }),
+                None,
             )
             .await
         });
@@ -4763,7 +5017,7 @@ mod tests {
             TEST_PRE_RUN_BLOCK.scope(
                 Duration::from_secs(2),
                 Box::pin(execute_and_persist_job(
-                    &config, &security, TEST_AGENT, &job, &component,
+                    &config, &security, TEST_AGENT, &job, &component, None,
                 )),
             ),
         )
@@ -4859,6 +5113,7 @@ mod tests {
                             TEST_AGENT,
                             &run_job,
                             &component,
+                            None,
                         )),
                     )
                     .await
@@ -4965,7 +5220,7 @@ mod tests {
             TEST_PURGE_MEMORY.scope(
                 blocking_memory,
                 Box::pin(execute_and_persist_job(
-                    &config, &security, TEST_AGENT, &job, &component,
+                    &config, &security, TEST_AGENT, &job, &component, None,
                 )),
             ),
         )
@@ -5056,7 +5311,7 @@ mod tests {
             TEST_PURGE_CONSTRUCT_BLOCK.scope(
                 Duration::from_secs(10),
                 Box::pin(execute_and_persist_job(
-                    &config, &security, TEST_AGENT, &job, &component,
+                    &config, &security, TEST_AGENT, &job, &component, None,
                 )),
             ),
         )
@@ -5143,7 +5398,7 @@ mod tests {
             .scope(
                 counting_memory,
                 Box::pin(execute_and_persist_job(
-                    &config, &security, TEST_AGENT, &job, &component,
+                    &config, &security, TEST_AGENT, &job, &component, None,
                 )),
             )
             .await;
@@ -5228,7 +5483,7 @@ mod tests {
             TEST_DELIVERY_TIMEOUT.scope(
                 Duration::from_millis(250),
                 Box::pin(execute_and_persist_job(
-                    &config, &security, TEST_AGENT, &job, &component,
+                    &config, &security, TEST_AGENT, &job, &component, None,
                 )),
             ),
         )
@@ -5389,7 +5644,7 @@ mod tests {
         let security = test_security(&config);
 
         let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+            Box::pin(run_agent_job(&config, &security, "test-agent", &job, None)).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -5402,13 +5657,152 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, Vec::new(), &component, &None).await;
+        process_due_jobs(&config, Vec::new(), &component, &None, None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
         assert_eq!(entry["status"], "ok");
         assert!(entry["last_ok"].as_str().is_some());
         assert!(entry["last_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn selected_cron_work_cannot_run_as_a_recreated_alias() {
+        for manual in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp).await;
+            let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo stale").unwrap();
+            let authority = crate::LiveConfigAuthority::new(config.clone());
+            let selection = authority.execution_capability().capture_selection();
+            let selected_job = cron::get_job(&config, &job.id).unwrap();
+            let (old_alias, mut delete) = {
+                let lifecycle = authority.agent_lifecycle();
+                let delete = lifecycle.begin_delete(TEST_AGENT).unwrap();
+                let old_alias = authority
+                    .config()
+                    .write()
+                    .agents
+                    .remove(TEST_AGENT)
+                    .unwrap();
+                (old_alias, delete)
+            };
+            delete.commit_destructive_mutation();
+            drop(delete);
+            authority
+                .config()
+                .write()
+                .agents
+                .insert(TEST_AGENT.into(), old_alias);
+            let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+            let events = Some(tx);
+
+            if manual {
+                let result = run_manual_job_with_selection(
+                    &config,
+                    &selected_job,
+                    CronDeliveryContext::RpcManual,
+                    &events,
+                    Some(selection),
+                )
+                .await;
+                assert!(!result.success);
+                assert!(result.output.contains("changed during admission"));
+            } else {
+                let claimed = claim_due_jobs(&config, vec![selected_job]);
+                assert_eq!(claimed.len(), 1);
+                process_due_jobs(&config, claimed, "stale-cron", &events, Some(selection)).await;
+                assert!(
+                    claim_job(&config, &job.id, Utc::now()).unwrap(),
+                    "stale rejection releases claim"
+                );
+                release_job(&config, &job.id).unwrap();
+            }
+            assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
+            assert_eq!(
+                cron::get_job(&config, &job.id).unwrap().last_status,
+                job.last_status
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "rejected work must not announce a run"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_cron_work_rejects_owner_reassignment() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo selected-owner").unwrap();
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
+        config.agents.insert("other".into(), Default::default());
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let selection = authority.execution_capability().capture_selection();
+        let selected_config = authority.config().read().clone();
+        let selected_job = cron::get_job(&selected_config, &job.id).unwrap();
+        {
+            let handle = authority.config();
+            let mut live = handle.write();
+            // Disable the stored owner so the moved claim becomes effective.
+            live.agents.get_mut(TEST_AGENT).unwrap().cron_jobs.clear();
+            live.agents.get_mut(TEST_AGENT).unwrap().enabled = false;
+            live.agents
+                .get_mut("other")
+                .unwrap()
+                .cron_jobs
+                .push(job.id.clone());
+        }
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let result = run_manual_job_with_selection(
+            &selected_config,
+            &selected_job,
+            CronDeliveryContext::RpcManual,
+            &Some(tx),
+            Some(selection),
+        )
+        .await;
+        assert!(!result.success);
+        assert!(result.output.contains("changed owning agent"));
+        assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
+        assert!(
+            cron::get_job(&config, &job.id)
+                .unwrap()
+                .last_status
+                .is_none()
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(authority.agent_lifecycle().active_turn_count(TEST_AGENT), 0);
+        assert_eq!(authority.agent_lifecycle().active_turn_count("other"), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_queued_cron_admission_does_not_execute_or_persist() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo stale").unwrap();
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let admission = authority.execution_capability().admit(TEST_AGENT).unwrap();
+        assert!(claim_job(&config, &job.id, Utc::now()).unwrap());
+        authority.close_agent_lifecycle();
+        let (_, success, output) = execute_and_persist_job(
+            &config,
+            &test_security(&config),
+            TEST_AGENT,
+            &job,
+            "closed-cron",
+            Some(admission),
+        )
+        .await;
+        assert!(!success);
+        assert!(output.contains("lifecycle generation is closing"));
+        assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
+        assert!(claim_job(&config, &job.id, Utc::now()).unwrap());
+        release_job(&config, &job.id).unwrap();
     }
 
     #[tokio::test]
@@ -5419,7 +5813,7 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, vec![job], &component, &None).await;
+        process_due_jobs(&config, vec![job], &component, &None, None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -5491,6 +5885,7 @@ mod tests {
                         started,
                         started + ChronoDuration::milliseconds(10),
                         &old_claim,
+                        None,
                     ),
                 ),
             )
@@ -5552,6 +5947,7 @@ mod tests {
                                 started,
                                 started + ChronoDuration::milliseconds(10),
                                 &claim,
+                                None,
                             ),
                         ),
                     )
@@ -5577,6 +5973,7 @@ mod tests {
                             started,
                             started + ChronoDuration::milliseconds(10),
                             &claim,
+                            None,
                         ),
                     )
                     .await;
@@ -5630,6 +6027,7 @@ mod tests {
                                 started,
                                 started + ChronoDuration::milliseconds(10),
                                 &first_claim,
+                                None,
                             ),
                         ),
                     )
@@ -5653,6 +6051,7 @@ mod tests {
                             started,
                             started + ChronoDuration::milliseconds(10),
                             &second_claim,
+                            None,
                         ),
                     )
                     .await;
@@ -5728,6 +6127,7 @@ mod tests {
                                 started,
                                 started + ChronoDuration::milliseconds(10),
                                 &first_claim,
+                                None,
                             ),
                         ),
                     )
@@ -5752,6 +6152,7 @@ mod tests {
                             started,
                             started + ChronoDuration::milliseconds(10),
                             &second_claim,
+                            None,
                         ),
                     )
                     .await;
@@ -6599,6 +7000,8 @@ mod tests {
     }
 
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static DELIVERY_ENTERED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+    static DELIVERY_RELEASE: tokio::sync::Notify = tokio::sync::Notify::const_new();
     static CONTEXT_FAILURES_DELIVERED: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
     const CONTEXT_FAILURE_CHANNEL: &str = "context-failure-delivery";
@@ -6630,6 +7033,10 @@ mod tests {
         // delivery-classification tests so it composes regardless of order.
         register_delivery_fn(Box::new(|_config, channel, _target, _thread, output| {
             Box::pin(async move {
+                if channel == "paused-admission-delivery" {
+                    DELIVERY_ENTERED.notify_one();
+                    DELIVERY_RELEASE.notified().await;
+                }
                 if channel == "fail-delivery" {
                     anyhow::bail!("synthetic delivery failure");
                 }
@@ -6732,6 +7139,70 @@ mod tests {
             before + 1,
             "manual delivery remains owned by and awaited by its caller"
         );
+    }
+
+    #[tokio::test]
+    async fn cron_admission_survives_delivery_until_run_history_is_persisted() {
+        register_recording_delivery_fn();
+        for manual in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp).await;
+            let mut job =
+                cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo admitted").unwrap();
+            job.delivery = DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("paused-admission-delivery".into()),
+                to: Some("local-test".into()),
+                thread_id: None,
+                best_effort: false,
+            };
+            let authority = crate::LiveConfigAuthority::new(config.clone());
+            let lifecycle = authority.agent_lifecycle();
+            let selection = authority.execution_capability().capture_selection();
+            let run_config = config.clone();
+            let run_job = job.clone();
+            if !manual {
+                assert!(claim_job(&config, &job.id, Utc::now()).unwrap());
+            }
+            let task = zeroclaw_spawn::spawn!(async move {
+                if manual {
+                    let result = run_manual_job_with_selection(
+                        &run_config,
+                        &run_job,
+                        CronDeliveryContext::RpcManual,
+                        &None,
+                        Some(selection),
+                    )
+                    .await;
+                    assert!(result.success, "{}", result.output);
+                } else {
+                    process_due_jobs(
+                        &run_config,
+                        vec![run_job],
+                        "admission-delivery",
+                        &None,
+                        Some(selection),
+                    )
+                    .await;
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), DELIVERY_ENTERED.notified())
+                .await
+                .unwrap();
+            drop(authority);
+            assert!(matches!(
+                lifecycle.begin_delete(TEST_AGENT),
+                Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
+            ));
+            assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
+            DELIVERY_RELEASE.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
+            assert!(lifecycle.begin_delete(TEST_AGENT).is_ok());
+        }
     }
 
     fn announce_job() -> CronJob {
@@ -7036,7 +7507,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job.clone()], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job.clone()], &component, &event_tx, None).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
@@ -7069,7 +7540,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job.clone()], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job.clone()], &component, &event_tx, None).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
@@ -7099,7 +7570,7 @@ mod tests {
                 Duration::from_millis(25),
                 TEST_PERSIST_BLOCK.scope(
                     Duration::from_secs(2),
-                    process_due_jobs(&config, vec![job.clone()], &component, &event_tx),
+                    process_due_jobs(&config, vec![job.clone()], &component, &event_tx, None),
                 ),
             )
             .await;
@@ -7168,7 +7639,14 @@ mod tests {
             ..job.clone()
         };
 
-        process_due_jobs(&config, vec![orphan], &unique_component("orphan"), &None).await;
+        process_due_jobs(
+            &config,
+            vec![orphan],
+            &unique_component("orphan"),
+            &None,
+            None,
+        )
+        .await;
 
         assert!(
             cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
@@ -7240,6 +7718,7 @@ mod tests {
             vec![contested.clone()],
             &unique_component("contested"),
             &None,
+            None,
         )
         .await;
         assert!(
@@ -7301,7 +7780,14 @@ mod tests {
         assert_eq!(resolve_owning_agent(&config, &legacy), Some(TEST_AGENT));
 
         assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
-        process_due_jobs(&config, vec![legacy], &unique_component("sole"), &None).await;
+        process_due_jobs(
+            &config,
+            vec![legacy],
+            &unique_component("sole"),
+            &None,
+            None,
+        )
+        .await;
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(
@@ -7320,7 +7806,7 @@ mod tests {
         let component = unique_component("broadcast-none");
 
         // event_tx = None — should complete without panic.
-        process_due_jobs(&config, vec![job], &component, &None).await;
+        process_due_jobs(&config, vec![job], &component, &None, None).await;
     }
 
     #[tokio::test]
@@ -7335,7 +7821,7 @@ mod tests {
         // process_due_jobs must not panic when there are no subscribers.
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job], &component, &event_tx, None).await;
         // If we got here without panic, the test passes.
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7380,6 +7866,7 @@ mod tests {
                             now,
                             now,
                             &claim,
+                            None,
                         )
                         .await
                     };
@@ -7514,6 +8001,7 @@ mod tests {
                             worker_gate.block();
                         })
                     }),
+                    None,
                 )
                 .await
             }));

@@ -1,4 +1,5 @@
 use crate::cron::{self, JobType};
+use crate::live_config_authority::AgentExecutionCapability;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -13,6 +14,7 @@ pub struct CronRunTool {
     /// Owning agent — another agent's job cannot be triggered from here.
     agent_alias: String,
     runtime: Arc<dyn RuntimeAdapter>,
+    execution_capability: Option<AgentExecutionCapability>,
 }
 
 struct ManualCronClaim {
@@ -39,11 +41,22 @@ impl CronRunTool {
         agent_alias: impl Into<String>,
         runtime: Arc<dyn RuntimeAdapter>,
     ) -> Self {
+        Self::new_with_runtime_and_capability(config, security, agent_alias, runtime, None)
+    }
+
+    pub fn new_with_runtime_and_capability(
+        config: Arc<Config>,
+        security: Arc<SecurityPolicy>,
+        agent_alias: impl Into<String>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        execution_capability: Option<AgentExecutionCapability>,
+    ) -> Self {
         Self {
             config,
             security,
             agent_alias: agent_alias.into(),
             runtime,
+            execution_capability,
         }
     }
 
@@ -126,7 +139,15 @@ impl Tool for CronRunTool {
             });
         }
 
-        let job = match cron::get_job_for_agent(&self.config, job_id, &self.agent_alias) {
+        let selection = self
+            .execution_capability
+            .as_ref()
+            .map(AgentExecutionCapability::capture_selection);
+        let selection_config = selection
+            .as_ref()
+            .map(|selection| selection.config_handle().read().clone());
+        let config = selection_config.as_ref().unwrap_or(&self.config);
+        let job = match cron::get_job_for_agent(config, job_id, &self.agent_alias) {
             Ok(job) => job,
             Err(e) => {
                 return Ok(ToolResult {
@@ -161,7 +182,7 @@ impl Tool for CronRunTool {
         }
 
         let lock_token = match cron::claim_job_for_agent_with_token(
-            &self.config,
+            config,
             &job.id,
             &self.agent_alias,
             chrono::Utc::now(),
@@ -185,19 +206,20 @@ impl Tool for CronRunTool {
             });
         };
 
-        let owner = crate::cron::CronClaimToken::manual(&self.config, &job.id, lock_token);
+        let owner = crate::cron::CronClaimToken::manual(config, &job.id, lock_token);
         let mut claim = ManualCronClaim {
             ownership: Some(owner.clone()),
         };
         let result = crate::cron::claim_scope::scope(
             owner,
-            cron::scheduler::run_manual_job_with_runtime(
-                &self.config,
+            cron::scheduler::run_manual_job_with_runtime_and_selection(
+                config,
                 &job,
                 cron::scheduler::CronDeliveryContext::ToolManual,
                 &None,
                 self.runtime.as_ref(),
                 approved,
+                selection,
             ),
         )
         .await;
