@@ -3060,7 +3060,30 @@ fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<Strin
     match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, alias) {
         Ok(true) => Ok(Some(format!("{section_path}.{alias}"))),
         Ok(false) => Ok(None),
-        Err(e) => Err(anyhow::Error::msg(e.to_string())),
+        Err(e) => Err(alias_create_refusal(e)),
+    }
+}
+
+/// A refused alias creation as the operator reads it: an alias an unfinished
+/// agent rename retired names the rename that frees it, and every other
+/// refusal keeps the config crate's own text.
+#[cfg(any(feature = "agent-runtime", test))]
+fn alias_create_refusal(error: zeroclaw_config::alias_refs::CreateError) -> anyhow::Error {
+    use zeroclaw_config::alias_refs::CreateError;
+    match error {
+        CreateError::Retired { alias, pending_to } => anyhow::Error::msg(ta(
+            "cli-alias-create-retired",
+            &[("alias", &alias), ("to", &pending_to)],
+            format!(
+                "alias `{alias}` is retired by an unfinished rename to `{pending_to}`; run `zeroclaw agents rename {alias} {pending_to}` first"
+            ),
+        )),
+        CreateError::RecoveryUnreadable(detail) => anyhow::Error::msg(ta(
+            "cli-alias-recovery-unreadable",
+            &[("error", &detail)],
+            format!("agent lifecycle recovery journal could not be read: {detail}"),
+        )),
+        other => anyhow::Error::msg(other.to_string()),
     }
 }
 
@@ -3116,7 +3139,7 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
             Err(zeroclaw_config::alias_refs::CreateError::Reserved(_)) => return Ok(false),
             // A retired alias or an unreadable recovery journal is an error the
             // operator must see, never the reserved case's silent no-op.
-            Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+            Err(e) => return Err(alias_create_refusal(e)),
         };
     if created {
         // The section matched and the alias was newly materialized, but the
@@ -15958,12 +15981,13 @@ mod tests {
         };
 
         // Unlike the reserved `default` agent, a retired alias is an error the
-        // operator sees, not a silent no-op.
+        // operator sees, not a silent no-op, and it names the rename that
+        // frees the alias.
         let err = ensure_map_key_for_prop_path(&mut config, "agents.researcher.enabled")
             .expect_err("a retired agent alias must not be materialized");
         assert!(
             err.to_string()
-                .contains("retired by an unfinished agent rename"),
+                .contains("zeroclaw agents rename researcher analyst"),
             "{err}"
         );
         assert!(!config.agents.contains_key("researcher"));
