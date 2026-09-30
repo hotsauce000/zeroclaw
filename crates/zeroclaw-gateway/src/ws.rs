@@ -1206,6 +1206,7 @@ fn history_trimmed_frame_for(event: zeroclaw_api::agent::TurnEvent) -> Option<se
         tokens_before_source,
         tokens_after_source,
         unsatisfiable_floor,
+        retained_context: _,
     } = event
     else {
         return None;
@@ -1983,6 +1984,7 @@ async fn process_chat_message(
                                         tokens_before_source,
                                         tokens_after_source,
                                         unsatisfiable_floor,
+                                        retained_context: _,
                                     } => history_trimmed_ws_frame(
                                         dropped_messages,
                                         dropped_turns,
@@ -3747,6 +3749,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             tokens_before_source: None,
             tokens_after_source: None,
             unsatisfiable_floor: None,
+            retained_context: None,
         })
         .expect("history trim event should produce a frame");
 
@@ -5032,7 +5035,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             v.get("model_context_window").is_none(),
             "done-frame must omit model_context_window on same-profile fallback"
         );
-        assert_eq!(v["max_context_tokens"], 32_000);
+        assert_eq!(
+            v["max_context_tokens"], 800_000,
+            "the explicit profile budget survives the same-profile fallback (#10068)"
+        );
         assert_eq!(v["last_serving_model"], "model-b");
     }
 

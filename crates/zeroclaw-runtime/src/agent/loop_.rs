@@ -867,7 +867,7 @@ pub async fn agent_turn(
     // preamble onto the last user message: the exact byte length injected,
     // so the caller can strip precisely that block before persisting —
     // see `ToolLoop::injected_memory_preamble`.
-    injected_memory_preamble: &mut Option<String>,
+    injected_memory_preamble: &mut Option<super::turn::MemoryPreamble>,
     tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
@@ -879,6 +879,7 @@ pub async fn agent_turn(
     multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
     max_tool_iterations: usize,
     approval: Option<&ApprovalManager>,
+    security: Option<&SecurityPolicy>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
@@ -910,6 +911,7 @@ pub async fn agent_turn(
         multimodal_config,
         max_tool_iterations,
         approval,
+        security,
         excluded_tools,
         dedup_exempt_tools,
         activated_tools,
@@ -920,6 +922,7 @@ pub async fn agent_turn(
         context_token_budget,
         channel,
         origin,
+        None,
         memory,
         agent_alias,
         turn_id,
@@ -936,7 +939,7 @@ async fn agent_turn_with_sop_reassembly(
     // Authoritative breadcrumb provenance for `history` — see `agent_turn`.
     history_has_trim_breadcrumb: &mut bool,
     // See `agent_turn`.
-    injected_memory_preamble: &mut Option<String>,
+    injected_memory_preamble: &mut Option<super::turn::MemoryPreamble>,
     tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
@@ -948,6 +951,7 @@ async fn agent_turn_with_sop_reassembly(
     multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
     max_tool_iterations: usize,
     approval: Option<&ApprovalManager>,
+    security: Option<&SecurityPolicy>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
@@ -958,6 +962,7 @@ async fn agent_turn_with_sop_reassembly(
     context_token_budget: usize,
     channel: Option<&dyn Channel>,
     origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
     memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
     agent_alias: Option<&str>,
     turn_id: Option<&str>,
@@ -1009,16 +1014,12 @@ async fn agent_turn_with_sop_reassembly(
         },
         |config| config.resolved_model_context_window_for_route(provider_name, model),
     );
-    let context_token_budget = if context_token_budget == 0 {
-        0
-    } else {
-        context_token_budget.min(resolved_capacity.tokens)
-    };
-    let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
-        model_context_window: resolved_capacity.tokens,
+    // A configured capacity caps the budget; the compatibility stub does not
+    // (see `ResolvedContextLimits::bind_budget`).
+    let context_limits = zeroclaw_config::schema::ResolvedContextLimits::bind_budget(
+        resolved_capacity,
         context_token_budget,
-        model_context_window_source: resolved_capacity.source,
-    };
+    );
     let result = Box::pin(run_tool_call_loop(ToolLoop {
         sop_reassembly,
         history_has_trim_breadcrumb,
@@ -1042,6 +1043,7 @@ async fn agent_turn_with_sop_reassembly(
                 activated_tools,
                 model_switch_callback,
                 receipt_generator: None,
+                security,
             },
             ResolvedRuntimeKnobs {
                 max_tool_iterations,
@@ -1072,7 +1074,7 @@ async fn agent_turn_with_sop_reassembly(
         // point; source/transport/trust stay phase-1 placeholders until
         // per-transport stamping lands.
         memory,
-        ingress: IngressContext::from_origin(origin),
+        ingress: IngressContext::from_parts(origin, internal_principal),
         agent_alias,
         parent_agent_alias: None,
         served_route_sink: None,
@@ -1112,8 +1114,8 @@ async fn agent_turn_with_sop_reassembly(
 pub(crate) use super::turn::StreamCancelledAfterOutput;
 pub use super::turn::{
     ContextLimitsResolver, DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs, MaxIterationBehavior,
-    ModelSwitchCallback, ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ProgressEvent,
-    REASONING_FULL_PREFIX, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    MemoryPreamble, ModelSwitchCallback, ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS,
+    ProgressEvent, REASONING_FULL_PREFIX, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
     ResolvedRuntimeKnobs, ServedRoute, ServedRouteSink, SopStepReassembly, StreamDelta,
     THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled, drain_steering_messages,
     is_model_switch_requested, is_thinking_status_text, is_tool_loop_cancelled, run_tool_call_loop,
@@ -1215,6 +1217,11 @@ pub struct AgentRunOverrides {
     /// (CLI / one-shot), which is correct for callers that have no
     /// cross-turn reuse contract.
     pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
+    /// The internal principal that initiated this turn, stamped into the
+    /// ingress envelope. Supplied by internal dispatch surfaces (cron
+    /// scheduler, daemon heartbeat, SOP driver); `None` for entries with
+    /// no principal contract (CLI, one-shot).
+    pub internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
     /// Tool-scope contract for a SOP step executed headlessly (cron and the
     /// other non-agent-loop trigger surfaces). `Some` narrows every turn of
     /// this run to the step's active scope and removes the SOP control tools,
@@ -1396,6 +1403,7 @@ pub async fn run(
         let is_subagent_caller = overrides.is_subagent;
         let suppress_memory_inject = overrides.suppress_memory_inject;
         let memory_free = overrides.memory_free;
+        let internal_principal = overrides.internal_principal.clone();
         let sop_step_scope = overrides.sop_step_scope.clone();
         let security = match overrides.security {
             Some(sec) => sec,
@@ -2116,6 +2124,7 @@ pub async fn run(
                                         activated_tools: activated_handle.as_ref(),
                                         model_switch_callback: None,
                                         receipt_generator: None,
+                                        security: Some(security.as_ref()),
                                     },
                                     ResolvedRuntimeKnobs {
                                         max_tool_iterations: agent.resolved.max_tool_iterations,
@@ -2157,7 +2166,10 @@ pub async fn run(
                                         crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
                                     ),
                                 }),
-                                ingress: IngressContext::from_origin(origin),
+                                ingress: IngressContext::from_parts(
+                                    origin,
+                                    internal_principal.clone(),
+                                ),
                                 agent_alias: Some(agent_alias),
                                 parent_agent_alias: None,
                                 turn_id: &turn_id,
@@ -2715,6 +2727,7 @@ pub async fn run(
                                             activated_tools: activated_handle.as_ref(),
                                             model_switch_callback: None,
                                             receipt_generator: None,
+                                            security: Some(security.as_ref()),
                                         },
                                         ResolvedRuntimeKnobs {
                                             max_tool_iterations: agent.resolved.max_tool_iterations,
@@ -2761,7 +2774,10 @@ pub async fn run(
                                             crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
                                         ),
                                     }),
-                                    ingress: IngressContext::from_origin(origin),
+                                    ingress: IngressContext::from_parts(
+                                        origin,
+                                        internal_principal.clone(),
+                                    ),
                                     agent_alias: Some(agent_alias),
                                     parent_agent_alias: None,
                                     turn_id: &turn_id,
@@ -3068,14 +3084,15 @@ pub async fn process_message(
     message: &str,
     session_id: Option<&str>,
     origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
-    process_message_inner(
+    process_message_shared(
         Arc::new(config),
-        None,
         agent_alias,
         message,
         session_id,
         origin,
+        internal_principal,
     )
     .await
 }
@@ -3090,8 +3107,18 @@ pub(crate) async fn process_message_shared(
     message: &str,
     session_id: Option<&str>,
     origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
-    process_message_inner(config, None, agent_alias, message, session_id, origin).await
+    process_message_inner(
+        config,
+        None,
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        internal_principal,
+    )
+    .await
 }
 
 /// Shared-snapshot variant that also preserves the daemon's live tool-policy source.
@@ -3102,6 +3129,7 @@ pub(crate) async fn process_message_shared_with_live_config(
     message: &str,
     session_id: Option<&str>,
     origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
     process_message_inner(
         config,
@@ -3110,6 +3138,7 @@ pub(crate) async fn process_message_shared_with_live_config(
         message,
         session_id,
         origin,
+        internal_principal,
     )
     .await
 }
@@ -3131,6 +3160,7 @@ pub async fn process_message_with_live_config(
         message,
         session_id,
         origin,
+        None,
     )
     .await
 }
@@ -3142,6 +3172,7 @@ async fn process_message_inner(
     message: &str,
     session_id: Option<&str>,
     origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
@@ -3677,6 +3708,10 @@ async fn process_message_inner(
                     &config.multimodal,
                     agent.resolved.max_tool_iterations,
                     Some(&approval_manager),
+                    // The same policy Arc that assembled this turn's scoped
+                    // tools, so the no-vision image-marker gate reads the
+                    // exact ledger the file tools enforce.
+                    Some(&security),
                     &excluded_tools,
                     &agent.resolved.tool_call_dedup_exempt,
                     activated_handle_pm.as_ref(),
@@ -3696,6 +3731,7 @@ async fn process_message_inner(
                     // `None` (today's channel-less auto-deny). See above.
                     routed_approval_channel_ref,
                     origin,
+                    internal_principal,
                     Some(crate::agent::memory_inject::TurnMemory {
                         handle: mem.as_ref(),
                         query: effective_message.clone(),
@@ -5416,6 +5452,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             history_has_trim_breadcrumb: &mut false,
@@ -5662,6 +5699,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -6093,6 +6131,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -6177,6 +6216,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -6290,6 +6330,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcript starts fresh: no prior trim, no crumb.
@@ -6370,6 +6411,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -6466,6 +6508,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -6547,6 +6590,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -6631,6 +6675,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -6716,6 +6761,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -6788,6 +6834,7 @@ mod tests {
                     context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
+                    security: None,
                 },
                 history: &mut history,
                 // Test transcripts start fresh: no prior trim, no crumb.
@@ -6824,6 +6871,7 @@ mod tests {
             },
             trust: zeroclaw_api::ingress::TrustClass::Untrusted,
             origin: zeroclaw_api::ingress::TurnOrigin::Channel,
+            internal_principal: None,
         })
         .await;
 
@@ -6982,6 +7030,7 @@ mod tests {
                     context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
+                    security: None,
                 },
                 history: &mut history,
                 // Test transcripts start fresh: no prior trim, no crumb.
@@ -7114,6 +7163,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -7198,6 +7248,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -7281,6 +7332,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -7449,6 +7501,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -7617,6 +7670,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             history_has_trim_breadcrumb: &mut false,
@@ -7751,6 +7805,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -7919,6 +7974,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -8146,6 +8202,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &knobs,
+                security: None,
             },
             history: &mut history,
             history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
@@ -8298,6 +8355,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -8477,6 +8535,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -8592,6 +8651,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -8691,6 +8751,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -8782,6 +8843,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -8881,6 +8943,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -8983,6 +9046,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -9091,6 +9155,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -9191,6 +9256,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -9317,6 +9383,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &knobs,
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -9421,6 +9488,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -9530,6 +9598,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -9629,6 +9698,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -9732,6 +9802,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -9837,6 +9908,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -9928,6 +10000,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -10023,6 +10096,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -10113,6 +10187,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -10201,6 +10276,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -10295,6 +10371,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -10402,6 +10479,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -10495,6 +10573,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             channel_name: "matrix",
@@ -10592,6 +10671,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -10672,6 +10752,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -10753,6 +10834,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -10834,6 +10916,7 @@ mod tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -10917,6 +11000,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -11004,6 +11088,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -11103,6 +11188,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -11186,6 +11272,7 @@ Done."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -11272,6 +11359,7 @@ Done."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -11356,6 +11444,7 @@ Done."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -11441,6 +11530,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -11583,6 +11673,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -11676,6 +11767,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -11772,6 +11864,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -11891,6 +11984,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -12023,6 +12117,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -12125,6 +12220,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -12238,6 +12334,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -13138,6 +13235,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -13253,6 +13351,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -13363,6 +13462,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -13473,6 +13573,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -13640,6 +13741,7 @@ This is an example, not an invocation."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -13749,6 +13851,7 @@ This is an example, not an invocation."#;
                 &zeroclaw_config::schema::MultimodalConfig::default(),
                 4,
                 None,
+                None, // security: policy not under test here
                 &[],
                 &[],
                 Some(&activated),
@@ -13825,6 +13928,7 @@ This is an example, not an invocation."#;
                 &zeroclaw_config::schema::MultimodalConfig::default(),
                 4,
                 None,
+                None, // security: policy not under test here
                 &[],
                 &[],
                 Some(&activated),
@@ -13852,6 +13956,231 @@ This is an example, not an invocation."#;
                 "strict parser should still strip think tags from final text, got: {result}"
             );
         });
+    }
+
+    // ── No-vision marker gate through the agent_turn seam ────────────────────
+
+    /// The `agent_turn` wrapper seam (the `process_message` gateway path)
+    /// must refuse a policy-readable marker on a non-vision provider: the
+    /// file exists inside the policy's workspace, so the gate counts it and
+    /// returns the structured capability error before any dispatch.
+    #[tokio::test]
+    async fn agent_turn_refuses_policy_readable_marker_on_non_vision_provider() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir should create");
+        let image_path = workspace.path().join("shot.png");
+        std::fs::write(&image_path, b"policy-readable marker fixture")
+            .expect("marker fixture should write");
+        let policy = crate::security::SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: true,
+            ..crate::security::SecurityPolicy::default()
+        };
+        let model_provider = RecordingModelProvider::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            image_path.display()
+        ))];
+        let observer = NoopObserver;
+
+        let err = agent_turn(
+            None,
+            &model_provider,
+            &mut history,
+            &mut false,
+            &mut None,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            "daemon",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            Some(&policy),
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+            0,
+            0,
+            None,
+            TurnOrigin::SubTurn,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a policy-readable marker on a non-vision provider must refuse the turn");
+
+        let capability_error = err
+            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+            .expect("refusal must retain the structured capability error");
+        assert_eq!(capability_error.capability, "vision");
+        assert!(
+            capability_error.message.contains("1 image marker(s)"),
+            "refusal must count the loadable marker: {capability_error}"
+        );
+        assert!(
+            model_provider
+                .requests
+                .lock()
+                .expect("requests lock")
+                .is_empty(),
+            "the refusal must fire before any provider dispatch"
+        );
+    }
+
+    /// A marker the policy would allow but whose file is missing degrades:
+    /// the turn proceeds and the provider's request carries the placeholder,
+    /// never the raw path.
+    #[tokio::test]
+    async fn agent_turn_degrades_unreadable_marker_on_non_vision_provider() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir should create");
+        let image_path = workspace.path().join("missing.png");
+        let policy = crate::security::SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: true,
+            ..crate::security::SecurityPolicy::default()
+        };
+        let model_provider = RecordingModelProvider::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            image_path.display()
+        ))];
+        let observer = NoopObserver;
+
+        let result = agent_turn(
+            None,
+            &model_provider,
+            &mut history,
+            &mut false,
+            &mut None,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            "daemon",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            Some(&policy),
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+            0,
+            0,
+            None,
+            TurnOrigin::SubTurn,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("an unreadable marker must degrade, not fail the turn");
+
+        assert_eq!(result, "done");
+        let requests = model_provider.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 1, "exactly one dispatch, got {requests:?}");
+        let request_text = requests[0]
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            request_text.contains("(media attachment omitted)"),
+            "the degrade must replace the marker with the placeholder, got: {request_text}"
+        );
+        assert!(
+            !request_text.contains("[IMAGE:"),
+            "no raw marker text may reach the provider, got: {request_text}"
+        );
+    }
+
+    /// `security: None` fails closed to the degrade even when the file
+    /// exists. This pins the wrapper's contract: a future caller that
+    /// forgets to thread the policy fails this test instead of silently
+    /// regressing the gate.
+    #[tokio::test]
+    async fn agent_turn_without_policy_fails_closed_to_degrade() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir should create");
+        let image_path = workspace.path().join("shot.png");
+        std::fs::write(&image_path, b"an existing file nobody vouches for")
+            .expect("marker fixture should write");
+        let model_provider = RecordingModelProvider::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            image_path.display()
+        ))];
+        let observer = NoopObserver;
+
+        let result = agent_turn(
+            None,
+            &model_provider,
+            &mut history,
+            &mut false,
+            &mut None,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            "daemon",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+            0,
+            0,
+            None,
+            TurnOrigin::SubTurn,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("no policy means fail closed: degrade, never fail the turn");
+
+        assert_eq!(result, "done");
+        let requests = model_provider.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 1, "exactly one dispatch, got {requests:?}");
+        let request_text = requests[0]
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            request_text.contains("(media attachment omitted)"),
+            "the degrade must replace the marker with the placeholder, got: {request_text}"
+        );
+        assert!(
+            !request_text.contains("[IMAGE:"),
+            "no raw marker text may reach the provider, got: {request_text}"
+        );
     }
 
     // ── Regression tests for trimming-budget forwarding through agent_turn ────
@@ -13958,6 +14287,7 @@ This is an example, not an invocation."#;
                 &zeroclaw_config::schema::MultimodalConfig::default(),
                 4,
                 None,
+                None, // security: policy not under test here
                 &[],
                 &[],
                 None,
@@ -14041,6 +14371,7 @@ This is an example, not an invocation."#;
                 &zeroclaw_config::schema::MultimodalConfig::default(),
                 4,
                 None,
+                None, // security: policy not under test here
                 &[],
                 &[],
                 None,
@@ -16351,6 +16682,7 @@ Let me check the result."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -16543,6 +16875,7 @@ Let me check the result."#;
                         context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
+                        security: None,
                     },
                     history: &mut history,
                     // Test transcripts start fresh: no prior trim, no crumb.
@@ -16678,6 +17011,7 @@ Let me check the result."#;
                         context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
+                        security: None,
                     },
                     history: &mut history,
                     // Test transcripts start fresh: no prior trim, no crumb.
@@ -16891,6 +17225,7 @@ Let me check the result."#;
                         context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
+                        security: None,
                     },
                     history: &mut history,
                     history_has_trim_breadcrumb: &mut false,
@@ -16994,6 +17329,7 @@ Let me check the result."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -17120,6 +17456,7 @@ Let me check the result."#;
                         context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
+                        security: None,
                     },
                     history: &mut history,
                     // Test transcripts start fresh: no prior trim, no crumb.
@@ -17221,6 +17558,7 @@ Let me check the result."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -17318,6 +17656,7 @@ Let me check the result."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -18451,6 +18790,7 @@ Let me check the result."#;
             "hello",
             Some("session"),
             TurnOrigin::SubTurn,
+            None,
         )
         .await;
 
@@ -18527,6 +18867,7 @@ Let me check the result."#;
             "hello",
             Some("session"),
             TurnOrigin::SubTurn,
+            None,
         )
         .await;
         let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
@@ -18822,6 +19163,81 @@ Let me check the result."#;
         );
     }
 
+    /// The gateway `process_message` seam carries the agent's filesystem
+    /// policy into the turn: a marker under the agent's configured
+    /// workspace on a non-vision provider returns the capability error
+    /// through the full config-resolved path. The provider's non-vision
+    /// capability comes from the construction-time vision override, and
+    /// the gate fires before any dispatch, so the dead `127.0.0.1:9`
+    /// endpoint is never contacted.
+    #[tokio::test]
+    async fn process_message_refuses_policy_readable_marker_on_non_vision_provider() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir should create");
+        let image_path = workspace.path().join("shot.png");
+        std::fs::write(&image_path, b"policy-readable marker fixture")
+            .expect("marker fixture should write");
+        let tmp = tempfile::tempdir().expect("isolated config tempdir should create");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("process-message-vision-gate-model".to_string()),
+                    timeout_secs: Some(1),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    vision: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "process-message-vision-gate-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(workspace.path().to_path_buf()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let err = super::process_message(
+            config,
+            "process-message-vision-gate-agent",
+            &format!("look at this [IMAGE: {}]", image_path.display()),
+            Some("session"),
+            TurnOrigin::SubTurn,
+            None,
+        )
+        .await
+        .expect_err(
+            "a policy-readable marker under the agent workspace must refuse through process_message",
+        );
+
+        let capability_error = err
+            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+            .expect("refusal must retain the structured capability error");
+        assert_eq!(capability_error.capability, "vision");
+        assert!(
+            capability_error.message.contains("1 image marker(s)"),
+            "refusal must count the loadable marker: {capability_error}"
+        );
+    }
+
     // ── Observer metadata regression tests ──
 
     #[derive(Default)]
@@ -19000,6 +19416,7 @@ Let me check the result."#;
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history: &mut history,
             // Test transcripts start fresh: no prior trim, no crumb.
@@ -19173,6 +19590,7 @@ Let me check the result."#;
                 observer: &observer,
                 silent: true,
                 approval: None,
+                security: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                 config: None,
                 max_tool_iterations: 2,
@@ -19381,6 +19799,7 @@ Let me check the result."#;
                 observer: &observer,
                 silent: true,
                 approval: None,
+                security: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                 config: None,
                 max_tool_iterations: 3,
@@ -19489,6 +19908,7 @@ Let me check the result."#;
                 observer: &observer,
                 silent: true,
                 approval: None,
+                security: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                 config: None,
                 max_tool_iterations: 2,
@@ -19808,6 +20228,7 @@ Let me check the result."#;
                     observer: &NoopObserver,
                     silent: true,
                     approval: None,
+                    security: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                     config: None,
                     max_tool_iterations: if summary { 1 } else { 3 },
@@ -20196,6 +20617,7 @@ Let me check the result."#;
                     observer: &observer,
                     silent: true,
                     approval: None,
+                    security: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                     config: None,
                     max_tool_iterations: 3,
@@ -20323,6 +20745,7 @@ Let me check the result."#;
                     observer: &observer,
                     silent: true,
                     approval: None,
+                    security: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                     config: None,
                     max_tool_iterations: 3,
@@ -20592,6 +21015,7 @@ Let me check the result."#;
                     observer: &observer,
                     silent: true,
                     approval: None,
+                    security: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                     config: None,
                     max_tool_iterations: 3,
@@ -20716,6 +21140,7 @@ Let me check the result."#;
             &zeroclaw_config::schema::MultimodalConfig::default(),
             4,
             None,
+            None, // security: policy not under test here
             &[],
             &[],
             None,
@@ -20772,6 +21197,7 @@ Let me check the result."#;
             &zeroclaw_config::schema::MultimodalConfig::default(),
             4,
             None,
+            None, // security: policy not under test here
             &[],
             &[],
             None,
@@ -20845,6 +21271,7 @@ Let me check the result."#;
             &zeroclaw_config::schema::MultimodalConfig::default(),
             4,
             None,
+            None, // security: policy not under test here
             &[],
             &[],
             None,
@@ -21140,6 +21567,82 @@ Let me check the result."#;
             matches!(lifecycle.last(), Some(ObserverEvent::AgentEnd { .. })),
             "the target agent's last lifecycle event must be AgentEnd, \
              got {lifecycle:?} (full captured stream: {events:?})"
+        );
+    }
+
+    /// The `run` seam (daemon/CLI/cron entry) carries the agent policy into
+    /// the turn through its own `ResolvedIo` wiring: same refusal as the
+    /// wrapper path. No HTTP server is needed: the gate fires before any
+    /// dispatch, so the dead endpoint is never contacted; if the gate
+    /// regressed, the connection error would fail the capability downcast
+    /// below.
+    #[tokio::test]
+    async fn run_refuses_policy_readable_marker_on_non_vision_provider() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir should create");
+        let image_path = workspace.path().join("shot.png");
+        std::fs::write(&image_path, b"policy-readable marker fixture")
+            .expect("marker fixture should write");
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("run-vision-gate-model".to_string()),
+                    timeout_secs: Some(1),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    vision: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "run-vision-gate-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(workspace.path().to_path_buf()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let result = super::run(
+            config,
+            "run-vision-gate-agent",
+            Some(format!("look at this [IMAGE: {}]", image_path.display())),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        let err = result.expect_err(
+            "a policy-readable marker under the agent workspace must refuse through run",
+        );
+        let capability_error = err
+            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+            .expect("refusal must retain the structured capability error");
+        assert_eq!(capability_error.capability, "vision");
+        assert!(
+            capability_error.message.contains("1 image marker(s)"),
+            "refusal must count the loadable marker: {capability_error}"
         );
     }
 
