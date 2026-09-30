@@ -85,6 +85,21 @@ struct RuntimeProxyCachedClient {
 
 // ── Top-level config ──────────────────────────────────────────────
 
+/// How `[agents.<alias>].cron_jobs` membership claims a cron job id. See
+/// [`Config::agent_for_cron_job`]: only a [`CronJobClaim::Sole`] claim names an
+/// owner through configuration; every other shape names none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CronJobClaim<'a> {
+    /// No enabled agent lists the id.
+    Unclaimed,
+    /// Only disabled agents list the id.
+    DisabledOnly,
+    /// Exactly one enabled agent lists the id.
+    Sole(&'a str),
+    /// More than one enabled agent lists the id (aliases sorted).
+    Contested(Vec<&'a str>),
+}
+
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
 ///
 /// Resolution order: `ZEROCLAW_CONFIG_DIR` env → `ZEROCLAW_WORKSPACE` env → `~/.zeroclaw/config.toml`.
@@ -337,6 +352,12 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub wss: WssConfig,
+
+    /// Local IPC endpoint limits for the RPC socket or named pipe (`[rpc]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Network"]
+    pub rpc: RpcConfig,
 
     /// Nominated-relay client for reaching this daemon through a relay (`[relay]`).
     #[serde(default)]
@@ -3843,18 +3864,40 @@ pub struct ResolvedContextLimits {
 impl ResolvedContextLimits {
     /// Compatibility-fallback limits for paths that cannot resolve a route
     /// (missing config or an empty agent alias): the unconfigured-window
-    /// fallback with the caller's budget preserved — `0` stays `0` (proactive
-    /// trimming disabled), any positive value is clamped to that window.
+    /// fallback bound to the caller's budget. `0` stays `0` (proactive
+    /// trimming disabled); a positive budget is honored, raising the stub
+    /// window to meet it, because the stub is not model truth (see
+    /// [`Self::bind_budget`]).
     #[must_use]
     pub fn legacy_fallback(budget: usize) -> Self {
-        Self {
-            model_context_window: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
-            model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
-            context_token_budget: if budget == 0 {
-                0
-            } else {
-                budget.min(UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
+        Self::bind_budget(
+            ResolvedModelContextWindow {
+                tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                source: ModelContextWindowSource::CompatibilityFallback,
             },
+            budget,
+        )
+    }
+
+    /// Bind an already-resolved proactive budget to a route's capacity.
+    ///
+    /// A configured capacity is a hard cap on every positive budget. The
+    /// [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`] stub is not: it exists only so
+    /// budget arithmetic has an operand, and an operator's explicit budget is
+    /// better evidence of the model's real window than that stub. When the
+    /// capacity is a compatibility fallback, the window operand is raised to
+    /// the budget so `context_token_budget <= model_context_window` still
+    /// holds, while the source keeps reporting the capacity as unconfigured.
+    #[must_use]
+    pub fn bind_budget(capacity: ResolvedModelContextWindow, budget: usize) -> Self {
+        let model_context_window = match capacity.source {
+            ModelContextWindowSource::Configured => capacity.tokens,
+            ModelContextWindowSource::CompatibilityFallback => capacity.tokens.max(budget),
+        };
+        Self {
+            model_context_window,
+            model_context_window_source: capacity.source,
+            context_token_budget: budget.min(model_context_window),
         }
     }
 
@@ -3885,6 +3928,19 @@ impl ResolvedRuntime {
             model_context_window
         } else {
             UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        };
+        // An unconfigured capacity is only the compatibility stub, not model
+        // truth. An explicit absolute budget above it is the operator telling
+        // us the window is at least that large, so it becomes the window
+        // operand instead of being clamped down to the stub. The source is
+        // left untouched so wire/UI consumers still report the
+        // capacity as unconfigured.
+        let model_context_window = match (self.model_context_window_source, self.max_context_tokens)
+        {
+            (ModelContextWindowSource::CompatibilityFallback, Some(budget)) if budget > 0 => {
+                model_context_window.max(budget)
+            }
+            _ => model_context_window,
         };
 
         // Preserve the established disable sentinel before applying any
@@ -4147,6 +4203,10 @@ pub struct AliasedAgentConfig {
     /// Cron job aliases. Each entry references `cron[key]`, a declarative
     /// scheduled job invoked by the scheduler on its configured trigger.
     /// When the cron fires, this agent is the actor that executes the job.
+    /// Exactly one enabled agent may claim a given id: a job listed by two
+    /// enabled agents is refused rather than run under an arbitrary one,
+    /// unless its row already carries a stored owner from before the second
+    /// claim was added.
     #[tab(Cron)]
     #[serde(default)]
     pub cron_jobs: Vec<String>,
@@ -4973,20 +5033,79 @@ impl Config {
             .collect()
     }
 
-    /// Reverse-lookup the agent alias that owns a declaratively-configured
-    /// cron job (`[cron.<alias>]`). Returns the first agent listing the
-    /// alias in its `cron_jobs` field. `None` when no agent claims the
-    /// job — orphaned cron jobs are skipped at scheduler time with a
-    /// warning. Imperative jobs (created at runtime via `cron_add`) have
-    /// UUID-shaped ids that won't match any agent's `cron_jobs`; the
-    /// scheduler treats those separately (carrying their owning agent
-    /// alongside the DB row is a follow-up).
+    /// The single enabled agent that claims `cron_alias` through
+    /// `[agents.<alias>].cron_jobs`, or `None` when the claim is not unique.
+    /// This is the answer to "who owns this cron job" for ownership that lives
+    /// only in configuration: the scheduler's execution fallback, declarative
+    /// sync, and upgrade ownership recovery all use it. A job row that already
+    /// carries a stored owner is resolved through that stored alias first (see
+    /// the runtime's owner resolution), so this rule governs empty-alias rows
+    /// and not-yet-materialized declarative ids. `agents` is a hash map, so an
+    /// id claimed by two enabled agents would otherwise resolve to whichever
+    /// one iteration yields first, differing between processes; such a job is
+    /// refused rather than run under a coin-flip authority. See
+    /// [`Config::cron_job_claim`] for the reason a claim is not unique.
     #[must_use]
     pub fn agent_for_cron_job(&self, cron_alias: &str) -> Option<&str> {
-        self.agents
-            .iter()
-            .find(|(_, agent)| agent.enabled && agent.cron_jobs.iter().any(|c| c == cron_alias))
-            .map(|(alias, _)| alias.as_str())
+        match self.cron_job_claim(cron_alias) {
+            CronJobClaim::Sole(alias) => Some(alias),
+            _ => None,
+        }
+    }
+
+    /// How `[agents.<alias>].cron_jobs` membership claims `cron_alias`.
+    pub fn cron_job_claim(&self, cron_alias: &str) -> CronJobClaim<'_> {
+        let mut enabled: Vec<&str> = Vec::new();
+        let mut disabled = false;
+        for (alias, agent) in &self.agents {
+            if !agent.cron_jobs.iter().any(|c| c == cron_alias) {
+                continue;
+            }
+            if agent.enabled {
+                enabled.push(alias.as_str());
+            } else {
+                disabled = true;
+            }
+        }
+        enabled.sort_unstable();
+        match enabled.len() {
+            0 if disabled => CronJobClaim::DisabledOnly,
+            0 => CronJobClaim::Unclaimed,
+            1 => CronJobClaim::Sole(enabled[0]),
+            _ => CronJobClaim::Contested(enabled),
+        }
+    }
+
+    /// One warning per cron job id that more than one enabled agent claims:
+    /// such a job is refused at runtime rather than run under an arbitrary
+    /// claimant, and that should surface at validation time, not in the
+    /// scheduler's poll log.
+    fn collect_cron_claim_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        let mut ids: Vec<&str> = self
+            .agents
+            .values()
+            .filter(|agent| agent.enabled)
+            .flat_map(|agent| agent.cron_jobs.iter().map(String::as_str))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            if let CronJobClaim::Contested(claimants) = self.cron_job_claim(id) {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "cron_job_contested_claim",
+                    format!(
+                        "cron job `{id}` is listed in the cron_jobs of more than one enabled agent \
+                         ({}); a job without a stored owner is refused rather than run under an \
+                         arbitrary one. Keep it in exactly one enabled agent's list.",
+                        claimants.join(", ")
+                    ),
+                    "agents",
+                ));
+            }
+        }
     }
 
     /// Resolve the per-agent workspace directory for `alias`.
@@ -8198,6 +8317,36 @@ fn default_wss_max_sessions_per_client() -> usize {
 
 fn default_wss_incomplete_message_timeout_secs() -> u64 {
     60
+}
+
+/// Local IPC endpoint limits (`[rpc]`).
+///
+/// Applies to the Unix socket or Windows named pipe that local clients such as
+/// zerocode connect to. The remote WSS plane has its own limits under `[wss]`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "rpc"]
+pub struct RpcConfig {
+    /// Ceiling on concurrently open local IPC connections (default: 512).
+    /// A connection past the ceiling receives one error frame naming this
+    /// setting and is closed. Values below 1 are treated as 1, and values
+    /// above the runtime's semaphore ceiling are clamped to it. Read when the
+    /// local listener starts, so a change applies at the next daemon restart
+    /// or reload.
+    #[serde(default = "default_rpc_max_local_connections")]
+    pub max_local_connections: usize,
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        Self {
+            max_local_connections: default_rpc_max_local_connections(),
+        }
+    }
+}
+
+fn default_rpc_max_local_connections() -> usize {
+    512
 }
 
 fn default_enroll_bind() -> String {
@@ -20909,6 +21058,7 @@ impl Default for Config {
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            rpc: RpcConfig::default(),
             relay: RelayConfig::default(),
             enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
@@ -22676,6 +22826,7 @@ impl Config {
         // covers the same path.
         self.collect_context_compression_ignored_warnings(&mut warnings);
         self.collect_verifiable_intent_warnings(&mut warnings);
+        self.collect_cron_claim_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -26982,7 +27133,19 @@ fn set_path_in_doc(root: &mut toml_edit::Table, segs: &[&str], value: &toml::Val
         };
     }
     let new_item = crate::migration::toml_value_to_edit_item(value);
-    cursor.insert(last, new_item);
+    match cursor.get_mut(last) {
+        // Key already present: mutate the value in place so the key's leading
+        // decor (a full-line comment above it, blank lines) is preserved.
+        // `insert` would replace the whole key/value pair with a fresh key
+        // carrying default decor, silently dropping an operator's in-section
+        // comment on overwrite. Mirrors `migration::sync_table`'s decor-
+        // preserving update so the incremental (`save_dirty`) and full (`save`)
+        // write paths keep comments identically.
+        Some(existing) => *existing = new_item,
+        None => {
+            cursor.insert(last, new_item);
+        }
+    }
 }
 
 #[allow(clippy::unused_async)] // async needed on unix for tokio File I/O; no-op on other platforms
@@ -27970,6 +28133,64 @@ mod tests {
         assert!(all_denied.channel_voice_peers("telegram", "ops").is_empty());
     }
 
+    fn claiming_agent(enabled: bool, ids: &[&str]) -> super::AliasedAgentConfig {
+        super::AliasedAgentConfig {
+            enabled,
+            cron_jobs: ids.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn cron_job_claim_distinguishes_every_shape() {
+        use super::CronJobClaim;
+        let mut config = super::Config::default();
+        config
+            .agents
+            .insert("a".into(), claiming_agent(true, &["sole", "shared"]));
+        config
+            .agents
+            .insert("b".into(), claiming_agent(true, &["shared"]));
+        config
+            .agents
+            .insert("off".into(), claiming_agent(false, &["dormant", "shared"]));
+
+        assert_eq!(config.cron_job_claim("sole"), CronJobClaim::Sole("a"));
+        assert_eq!(
+            config.cron_job_claim("shared"),
+            CronJobClaim::Contested(vec!["a", "b"]),
+            "a disabled claimant does not count toward contention"
+        );
+        assert_eq!(config.cron_job_claim("dormant"), CronJobClaim::DisabledOnly);
+        assert_eq!(config.cron_job_claim("nobody"), CronJobClaim::Unclaimed);
+
+        // Only the sole claim names an owner; a contested id has none.
+        assert_eq!(config.agent_for_cron_job("sole"), Some("a"));
+        assert_eq!(config.agent_for_cron_job("shared"), None);
+        assert_eq!(config.agent_for_cron_job("dormant"), None);
+        assert_eq!(config.agent_for_cron_job("nobody"), None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn contested_cron_claim_is_a_validation_warning() {
+        let mut config = super::Config::default();
+        config
+            .agents
+            .insert("a".into(), claiming_agent(true, &["shared", "mine"]));
+        config
+            .agents
+            .insert("b".into(), claiming_agent(true, &["shared"]));
+        let warnings = config.collect_warnings();
+        let contested: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.code == "cron_job_contested_claim")
+            .collect();
+        assert_eq!(contested.len(), 1, "{warnings:?}");
+        assert!(contested[0].message.contains("`shared`"));
+        assert!(contested[0].message.contains("a, b"));
+        assert_eq!(contested[0].path, "agents");
+    }
+
     #[::core::prelude::v1::test]
     fn cache_passthrough_deserializes_and_defaults_to_omitted() {
         let enabled: ModelProviderConfig = toml::from_str("cache_passthrough = true").unwrap();
@@ -28178,6 +28399,171 @@ mod tests {
             ..ResolvedRuntime::default()
         };
         assert_eq!(r.effective_context_budget(), 8_000);
+
+        // An unconfigured capacity is a compatibility stub, not model truth.
+        // An explicit absolute budget above the stub is honored, and the
+        // window operand is raised to it so capacity stays a hard invariant
+        // while its provenance still reports "not configured".
+        let r = ResolvedRuntime {
+            max_context_tokens: Some(1_000_000),
+            ..ResolvedRuntime::default()
+        };
+        let limits = r.context_limits();
+        assert_eq!(limits.context_token_budget, 1_000_000);
+        assert_eq!(limits.model_context_window, 1_000_000);
+        assert_eq!(
+            limits.model_context_window_source,
+            ModelContextWindowSource::CompatibilityFallback
+        );
+        assert_eq!(limits.configured_model_context_window(), None);
+
+        // In ratio mode the explicit budget stands in for the unknown window.
+        let r = ResolvedRuntime {
+            max_context_tokens: Some(1_000_000),
+            context_compact_ratio: Some(0.8),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 800_000);
+
+        // A pruning threshold still pulls the honored budget down.
+        let r = ResolvedRuntime {
+            max_context_tokens: Some(1_000_000),
+            history_pruning: crate::scattered_types::HistoryPrunerConfig {
+                enabled: true,
+                max_tokens: 12_000,
+                ..crate::scattered_types::HistoryPrunerConfig::default()
+            },
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 12_000);
+
+        // An explicit budget at or below the stub leaves the stub untouched.
+        let r = ResolvedRuntime {
+            max_context_tokens: Some(16_000),
+            ..ResolvedRuntime::default()
+        };
+        let limits = r.context_limits();
+        assert_eq!(limits.context_token_budget, 16_000);
+        assert_eq!(limits.model_context_window, 32_000);
+    }
+
+    #[::core::prelude::v1::test]
+    fn compatibility_fallback_limits_honor_explicit_budget_above_the_stub() {
+        use super::{
+            ModelContextWindowSource, ResolvedContextLimits, ResolvedModelContextWindow,
+            UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+        };
+
+        // Zero stays the proactive-trimming disable sentinel.
+        let limits = ResolvedContextLimits::legacy_fallback(0);
+        assert_eq!(limits.context_token_budget, 0);
+        assert_eq!(
+            limits.model_context_window,
+            UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
+
+        // A budget below the stub is preserved against the stub.
+        let limits = ResolvedContextLimits::legacy_fallback(16_000);
+        assert_eq!(limits.context_token_budget, 16_000);
+        assert_eq!(
+            limits.model_context_window,
+            UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
+
+        // A budget above the stub is no longer clamped to it: the stub is not
+        // model truth, and the operator's explicit value is better evidence.
+        let limits = ResolvedContextLimits::legacy_fallback(1_000_000);
+        assert_eq!(limits.context_token_budget, 1_000_000);
+        assert_eq!(limits.model_context_window, 1_000_000);
+        assert_eq!(
+            limits.model_context_window_source,
+            ModelContextWindowSource::CompatibilityFallback
+        );
+        assert_eq!(limits.configured_model_context_window(), None);
+
+        // Binding a budget to a configured capacity still caps at capacity.
+        let limits = ResolvedContextLimits::bind_budget(
+            ResolvedModelContextWindow {
+                tokens: 8_000,
+                source: ModelContextWindowSource::Configured,
+            },
+            1_000_000,
+        );
+        assert_eq!(limits.context_token_budget, 8_000);
+        assert_eq!(limits.model_context_window, 8_000);
+        assert_eq!(limits.configured_model_context_window(), Some(8_000));
+
+        // Binding to the compatibility stub honors the budget.
+        let limits = ResolvedContextLimits::bind_budget(
+            ResolvedModelContextWindow {
+                tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                source: ModelContextWindowSource::CompatibilityFallback,
+            },
+            1_000_000,
+        );
+        assert_eq!(limits.context_token_budget, 1_000_000);
+        assert_eq!(limits.model_context_window, 1_000_000);
+    }
+
+    /// Mirrors the reported operator setup: a provider profile that declares `model`
+    /// and `max_tokens` but no `context_window`, bound to a runtime profile
+    /// with a large explicit `max_context_tokens`. The profile budget must
+    /// win over the 32,000 compatibility stub.
+    #[::core::prelude::v1::test]
+    fn unconfigured_provider_capacity_honors_explicit_profile_budget() {
+        use super::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut cfg = Config::default();
+        let provider = cfg
+            .providers
+            .models
+            .ensure("anthropic", "clod")
+            .expect("known model provider type");
+        provider.model = Some("claude-opus-5-5".to_string());
+        provider.max_tokens = Some(128_000);
+        cfg.runtime_profiles.insert(
+            "normal".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(1_000_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        cfg.agents.insert(
+            "zerocode".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "normal".into(),
+                model_provider: "anthropic.clod".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let limits =
+            cfg.resolved_context_limits_for_route("zerocode", "anthropic.clod", "claude-opus-5-5");
+        assert_eq!(limits.context_token_budget, 1_000_000);
+        assert_eq!(limits.model_context_window, 1_000_000);
+        assert_eq!(
+            limits.model_context_window_source,
+            super::ModelContextWindowSource::CompatibilityFallback
+        );
+        assert_eq!(cfg.configured_model_context_window("zerocode"), None);
+        assert_eq!(
+            cfg.resolved_agent_config("zerocode")
+                .expect("agent resolves")
+                .resolved
+                .effective_context_budget(),
+            1_000_000
+        );
+
+        // With the ratio also set, the explicit budget is the window operand.
+        cfg.runtime_profiles
+            .get_mut("normal")
+            .expect("profile exists")
+            .context_compact_ratio = Some(0.8);
+        let limits =
+            cfg.resolved_context_limits_for_route("zerocode", "anthropic.clod", "claude-opus-5-5");
+        assert_eq!(limits.context_token_budget, 800_000);
+        assert_eq!(limits.model_context_window, 1_000_000);
     }
 
     #[::core::prelude::v1::test]
@@ -32237,6 +32623,7 @@ auto_save = true
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            rpc: RpcConfig::default(),
             relay: RelayConfig::default(),
             enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
@@ -33429,6 +33816,7 @@ default_temperature = 0.7
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            rpc: RpcConfig::default(),
             relay: RelayConfig::default(),
             enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
