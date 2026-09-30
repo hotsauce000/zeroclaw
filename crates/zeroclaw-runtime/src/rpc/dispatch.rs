@@ -2709,6 +2709,7 @@ impl RpcDispatcher {
             Method::SessionClose
                 | Method::SessionPrompt
                 | Method::SessionConfigure
+                | Method::SessionThinkingOptions
                 | Method::SessionCancel
                 | Method::SessionGitBranch
                 | Method::SessionMessages
@@ -7229,6 +7230,21 @@ impl RpcDispatcher {
         // gate, so parking here with the gate held would block the very
         // task that wait is waiting on (and stall every other config write
         // until the timeout).
+        #[cfg(test)]
+        let _config_write_guard = {
+            let mut lock = Box::pin(Arc::clone(&self.ctx.config_write_lock).lock_owned());
+            let mut notified = false;
+            std::future::poll_fn(|cx| {
+                let result = std::future::Future::poll(lock.as_mut(), cx);
+                if result.is_pending() && !notified {
+                    self.ctx.sessions.configure_writer_waiting.notify_one();
+                    notified = true;
+                }
+                result
+            })
+            .await
+        };
+        #[cfg(not(test))]
         let _config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
 
         // Capture the session generation /before/ acquiring the per-session
@@ -21008,9 +21024,12 @@ mod tests {
             .await
             .expect("the live session has an update lock");
         let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+        let waiting = sessions.model_provider_update_waiting();
         let operation = alice.handle_session_configure(&params);
         let replace = async {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiting.notified())
+                .await
+                .expect("configure reached the update lock after capturing its generation");
             assert!(sessions.remove("cfg").await);
             let successor =
                 install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
@@ -21030,6 +21049,51 @@ mod tests {
                 .and_then(|o| o.temperature),
             None,
             "bob's successor keeps its own overrides"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_refuses_replacement_before_generation_capture() {
+        use crate::rpc::types::ChatMode;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        install_live_session_owned_by(&sessions, "cfg", Some("user:alice"), ChatMode::Chat).await;
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let writer = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+        let operation = alice.handle_session_configure(&params);
+        let replace = async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                sessions.configure_writer_waiting.notified(),
+            )
+            .await
+            .expect("configure passed initial authorization and is waiting before capture");
+            assert!(sessions.remove("cfg").await);
+            let successor =
+                install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
+                    .await;
+            drop(writer);
+            successor
+        };
+        let (result, successor) = tokio::join!(operation, replace);
+        let err = result.expect_err("current foreign owner must be refused before capture");
+        assert_eq!(err.code, FORBIDDEN);
+        assert_eq!(
+            err.message,
+            "Session not found or not owned by this principal"
+        );
+        assert_eq!(sessions.get_generation("cfg").await, Some(successor));
+        assert_eq!(
+            sessions
+                .get_overrides("cfg")
+                .await
+                .and_then(|o| o.temperature),
+            None
         );
     }
 
@@ -39342,6 +39406,7 @@ mod tests {
             "session/close",
             "session/prompt",
             "session/configure",
+            "session/thinking-options",
             "session/cancel",
             "session/git_branch",
             "session/messages",
@@ -39371,6 +39436,10 @@ mod tests {
                 .expect("foreign request must receive an ownership error");
             let response: Value = serde_json::from_str(&response).unwrap();
             assert_eq!(response["id"], index);
+            assert!(
+                response.get("result").is_none(),
+                "{method} must not disclose a result"
+            );
             assert_eq!(response["error"]["code"], SESSION_NOT_OWNED, "{method}");
         }
 
@@ -39380,6 +39449,52 @@ mod tests {
         );
         assert!(foreign.ctx.approval_pending.contains("owner-request"));
         assert!(approval_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn thinking_options_dispatch_preserves_owner_and_trusted_local_access_without_agent_wait()
+    {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let (mut owner, mut owner_rx) = make_remote_dispatcher(Arc::clone(&ctx), "tui-owner");
+        let created = owner
+            .handle_session_new_for_test(&json!({"agent_alias": "test-agent"}))
+            .await
+            .expect("owner must create the session");
+        let session_id = created["session_id"].as_str().unwrap().to_string();
+        let (local_tx, mut local_rx) = tokio::sync::mpsc::channel(64);
+        let mut local = RpcDispatcher::new(ctx, local_tx, "unix:trusted-local".to_string());
+        local.set_authenticated_for_test();
+        local.set_tui_id_for_test(Some("different-local-tui".to_string()));
+        let agent = sessions.get_agent(&session_id).await.unwrap();
+        let _turn_guard = agent.lock().await;
+        let frame = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/thinking-options",
+            "params": {"session_id": &session_id},
+        })
+        .to_string();
+        for (dispatcher, receiver) in [(&mut owner, &mut owner_rx), (&mut local, &mut local_rx)] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                dispatcher.process_line_for_test(&frame),
+            )
+            .await
+            .expect("thinking options must not wait for the Agent");
+            let response: Value = serde_json::from_str(&receiver.recv().await.unwrap()).unwrap();
+            assert!(response.get("error").is_none(), "{response}");
+            assert_eq!(response["result"]["session_id"], session_id);
+            assert!(response["result"]["thinking_options"].is_object());
+            assert!(response["result"]["overrides"].is_object());
+        }
+        assert_eq!(
+            sessions.session_owner_tui_id(&session_id).await,
+            Some(Some("tui-owner".to_string()))
+        );
     }
 
     // ── Missing-session regression: close / delete must not fabricate
