@@ -5808,7 +5808,7 @@ mod tests {
         state.mem = memory.clone();
         let state = Arc::new(state);
         let task_state = Arc::clone(&state);
-        let request = tokio::spawn(async move {
+        let request = zeroclaw_spawn::spawn!(async move {
             delete_agent_cascade(
                 &task_state,
                 &None,

@@ -1350,7 +1350,7 @@ mod tests {
             .join("knowledge.db")
             .to_string_lossy()
             .to_string();
-        config.save().await.unwrap();
+        Box::pin(config.save()).await.unwrap();
 
         // Block archive creation so the first cascade cannot cross the
         // export-then-purge gate.
@@ -1472,7 +1472,7 @@ mod tests {
             .join("knowledge.db")
             .to_string_lossy()
             .to_string();
-        config.save().await.unwrap();
+        Box::pin(config.save()).await.unwrap();
 
         // Committed-delete shape: `agents.victim` is already gone, only the
         // workspace still lags behind.
@@ -1571,7 +1571,7 @@ mod tests {
             .join("knowledge.db")
             .to_string_lossy()
             .to_string();
-        config.save().await.unwrap();
+        Box::pin(config.save()).await.unwrap();
 
         assert!(
             !agent_delete_residue_exists(&config, "ghost").await,
