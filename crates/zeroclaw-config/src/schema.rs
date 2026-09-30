@@ -5090,6 +5090,19 @@ impl Config {
         {
             return custom.clone();
         }
+        self.default_agent_workspace_dir(agent_alias)
+    }
+
+    /// The alias-derived workspace location for `alias`,
+    /// `<install>/agents/<alias>/workspace/`, whatever
+    /// `[agents.<alias>.workspace.path]` says.
+    ///
+    /// This is where [`Self::agent_workspace_dir`] resolves when no custom
+    /// path is set. An agent lifecycle operation compares the two to tell a
+    /// workspace that follows the alias, and so moves on rename, from a
+    /// custom one that stays put.
+    #[must_use]
+    pub fn default_agent_workspace_dir(&self, agent_alias: &str) -> std::path::PathBuf {
         self.install_root_dir()
             .join("agents")
             .join(agent_alias)
@@ -42061,6 +42074,33 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         workspace.set_prop("agent_workspace.path", "").unwrap();
         assert_eq!(workspace.path, None);
+    }
+
+    #[test]
+    async fn default_agent_workspace_dir_ignores_a_custom_workspace_path() {
+        let install = PathBuf::from("/srv/zeroclaw");
+        let mut config = Config {
+            config_path: install.join("config.toml"),
+            ..Config::default()
+        };
+        let derived = install.join("agents").join("scout").join("workspace");
+        assert_eq!(config.default_agent_workspace_dir("scout"), derived);
+        assert_eq!(
+            config.agent_workspace_dir("scout"),
+            derived,
+            "an unconfigured alias resolves to the derived location"
+        );
+
+        let custom = PathBuf::from("/mnt/disk/scout");
+        let mut agent = AliasedAgentConfig::default();
+        agent.workspace.path = Some(custom.clone());
+        config.agents.insert("scout".to_string(), agent);
+        assert_eq!(config.agent_workspace_dir("scout"), custom);
+        assert_eq!(
+            config.default_agent_workspace_dir("scout"),
+            derived,
+            "the derived location ignores the custom path"
+        );
     }
 
     #[cfg(feature = "schema-export")]

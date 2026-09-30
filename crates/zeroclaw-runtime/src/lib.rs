@@ -14,6 +14,7 @@ pub mod migration;
 pub mod util;
 
 pub mod agent;
+pub mod agent_rename_recovery;
 pub mod approval;
 pub mod browse;
 pub mod calendar;
@@ -28,6 +29,7 @@ pub mod heartbeat;
 pub mod hooks;
 pub mod i18n;
 pub mod integrations;
+pub mod lifecycle_path;
 pub mod observability;
 pub mod peers;
 pub mod platform;
