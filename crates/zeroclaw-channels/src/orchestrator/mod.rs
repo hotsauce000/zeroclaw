@@ -21547,62 +21547,116 @@ temperature = 0.3
             SessionOwnershipScope, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
         };
 
-        let tmp = tempfile::TempDir::new().unwrap();
-        let session_store: Arc<dyn SessionBackend> =
-            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
-        session_store
-            .append(
-                "webhook-session",
-                &ChatMessage::user("private webhook turn"),
+        for backend_name in ["sqlite", "jsonl"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let session_store =
+                zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+            let ctx = ChannelRuntimeContext {
+                session_store: Some(Arc::clone(&session_store)),
+                ..(*router_test_ctx()).clone()
+            };
+            let msg = ChannelMessage {
+                id: "webhook-msg".into(),
+                sender: "webhook-user".into(),
+                reply_target: "webhook-target".into(),
+                content: "private webhook turn".into(),
+                channel: "webhook".into(),
+                channel_alias: None,
+                ..Default::default()
+            };
+            // Match the real incoming-message order: claim a genuinely absent
+            // session before writing any private transcript content.
+            assert!(
+                session_store
+                    .get_session_metadata("webhook-session")
+                    .is_none()
+            );
+            assert!(stamp_session_routing_context(&ctx, &msg, "webhook-session"));
+            let metadata = session_store
+                .get_session_metadata("webhook-session")
+                .unwrap();
+            assert_eq!(metadata.agent_alias.as_deref(), Some("test-agent"));
+            assert_eq!(metadata.channel_id.as_deref(), Some("webhook"));
+            session_store
+                .append(
+                    "webhook-session",
+                    &ChatMessage::user("private webhook turn"),
+                )
+                .unwrap();
+
+            let scope = SessionOwnershipScope::for_agent("test-agent");
+            let security = Arc::new(SecurityPolicy::default());
+            let listed = SessionsListTool::for_agent(
+                Arc::clone(&session_store),
+                Arc::clone(&security),
+                scope.clone(),
             )
-            .unwrap();
-        let ctx = ChannelRuntimeContext {
-            session_store: Some(Arc::clone(&session_store)),
-            ..(*router_test_ctx()).clone()
-        };
-        let msg = ChannelMessage {
-            id: "webhook-msg".into(),
-            sender: "webhook-user".into(),
-            reply_target: "webhook-target".into(),
-            content: "private webhook turn".into(),
-            channel: "webhook".into(),
-            channel_alias: None,
-            ..Default::default()
-        };
-        assert!(stamp_session_routing_context(&ctx, &msg, "webhook-session"));
-
-        let scope = SessionOwnershipScope::for_agent("test-agent");
-        let security = Arc::new(SecurityPolicy::default());
-        let listed = SessionsListTool::for_agent(
-            Arc::clone(&session_store),
-            Arc::clone(&security),
-            scope.clone(),
-        )
-        .execute(serde_json::json!({}))
-        .await
-        .unwrap();
-        assert!(listed.success);
-        assert!(listed.output.contains("webhook-session"));
-
-        let history = SessionsHistoryTool::for_agent(
-            Arc::clone(&session_store),
-            Arc::clone(&security),
-            scope.clone(),
-        )
-        .execute(serde_json::json!({"session_id": "webhook-session"}))
-        .await
-        .unwrap();
-        assert!(history.success);
-        assert!(history.output.contains("private webhook turn"));
-
-        let sent = SessionsSendTool::for_agent(session_store, security, scope)
-            .execute(serde_json::json!({
-                "session_id": "webhook-session",
-                "message": "owned follow-up"
-            }))
+            .execute(serde_json::json!({}))
             .await
             .unwrap();
-        assert!(sent.success);
+            assert!(listed.success);
+            assert!(listed.output.contains("webhook-session"));
+
+            let history = SessionsHistoryTool::for_agent(
+                Arc::clone(&session_store),
+                Arc::clone(&security),
+                scope.clone(),
+            )
+            .execute(serde_json::json!({"session_id": "webhook-session"}))
+            .await
+            .unwrap();
+            assert!(history.success);
+            assert!(history.output.contains("private webhook turn"));
+
+            let sent = SessionsSendTool::for_agent(session_store, security, scope)
+                .execute(serde_json::json!({
+                    "session_id": "webhook-session",
+                    "message": "owned follow-up"
+                }))
+                .await
+                .unwrap();
+            assert!(sent.success);
+        }
+    }
+
+    #[test]
+    fn existing_unattributed_channel_session_refuses_claim_without_mutation() {
+        for backend_name in ["sqlite", "jsonl"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+            store
+                .append(
+                    "unattributed",
+                    &ChatMessage::user("private preexisting turn"),
+                )
+                .unwrap();
+            let before_messages = serde_json::to_value(store.load("unattributed")).unwrap();
+            let before_metadata =
+                format!("{:?}", store.get_session_metadata("unattributed").unwrap());
+            let ctx = ChannelRuntimeContext {
+                session_store: Some(Arc::clone(&store)),
+                ..(*router_test_ctx()).clone()
+            };
+            let msg = ChannelMessage {
+                channel: "webhook".into(),
+                sender: "webhook-user".into(),
+                reply_target: "webhook-target".into(),
+                ..Default::default()
+            };
+            assert!(
+                !stamp_session_routing_context(&ctx, &msg, "unattributed"),
+                "{backend_name}"
+            );
+            assert_eq!(
+                serde_json::to_value(store.load("unattributed")).unwrap(),
+                before_messages
+            );
+            assert_eq!(
+                format!("{:?}", store.get_session_metadata("unattributed").unwrap()),
+                before_metadata
+            );
+            assert_eq!(store.get_session_agent_alias("unattributed").unwrap(), None);
+        }
     }
 
     #[test]
@@ -25754,35 +25808,47 @@ api_key = "anthropic-key"
      {
         use zeroclaw_infra::session_backend::SessionBackend;
 
-        #[derive(Default)]
         struct FailingRewriteAndProvenanceBackend {
-            messages: std::sync::Mutex<Vec<ChatMessage>>,
+            inner: SqliteSessionBackend,
+            rewrite_attempts: std::sync::atomic::AtomicUsize,
+            provenance_attempts: std::sync::atomic::AtomicUsize,
         }
         impl SessionBackend for FailingRewriteAndProvenanceBackend {
             fn load(&self, _key: &str) -> Vec<ChatMessage> {
-                self.messages
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone()
+                self.inner.load(_key)
             }
             fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
-                self.messages
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(msg.clone());
-                Ok(())
+                self.inner.append(_key, msg)
             }
-            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
-                Ok(false)
+            fn remove_last(&self, key: &str) -> std::io::Result<bool> {
+                self.inner.remove_last(key)
             }
             fn list_sessions(&self) -> Vec<String> {
-                vec![]
+                self.inner.list_sessions()
+            }
+            fn claim_session_with_authority(
+                &self,
+                key: &str,
+                agent: &str,
+                authority: &zeroclaw_infra::session_backend::ChannelAuthority,
+            ) -> std::io::Result<zeroclaw_infra::session_backend::SessionOwnerClaim> {
+                self.inner
+                    .claim_session_with_authority(key, agent, authority)
+            }
+            fn set_session_context(
+                &self,
+                key: &str,
+                context: zeroclaw_infra::session_backend::SessionContext<'_>,
+            ) -> std::io::Result<()> {
+                self.inner.set_session_context(key, context)
             }
             fn rewrite_messages(
                 &self,
                 _key: &str,
                 _messages: &[ChatMessage],
             ) -> std::io::Result<()> {
+                self.rewrite_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(std::io::Error::other("simulated transcript write failure"))
             }
             fn set_session_trim_breadcrumb(
@@ -25793,17 +25859,67 @@ api_key = "anthropic-key"
                 Err(std::io::Error::other("simulated breadcrumb write failure"))
             }
             fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+                self.provenance_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(std::io::Error::other(
                     "simulated breadcrumb provenance read failure",
                 ))
             }
         }
 
+        #[derive(Default)]
+        struct ObservedFormatErrorProvider(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ModelProvider for ObservedFormatErrorProvider {
+            async fn chat_with_system(
+                &self,
+                system: Option<&str>,
+                message: &str,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                FormatErrorModelProvider
+                    .chat_with_system(system, message, model, temperature)
+                    .await
+            }
+            async fn chat_with_history(
+                &self,
+                messages: &[ChatMessage],
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                let result = FormatErrorModelProvider
+                    .chat_with_history(messages, model, temperature)
+                    .await;
+                if result.is_err() {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                result
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for ObservedFormatErrorProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Attributable::role(&FormatErrorModelProvider)
+            }
+            fn alias(&self) -> &str {
+                "ObservedFormatErrorProvider"
+            }
+        }
+        let provider = Arc::new(ObservedFormatErrorProvider::default());
         let mut msg = message_sent_hook_test_message();
         msg.content = "trigger format error".to_string();
         let history_key = conversation_history_key(&msg);
 
-        let backend = Arc::new(FailingRewriteAndProvenanceBackend::default());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = Arc::new(FailingRewriteAndProvenanceBackend {
+            inner: SqliteSessionBackend::new(tmp.path()).unwrap(),
+            rewrite_attempts: std::sync::atomic::AtomicUsize::new(0),
+            provenance_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        backend
+            .inner
+            .set_session_agent_alias(&history_key, "test")
+            .unwrap();
         // A whole old turn (user + assistant), so a tiny `context_token_budget`
         // forces the pre-dispatch gate to drop it before the (erroring)
         // provider call, giving the resync below something real to detect.
@@ -25821,7 +25937,7 @@ api_key = "anthropic-key"
         let runtime_ctx = test_channel_ctx_with_backend_channel_and_provider(
             backend.clone() as Arc<dyn SessionBackend>,
             channel,
-            Arc::new(FormatErrorModelProvider),
+            provider.clone(),
             1, // context_token_budget: force a whole-turn drop pre-dispatch
         );
         runtime_ctx
@@ -25839,12 +25955,26 @@ api_key = "anthropic-key"
             .push(history_key.clone(), false);
 
         process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
+        assert!(
+            backend
+                .rewrite_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+        );
+        assert!(
+            backend
+                .provenance_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+        );
+        assert!(
+            provider.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the erroring provider path must run"
+        );
 
         assert!(
             !backend
-                .messages
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .load(&history_key)
                 .iter()
                 .any(|m| m.content.contains("Task failed")),
             "a provider error after a failed resync must not append the \
