@@ -572,10 +572,10 @@ Some cases read differently:
   its record names the method that opened the stream.
 - Some refusals are answered but not recorded: a refused `initialize`
   handshake (so a missing or rejected credential leaves no record), the
-  not-found-or-not-owned session refusal, a scoped principal's request for the
-  shared memory plane, an SOP decision the approval policy does not authorize,
-  a failed TUI signature check, and the `sops/run-detail` and `sops/rename`
-  refusals over remote WSS.
+  not-found-or-not-owned session refusal outside chunked uploads, a scoped
+  principal's request for the shared memory plane, an SOP decision the
+  approval policy does not authorize, a failed TUI signature check, and the
+  `sops/run-detail` and `sops/rename` refusals over remote WSS.
 
 The identifiers `reason` can hold:
 
@@ -601,6 +601,7 @@ The identifiers `reason` can hold:
 | `global_stream_scoped` | `-32012` | A scoped principal (neither an administrator nor the shared operator) asked for a daemon-wide log or event stream or the event history, or held such a stream open when it lost administrator rights. |
 | `sop_tool_selector_constrained` | `-32012` | `sops/run` or `sops/decide` came from a principal that is not an administrator and whose tool selector is not `"*"`. |
 | `sop_definition_unreadable` | `-32012` | The procedure to replace or delete cannot be loaded to check which agents it runs as. |
+| `session_not_owned` | `-32012` | A chunked upload names a session the principal does not own. The client is told the session was not found or is not owned. |
 
 ## Session isolation
 
