@@ -1036,6 +1036,75 @@ mod tests {
         );
     }
 
+    const PEER_COST_CHILD_ENV: &str = "ZEROCLAW_PEER_COST_EXECUTE_TEST_CHILD";
+    const PEER_COST_TEST: &str = "tools::send_message_to_peer::tests::peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget";
+    const PEER_COST_COMPLETE: &str = "peer cost execute assertions completed";
+
+    async fn run_peer_cost_child(mode: &str) -> Result<String, String> {
+        // Other suites legitimately resolve disabled process-global cost policy.
+        // A separate process isolates this real-boundary fixture, not production.
+        let output = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let stdout = output.path().join("stdout");
+        let stderr = output.path().join("stderr");
+        let mut child = tokio::process::Command::new(
+            std::env::current_exe().map_err(|error| error.to_string())?,
+        )
+        .arg(PEER_COST_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(PEER_COST_CHILD_ENV, mode)
+        .stdout(std::fs::File::create(&stdout).map_err(|error| error.to_string())?)
+        .stderr(std::fs::File::create(&stderr).map_err(|error| error.to_string())?)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+        let status =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await {
+                Ok(status) => status.map_err(|error| error.to_string())?,
+                Err(_) => {
+                    child.kill().await.map_err(|error| error.to_string())?;
+                    let transcript = format!(
+                        "{}\n{}",
+                        std::fs::read_to_string(&stdout).map_err(|error| error.to_string())?,
+                        std::fs::read_to_string(&stderr).map_err(|error| error.to_string())?
+                    );
+                    return Err(format!(
+                        "isolated peer cost test timed out and was reaped:\n{transcript}"
+                    ));
+                }
+            };
+        let transcript = format!(
+            "{}\n{}",
+            std::fs::read_to_string(&stdout).map_err(|error| error.to_string())?,
+            std::fs::read_to_string(&stderr).map_err(|error| error.to_string())?
+        );
+        if !status.success() {
+            return Err(format!(
+                "isolated peer cost test failed ({status}):\n{transcript}"
+            ));
+        }
+        if !transcript.contains("running 1 test")
+            || !transcript.contains("test result: ok. 1 passed;")
+            || !transcript.contains(PEER_COST_TEST)
+            || !transcript.contains(PEER_COST_COMPLETE)
+        {
+            return Err(format!(
+                "isolated peer cost body did not execute exactly once:\n{transcript}"
+            ));
+        }
+        Ok(transcript)
+    }
+
+    #[tokio::test]
+    async fn peer_cost_child_failure_propagates_status_and_output() {
+        let error = run_peer_cost_child("failure-control")
+            .await
+            .expect_err("a failing child must fail its parent wrapper");
+        assert!(error.contains("isolated peer cost test failed"), "{error}");
+        assert!(error.contains("peer cost child failure control"), "{error}");
+        assert!(error.contains("0 passed; 1 failed;"), "{error}");
+    }
+
     /// The test above exercises `deliver_peer_turn_with_cost_scope` directly
     /// with isolated trackers. This test drives the REAL tool boundary:
     /// `execute()` -> canonical-recipient resolution -> cost-context
@@ -1047,6 +1116,18 @@ mod tests {
     #[tokio::test]
     async fn peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget()
     {
+        match std::env::var(PEER_COST_CHILD_ENV).as_deref() {
+            Ok("fixture") => {}
+            Ok("failure-control") => panic!("peer cost child failure control"),
+            _ => {
+                let transcript = run_peer_cost_child("fixture")
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                eprintln!("{transcript}");
+                return;
+            }
+        }
+
         use crate::agent::turn::provider_call::enforce_tool_loop_budget;
         use crate::cost::CostTracker;
         use axum::{Json, Router, extract::State, routing::post};
@@ -1282,6 +1363,7 @@ mod tests {
         .expect("recipient finishes persistence and releases admission");
         assert!(lifecycle.begin_delete("recipient").is_ok());
         server.abort();
+        eprintln!("{PEER_COST_COMPLETE}");
     }
 
     /// The in-process peer route accepts a send and, by default, lets the
