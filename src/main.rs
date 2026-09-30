@@ -4423,6 +4423,13 @@ async fn seed_plugin_config_entries(
 /// contents; every other error passes through unchanged.
 #[cfg(feature = "plugins-wasm")]
 fn with_unadmitted_package_remedy(error: zeroclaw::plugins::error::PluginError) -> anyhow::Error {
+    if matches!(
+        &error,
+        zeroclaw::plugins::error::PluginError::RecoveryRetained { .. }
+            | zeroclaw::plugins::error::PluginError::NamespaceChanged(_)
+    ) {
+        return with_remove_refusal_reason(error);
+    }
     let zeroclaw::plugins::error::PluginError::UnadmittedPackage { name, .. } = &error else {
         return error.into();
     };
@@ -4441,6 +4448,24 @@ fn with_unadmitted_package_remedy(error: zeroclaw::plugins::error::PluginError) 
 /// passes through unchanged.
 #[cfg(feature = "plugins-wasm")]
 fn with_remove_refusal_reason(error: zeroclaw::plugins::error::PluginError) -> anyhow::Error {
+    if let zeroclaw::plugins::error::PluginError::NamespaceChanged(reason) = &error {
+        return anyhow::Error::msg(ta(
+            "cli-plugin-namespace-changed",
+            &[("reason", reason.as_str())],
+            format!(
+                "Plugin operation refused because filesystem ownership changed: {reason}. Inspect the plugins directory before retrying."
+            ),
+        ));
+    }
+    if let zeroclaw::plugins::error::PluginError::RecoveryRetained { path, reason } = &error {
+        return anyhow::Error::msg(ta(
+            "cli-plugin-recovery-retained",
+            &[("path", path.as_str()), ("reason", reason.as_str())],
+            format!(
+                "Recovery retained package files at {path}: {reason}. Resolve the occupied destination or filesystem error, then retry plugin remove."
+            ),
+        ));
+    }
     let zeroclaw::plugins::error::PluginError::UnadmittedPackage { name, reason } = &error else {
         return error.into();
     };
@@ -10098,7 +10123,22 @@ Add pricing to the active provider profile or supply a catalog entry."
                 let instance_keys: Vec<String> = installed_plugin_config_entries(&host, &name)
                     .map(|entries| entries.into_iter().map(|(_, key)| key).collect())
                     .unwrap_or_default();
-                host.remove(&name).map_err(with_remove_refusal_reason)?;
+                let retained = host
+                    .remove_with_report(&name)
+                    .map_err(with_remove_refusal_reason)?;
+                for path in retained {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-staging-retained",
+                            &[("path", path.to_string_lossy().as_ref())],
+                            format!(
+                                "Retained staging at {} because its ownership could not be proved abandoned. The recovered package can be installed again using fresh staging.",
+                                path.display()
+                            )
+                        )
+                    );
+                }
                 println!(
                     "{}",
                     ta("cli-plugin-removed", &[("name", &name)], "Plugin removed")
@@ -19566,6 +19606,22 @@ type = "string"
             "the refusal must name the package and the host's reason: {rendered}"
         );
         assert!(package.join("plugin.wasm").is_file(), "the package is kept");
+    }
+
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn retained_recovery_diagnostic_names_actual_claim_without_left_untouched() {
+        let error = zeroclaw::plugins::error::PluginError::RecoveryRetained {
+            path: "/synthetic/plugins/.probe.recovering-v1-test/package".into(),
+            reason: "destination occupied".into(),
+        };
+        let rendered = with_remove_refusal_reason(error).to_string();
+        assert!(
+            rendered.contains(".probe.recovering-v1-test/package"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("destination occupied"), "{rendered}");
+        assert!(!rendered.contains("left untouched"), "{rendered}");
     }
 
     /// REGRESSION (unsupported beta config): removing a pre-typed plugin leaves

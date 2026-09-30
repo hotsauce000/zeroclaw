@@ -1,9 +1,14 @@
 //! Plugin host: discovery, loading, lifecycle management.
 
+mod recovery;
+#[cfg(test)]
+mod recovery_tests;
+
 use super::error::PluginError;
 use super::signature::{self, SignatureMode};
 use super::{PluginCapability, PluginInfo, PluginManifest};
 use crate::config::validate_manifest_config;
+use cap_std::fs::Dir;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -15,6 +20,7 @@ const SKILLS_SUBDIR: &str = "skills";
 /// Manages the lifecycle of WASM plugins.
 pub struct PluginHost {
     plugins_dir: PathBuf,
+    recovery_root: recovery::Root,
     loaded: HashMap<String, LoadedPlugin>,
     signature_mode: SignatureMode,
     trusted_publisher_keys: Vec<String>,
@@ -136,6 +142,7 @@ impl PluginHost {
 
         let mut host = Self {
             plugins_dir: plugins_dir.to_path_buf(),
+            recovery_root: recovery::Root::open(plugins_dir)?,
             loaded: HashMap::new(),
             signature_mode,
             trusted_publisher_keys,
@@ -368,25 +375,16 @@ impl PluginHost {
             )));
         }
 
-        let (manifest, manifest_toml) = self.load_manifest(&manifest_path)?;
         let source_dir = manifest_path
             .parent()
             .ok_or_else(|| PluginError::InvalidManifest("no parent directory".into()))?
             .to_path_buf();
-
-        validate_manifest_shape(&manifest, &source_dir)?;
-
-        // Refuse a duplicate before the signature check and before the
-        // component is read: nothing downstream may run for a package the host
-        // has already decided not to install.
-        if self.loaded.contains_key(&manifest.name) {
-            return Err(PluginError::AlreadyLoaded(manifest.name));
-        }
-
-        // Admit the exact manifest and payload generations before installation.
-        self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
-        validate_manifest_config(&manifest)?;
-        let component = admit_component(&source_dir, &manifest)?;
+        let dir = Dir::open_ambient_dir(&source_dir, cap_std::ambient_authority())?;
+        let filename = manifest_path
+            .file_name()
+            .ok_or_else(|| PluginError::InvalidManifest("no manifest filename".into()))?;
+        let (manifest, manifest_toml, component) =
+            self.admit_open_directory(&dir, &source_dir, filename)?;
 
         Ok(AdmittedSource {
             manifest,
@@ -394,6 +392,24 @@ impl PluginHost {
             source_dir,
             component,
         })
+    }
+
+    fn admit_open_directory(
+        &self,
+        dir: &Dir,
+        display: &Path,
+        filename: &std::ffi::OsStr,
+    ) -> Result<(PluginManifest, String, Option<AdmittedComponent>), PluginError> {
+        let manifest_toml = dir.read_to_string(filename)?;
+        let manifest: PluginManifest = toml::from_str(&manifest_toml)?;
+        validate_manifest_shape_in(&manifest, dir, display)?;
+        if self.loaded.contains_key(&manifest.name) {
+            return Err(PluginError::AlreadyLoaded(manifest.name));
+        }
+        self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
+        validate_manifest_config(&manifest)?;
+        let component = admit_component_in(dir, &manifest)?;
+        Ok((manifest, manifest_toml, component))
     }
 
     /// Install a source admitted by [`Self::admit_source`].
@@ -417,53 +433,55 @@ impl PluginHost {
             return Err(PluginError::AlreadyLoaded(manifest.name));
         }
 
-        // The name is not loaded, yet something may occupy it: most often a
-        // package discovery skipped, such as one an older installer left
-        // half-written. It is judged without following a symlink and never
-        // overwritten; `remove` is the recovery path for an incomplete one.
+        let _guard = self.recovery_root.lock()?;
         let dest_dir = self.plugins_dir.join(&manifest.name);
-        match std::fs::symlink_metadata(&dest_dir) {
+        match self.recovery_root.dir.symlink_metadata(&manifest.name) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
-            Ok(metadata) => {
+            Ok(_) => {
                 return Err(PluginError::UnadmittedPackage {
-                    reason: self
-                        .kept_occupant(&dest_dir, &metadata)
-                        .unwrap_or_else(|| "it is a directory this host did not admit".to_string()),
-                    name: manifest.name,
+                    name: manifest.name.clone(),
+                    reason: if self
+                        .recovery_root
+                        .dir
+                        .symlink_metadata(&manifest.name)?
+                        .is_dir()
+                    {
+                        "an existing directory occupies the destination".into()
+                    } else {
+                        "it is not a directory".into()
+                    },
                 });
             }
         }
-
-        // Build the package in a staging directory and rename it into place,
-        // so a failed write (disk full, an unreadable skill file, an
-        // interrupted process) never leaves a half-written package under the
-        // real name, where it would block every retry until removed.
-        // Discovery ignores dot-prefixed directories, so a staging directory
-        // stranded by a crash is never loaded either. Install replaces only
-        // its own process's staging directory: another one may belong to an
-        // install still in progress.
-        std::fs::create_dir_all(&self.plugins_dir)?;
-        let staging = self.plugins_dir.join(format!(
-            "{}{}",
-            staging_prefix(&manifest.name),
-            std::process::id()
-        ));
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)?;
-        }
+        let tx = self
+            .recovery_root
+            .transaction(&manifest.name, "installing")?;
+        tx.dir.create_dir(recovery::PACKAGE)?;
+        let package = tx.dir.open_dir(recovery::PACKAGE)?;
         let staged = write_package(
-            &staging,
+            &package,
             &manifest,
             &manifest_toml,
             &source_dir,
             component.as_ref(),
-        )
-        .and_then(|()| std::fs::rename(&staging, &dest_dir).map_err(PluginError::from));
-        if let Err(e) = staged {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(e);
+        );
+        if let Err(error) = staged {
+            recovery::clear_owned(&package)?;
+            drop(package);
+            tx.dir.remove_dir(recovery::PACKAGE)?;
+            tx.finish(&self.recovery_root)?;
+            return Err(error);
         }
+        drop(package);
+        // Atomic no-clobber publication, even against an unrelated writer.
+        if let Err(error) = tx.publish(&self.recovery_root, &manifest.name) {
+            return Err(PluginError::RecoveryRetained {
+                path: self.recovery_root.retained_path(&tx),
+                reason: error.to_string(),
+            });
+        }
+        tx.finish(&self.recovery_root)?;
 
         let installed_name = manifest.name.clone();
         self.loaded.insert(
@@ -482,8 +500,9 @@ impl PluginHost {
     ///
     /// For a loaded plugin, the directory at its name is deleted. For a name the
     /// host did not load, `remove` is the recovery path for an interrupted
-    /// install: it deletes the real directory at that name, with the name's
-    /// leftover staging directories, only when the directory is empty, or
+    /// install: it claims and validates the exact directory generation and
+    /// cleans only staging whose protocol lease proves abandonment. Ambiguous
+    /// legacy staging is retained. The final directory must be empty, or
     /// holds a `manifest.toml` and admission rejects its own contents rather
     /// than its signature. That includes a package this host cannot accept as
     /// written, such as one whose component exceeds the admission size limit.
@@ -491,119 +510,218 @@ impl PluginHost {
     /// [`PluginError::UnadmittedPackage`] with the reason: a symlink or file, a
     /// directory holding files but no manifest, one that cannot be identified,
     /// inspected, or listed, a loaded package's directory, a package admission
-    /// accepts, and one this host rejects for its signature policy.
+    /// accepts, and one this host rejects for its signature policy. A refusal
+    /// restores the claimed package without overwriting a concurrent occupant;
+    /// if restoration cannot complete, `RecoveryRetained` names the retained
+    /// transaction and a later remove retries it.
     pub fn remove(&mut self, name: &str) -> Result<(), PluginError> {
-        if self.loaded.remove(name).is_none() {
-            return self.remove_unadmitted(name);
-        }
-
-        let plugin_dir = self.plugins_dir.join(name);
-        if plugin_dir.exists() {
-            std::fs::remove_dir_all(plugin_dir)?;
-        }
-
-        Ok(())
+        self.remove_with_report(name).map(|_| ())
     }
 
-    /// The recovery half of [`Self::remove`], for a name the host did not load.
-    ///
-    /// Every installer created the package directory and wrote
-    /// `manifest.toml` first, so an interrupted install leaves either an empty
-    /// directory or one holding a manifest. For the second shape, whether the
-    /// package is complete is decided by [`Self::admit_source`] run against
-    /// it, so recovery cannot disagree with install and discovery about what
-    /// a complete package is.
-    fn remove_unadmitted(&self, name: &str) -> Result<(), PluginError> {
-        let untouched = |reason: String| PluginError::UnadmittedPackage {
-            name: name.to_string(),
-            reason,
-        };
-
-        // Only a canonical package slug names exactly one entry directly in
-        // the plugins directory: never empty, `..`, a hidden staging name, or
-        // a path with separators.
+    /// Removal result includes ambiguous staging paths that were deliberately
+    /// retained. Callers displaying a recovery result must surface these paths.
+    pub fn remove_with_report(&mut self, name: &str) -> Result<Vec<PathBuf>, PluginError> {
+        let _guard = self.recovery_root.lock()?;
+        if self.loaded.remove(name).is_some() {
+            // Existing loaded-package semantics are not the recovery classifier.
+            let plugin_dir = self.plugins_dir.join(name);
+            if plugin_dir.exists() {
+                std::fs::remove_dir_all(plugin_dir)?;
+            }
+            return Ok(Vec::new());
+        }
         crate::instance::validate_package_name(name)
-            .map_err(|_| PluginError::NotFound(name.to_string()))?;
-        let package_dir = self.plugins_dir.join(name);
-        let metadata = match std::fs::symlink_metadata(&package_dir) {
+            .map_err(|_| PluginError::NotFound(name.into()))?;
+        self.retry_claims(name)?;
+        let metadata = match std::fs::symlink_metadata(self.plugins_dir.join(name)) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(PluginError::NotFound(name.to_string()));
+                return Err(PluginError::NotFound(name.into()));
             }
             Err(error) => return Err(error.into()),
         };
-        if let Some(reason) = self.kept_occupant(&package_dir, &metadata) {
-            return Err(untouched(reason));
+        if let Some(reason) = self.kept_occupant(&self.plugins_dir.join(name), &metadata) {
+            return Err(PluginError::UnadmittedPackage {
+                name: name.into(),
+                reason,
+            });
         }
+        let selected_id =
+            same_file::Handle::from_path(self.plugins_dir.join(name)).map_err(|error| {
+                PluginError::UnadmittedPackage {
+                    name: name.into(),
+                    reason: format!("it cannot be listed or cannot be inspected ({error})"),
+                }
+            })?;
+        #[cfg(test)]
+        recovery::pause("before-claim");
+        let tx = self.recovery_root.transaction(name, "recovering")?;
+        #[cfg(test)]
+        recovery::pause("claim-created");
+        tx.claim(&self.recovery_root, name)?;
+        #[cfg(test)]
+        recovery::pause("after-claim");
+        let claimed = match tx.dir.open_dir(recovery::PACKAGE) {
+            Ok(dir) => dir,
+            Err(error) => {
+                return self.restore_refused(
+                    name,
+                    tx,
+                    PluginError::InvalidConfig(format!(
+                        "it cannot be listed or cannot be inspected ({error})"
+                    )),
+                );
+            }
+        };
+        let claimed_id = same_file::Handle::from_file(claimed.try_clone()?.into_std_file())?;
+        let same_generation = selected_id == claimed_id;
+        drop(claimed_id);
+        drop(selected_id);
+        if !same_generation {
+            drop(claimed);
+            return self.restore_refused(name, tx, PluginError::NamespaceChanged(name.into()));
+        }
+        if let Err(error) = self.recovery_verdict(&claimed) {
+            drop(claimed);
+            return self.restore_refused(name, tx, error);
+        }
+        // Stages are handled only after a real final generation was claimed and
+        // judged recoverable. No-final calls never sweep unrelated stages.
+        let retained =
+            self.remove_stale_staging(name)
+                .map_err(|error| PluginError::RecoveryRetained {
+                    path: self.recovery_root.retained_path(&tx),
+                    reason: error.to_string(),
+                })?;
+        #[cfg(test)]
+        recovery::pause("before-delete");
+        self.recovery_root
+            .check()
+            .map_err(|error| PluginError::RecoveryRetained {
+                path: self.recovery_root.retained_path(&tx),
+                reason: error.to_string(),
+            })?;
+        // Admission is about these bytes, not a verdict retained across stage IO.
+        let empty = match self.recovery_verdict(&claimed) {
+            Ok(empty) => empty,
+            Err(error) => {
+                drop(claimed);
+                return self.restore_refused(name, tx, error);
+            }
+        };
+        if !empty {
+            recovery::clear_owned(&claimed).map_err(|error| PluginError::RecoveryRetained {
+                path: self.recovery_root.retained_path(&tx),
+                reason: error.to_string(),
+            })?;
+        }
+        drop(claimed);
+        tx.dir
+            .remove_dir(recovery::PACKAGE)
+            .map_err(|error| PluginError::RecoveryRetained {
+                path: self.recovery_root.retained_path(&tx),
+                reason: error.to_string(),
+            })?;
+        tx.finish(&self.recovery_root)?;
+        Ok(retained)
+    }
 
-        // Probed without following a symlink: a missing manifest and one that
-        // cannot be inspected are different answers, and only the first may
-        // lead to a delete.
-        match std::fs::symlink_metadata(package_dir.join("manifest.toml")) {
-            Ok(manifest) if manifest.is_file() => {}
-            Ok(_) => {
-                return Err(untouched(
-                    "its manifest.toml is not a regular file, so no install wrote it".to_string(),
+    fn recovery_verdict(&self, dir: &Dir) -> Result<bool, PluginError> {
+        match dir.symlink_metadata("manifest.toml") {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if dir.entries()?.next().transpose()?.is_none() {
+                    return Ok(true);
+                }
+                return Err(PluginError::InvalidConfig(
+                    "it holds files but no manifest.toml, so no interrupted install left it".into(),
                 ));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return self.remove_empty_stranded_dir(name, &package_dir);
-            }
             Err(error) => {
-                return Err(untouched(format!(
+                return Err(PluginError::InvalidConfig(format!(
                     "its manifest.toml cannot be inspected ({error})"
                 )));
             }
-        }
-
-        let source = package_dir
-            .to_str()
-            .ok_or_else(|| untouched("its path is not valid UTF-8".to_string()))?;
-        match self.admit_source(source) {
-            Ok(_) => {
-                return Err(untouched(
-                    "admission accepts the package it holds".to_string(),
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(PluginError::InvalidConfig(
+                    "its manifest.toml is not a regular file".into(),
                 ));
             }
-            Err(error) if !is_structural_admission_failure(&error) => {
-                return Err(untouched(error.to_string()));
-            }
-            Err(_) => {}
+            Ok(_) => {}
         }
-        // Deleting needs a listable directory; find that out before sweeping.
-        std::fs::read_dir(&package_dir)
-            .map_err(|error| untouched(format!("it cannot be listed ({error})")))?;
-
-        // Staging goes first: while the stranded directory holds the name, a
-        // new install of it stops at its destination check before staging, so
-        // what is swept here was left by earlier installs. A failure part way
-        // leaves the stranded directory in place for a retry.
-        self.remove_stale_staging(name)?;
-        std::fs::remove_dir_all(&package_dir)?;
-        Ok(())
+        // Exactly the same manifest, signature, schema and payload admission as
+        // install, but all reads resolve from the claimed directory capability.
+        match self.admit_open_directory(
+            dir,
+            Path::new("claimed package"),
+            std::ffi::OsStr::new("manifest.toml"),
+        ) {
+            Ok(_) => Err(PluginError::InvalidConfig(
+                "admission accepts this package".into(),
+            )),
+            Err(error) if is_structural_admission_failure(&error) => {
+                dir.entries().map_err(|error| {
+                    PluginError::InvalidConfig(format!("it cannot be listed ({error})"))
+                })?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
-    /// Recover a stranded directory that has no manifest: only an empty one,
-    /// the shape an install interrupted right after creating it leaves.
-    fn remove_empty_stranded_dir(&self, name: &str, package_dir: &Path) -> Result<(), PluginError> {
-        let has_entries = std::fs::read_dir(package_dir)
-            .map_err(|error| PluginError::UnadmittedPackage {
-                name: name.to_string(),
-                reason: format!("it cannot be listed ({error})"),
-            })?
-            .next()
-            .is_some();
-        if has_entries {
-            return Err(PluginError::UnadmittedPackage {
-                name: name.to_string(),
-                reason: "it holds files but no manifest.toml, so no interrupted install left it"
-                    .to_string(),
+    fn restore_refused<T>(
+        &self,
+        name: &str,
+        tx: recovery::Transaction,
+        reason: PluginError,
+    ) -> Result<T, PluginError> {
+        #[cfg(test)]
+        recovery::pause("before-restore");
+        if let Err(error) = tx.publish(&self.recovery_root, name) {
+            return Err(PluginError::RecoveryRetained {
+                path: self.recovery_root.retained_path(&tx),
+                reason: format!("{reason}; restoration refused: {error}"),
             });
         }
-        self.remove_stale_staging(name)?;
-        // Unlike `remove_dir_all`, this refuses a directory that gained an
-        // entry since it was found empty.
-        std::fs::remove_dir(package_dir)?;
+        tx.finish(&self.recovery_root)?;
+        Err(PluginError::UnadmittedPackage {
+            name: name.into(),
+            reason: reason.to_string(),
+        })
+    }
+
+    fn retry_claims(&self, name: &str) -> Result<(), PluginError> {
+        for entry in self.recovery_root.dir.entries()? {
+            let entry = entry?;
+            let Some(entry_name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !recovery::is_transaction(&entry_name, name, "recovering") {
+                continue;
+            }
+            let Some(tx) = self.recovery_root.reopen_transaction(entry_name.clone())? else {
+                return Err(PluginError::RecoveryRetained {
+                    path: self.plugins_dir.join(entry_name).display().to_string(),
+                    reason: "recovery transaction ownership is unavailable".into(),
+                });
+            };
+            match tx.dir.symlink_metadata(recovery::PACKAGE) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tx.finish(&self.recovery_root)?;
+                }
+                Err(error) => return Err(error.into()),
+                Ok(_) => {
+                    // Restore before restarting recovery; crash retry never
+                    // interprets hidden placement as proof of defective contents.
+                    if let Err(error) = tx.publish(&self.recovery_root, name) {
+                        return Err(PluginError::RecoveryRetained {
+                            path: self.recovery_root.retained_path(&tx),
+                            reason: error.to_string(),
+                        });
+                    }
+                    tx.finish(&self.recovery_root)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -633,26 +751,48 @@ impl PluginHost {
             .map(|plugin| format!("plugin '{}' is loaded from it", plugin.manifest.name))
     }
 
-    /// Delete the staging directories an interrupted install left for `name`.
-    /// Only real directories named exactly `.<name>.installing-<pid>` match.
-    fn remove_stale_staging(&self, name: &str) -> Result<(), PluginError> {
-        let prefix = staging_prefix(name);
-        for entry in std::fs::read_dir(&self.plugins_dir)? {
+    fn remove_stale_staging(&self, name: &str) -> Result<Vec<PathBuf>, PluginError> {
+        let mut retained = Vec::new();
+        for entry in self.recovery_root.dir.entries()? {
             let entry = entry?;
-            // A numeric suffix also keeps out the staging directory of a
-            // package whose own name extends this one, such as
-            // `<name>.installing-x`.
-            let is_staging = entry.file_name().to_str().is_some_and(|file_name| {
-                file_name.strip_prefix(prefix.as_str()).is_some_and(|pid| {
-                    !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit())
-                })
-            });
-            // `DirEntry::file_type` does not follow a symlink.
-            if is_staging && entry.file_type()?.is_dir() {
-                std::fs::remove_dir_all(entry.path())?;
+            let Some(entry_name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !entry_name.starts_with(&staging_prefix(name)) {
+                continue;
             }
+            if !recovery::is_transaction(&entry_name, name, "installing") {
+                if entry_name
+                    .strip_prefix(&staging_prefix(name))
+                    .is_some_and(|suffix| {
+                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                {
+                    retained.push(self.plugins_dir.join(entry_name));
+                }
+                continue;
+            }
+            let Some(tx) = self.recovery_root.reopen_transaction(entry_name.clone())? else {
+                retained.push(self.plugins_dir.join(entry_name));
+                continue;
+            };
+            // A protocol stage's held lease is the ownership fact. Never create
+            // a lease in an unknown directory and call that proof of abandonment.
+            match tx.dir.open_dir(recovery::PACKAGE) {
+                Ok(package) => {
+                    #[cfg(test)]
+                    recovery::pause("before-stage-delete");
+                    self.recovery_root.check()?;
+                    recovery::clear_owned(&package)?;
+                    drop(package);
+                    tx.dir.remove_dir(recovery::PACKAGE)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            tx.finish(&self.recovery_root)?;
         }
-        Ok(())
+        Ok(retained)
     }
 
     /// Get tool-capable plugins.
@@ -775,6 +915,46 @@ fn admit_component(
         .transpose()
 }
 
+fn admit_component_in(
+    dir: &Dir,
+    manifest: &PluginManifest,
+) -> Result<Option<AdmittedComponent>, PluginError> {
+    manifest
+        .wasm_path
+        .as_deref()
+        .map(|relative| {
+            validate_manifest_subpath("wasm_path", &manifest.name, relative)?;
+            let mut prefix = PathBuf::new();
+            for component in Path::new(relative).components() {
+                prefix.push(component);
+                let metadata = dir.symlink_metadata(&prefix).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        PluginError::NotFound(relative.into())
+                    } else {
+                        error.into()
+                    }
+                })?;
+                if metadata.is_symlink() {
+                    return Err(PluginError::InvalidManifest(
+                        "wasm_path contains a symlink".into(),
+                    ));
+                }
+            }
+            let file = dir.open(relative)?;
+            if !file.metadata()?.is_file() {
+                return Err(PluginError::InvalidManifest(
+                    "WASM payload is not a regular file".into(),
+                ));
+            }
+            let bytes = read_component_bytes(file.try_clone()?, file.metadata()?.len())?;
+            if let Some(expected) = manifest.wasm_sha256.as_deref() {
+                signature::verify_payload_digest(&bytes, expected)?;
+            }
+            Ok(AdmittedComponent::new(bytes))
+        })
+        .transpose()
+}
+
 /// Resolve a manifest executable without allowing traversal or symlink
 /// indirection outside the package. This validates the pathname used for the
 /// one admission read; it does not make later namespace substitutions safe.
@@ -868,7 +1048,7 @@ pub(crate) fn read_stable_file(confined: &ConfinedPayload) -> Result<Vec<u8>, Pl
     } = confined;
 
     let swapped = || {
-        PluginError::InvalidManifest(format!(
+        PluginError::NamespaceChanged(format!(
             "WASM payload path changed after confinement check: {}",
             path.display()
         ))
@@ -908,7 +1088,7 @@ pub(crate) fn read_stable_file(confined: &ConfinedPayload) -> Result<Vec<u8>, Pl
 
     let opened = same_file::Handle::from_file(file.try_clone()?)?;
     if same_file::Handle::from_path(root)? != *root_handle {
-        return Err(PluginError::InvalidManifest(format!(
+        return Err(PluginError::NamespaceChanged(format!(
             "plugin package root changed after confinement check: {}",
             root.display()
         )));
@@ -929,17 +1109,22 @@ pub(crate) fn read_stable_file(confined: &ConfinedPayload) -> Result<Vec<u8>, Pl
         return Err(swapped());
     }
 
-    // Bound the read, not just the stat above: the payload can grow between the
-    // size check and this read. Taking one byte past the limit makes an
-    // oversized payload detectable without retaining more than that.
-    let mut bytes = Vec::with_capacity(
-        usize::try_from(opened_metadata.len().min(MAX_COMPONENT_BYTES)).unwrap_or(0),
-    );
+    read_component_bytes(file, opened_metadata.len())
+}
+
+/// Shared bounded payload read: both ambient source admission and claimed
+/// directory admission enforce the same size policy before and during reading.
+fn read_component_bytes(file: impl Read, len: u64) -> Result<Vec<u8>, PluginError> {
+    if len > MAX_COMPONENT_BYTES {
+        return Err(PluginError::InvalidManifest(format!(
+            "WASM payload exceeds the {MAX_COMPONENT_BYTES}-byte admission limit"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
     file.take(MAX_COMPONENT_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_COMPONENT_BYTES {
         return Err(PluginError::InvalidManifest(format!(
-            "WASM payload grew past the {MAX_COMPONENT_BYTES}-byte admission limit while being read: {}",
-            path.display()
+            "WASM payload grew past the {MAX_COMPONENT_BYTES}-byte admission limit while being read"
         )));
     }
     Ok(bytes)
@@ -974,6 +1159,15 @@ fn validate_manifest_subpath(field: &str, name: &str, p: &str) -> Result<(), Plu
 
 fn validate_manifest_shape(
     manifest: &PluginManifest,
+    plugin_dir: &Path,
+) -> Result<(), PluginError> {
+    let dir = Dir::open_ambient_dir(plugin_dir, cap_std::ambient_authority())?;
+    validate_manifest_shape_in(manifest, &dir, plugin_dir)
+}
+
+fn validate_manifest_shape_in(
+    manifest: &PluginManifest,
+    dir: &Dir,
     plugin_dir: &Path,
 ) -> Result<(), PluginError> {
     crate::instance::validate_package_name(&manifest.name).map_err(PluginError::InvalidManifest)?;
@@ -1022,7 +1216,7 @@ fn validate_manifest_shape(
     .map_err(|e| PluginError::InvalidManifest(e.to_string()))?;
 
     if manifest.capabilities.contains(&PluginCapability::Skill) {
-        validate_skill_bundle(&manifest.name, plugin_dir)?;
+        validate_skill_bundle(&manifest.name, dir, plugin_dir)?;
     }
 
     Ok(())
@@ -1031,19 +1225,26 @@ fn validate_manifest_shape(
 /// Validate a skill bundle: `<plugin_dir>/skills/` must exist, contain at least
 /// one subdirectory, and each subdirectory must hold a `SKILL.md` whose YAML
 /// frontmatter declares the agentskills.io-required `name` and `description`.
-fn validate_skill_bundle(plugin_name: &str, plugin_dir: &Path) -> Result<(), PluginError> {
+fn validate_skill_bundle(
+    plugin_name: &str,
+    dir: &Dir,
+    plugin_dir: &Path,
+) -> Result<(), PluginError> {
     let skills_dir = plugin_dir.join(SKILLS_SUBDIR);
     // Like a package root, the skills root is an admission boundary: a
     // symlink here would let the bundle validated and later copied live
     // outside the package.
-    if std::fs::symlink_metadata(&skills_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+    if dir
+        .symlink_metadata(SKILLS_SUBDIR)
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
         return Err(PluginError::InvalidManifest(format!(
             "skill plugin '{}' has a symlinked `skills/` directory at {}; package the skills in place",
             plugin_name,
             skills_dir.display()
         )));
     }
-    if !skills_dir.is_dir() {
+    if !dir.is_dir(SKILLS_SUBDIR) {
         return Err(PluginError::InvalidManifest(format!(
             "skill plugin '{}' is missing `skills/` directory at {}",
             plugin_name,
@@ -1052,22 +1253,27 @@ fn validate_skill_bundle(plugin_name: &str, plugin_dir: &Path) -> Result<(), Plu
     }
 
     let mut found_any = false;
-    for entry in std::fs::read_dir(&skills_dir)? {
+    for entry in dir.read_dir(SKILLS_SUBDIR)? {
         let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
+        let relative = Path::new(SKILLS_SUBDIR).join(entry.file_name());
+        let path = plugin_dir.join(&relative);
+        if !entry.file_type()?.is_dir() {
             continue;
         }
         found_any = true;
         let skill_md = path.join("SKILL.md");
-        if !skill_md.is_file() {
+        if !dir.is_file(relative.join("SKILL.md")) {
             return Err(PluginError::InvalidManifest(format!(
                 "skill plugin '{}' subdirectory '{}' is missing SKILL.md",
                 plugin_name,
                 path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
             )));
         }
-        validate_skill_md_frontmatter(plugin_name, &skill_md)?;
+        validate_skill_md_frontmatter(
+            plugin_name,
+            &skill_md,
+            dir.read_to_string(relative.join("SKILL.md"))?,
+        )?;
     }
 
     if !found_any {
@@ -1080,8 +1286,11 @@ fn validate_skill_bundle(plugin_name: &str, plugin_dir: &Path) -> Result<(), Plu
     Ok(())
 }
 
-fn validate_skill_md_frontmatter(plugin_name: &str, skill_md: &Path) -> Result<(), PluginError> {
-    let content = std::fs::read_to_string(skill_md)?;
+fn validate_skill_md_frontmatter(
+    plugin_name: &str,
+    skill_md: &Path,
+    content: String,
+) -> Result<(), PluginError> {
     let normalized = content.replace("\r\n", "\n");
     let rest = normalized.strip_prefix("---\n").ok_or_else(|| {
         PluginError::InvalidManifest(format!(
@@ -1132,8 +1341,8 @@ fn validate_skill_md_frontmatter(plugin_name: &str, skill_md: &Path) -> Result<(
     Ok(())
 }
 
-/// Name prefix of every staging directory a package is built in: the owning
-/// process id completes it. Dot-prefixed, so discovery never loads one.
+/// Shared prefix for legacy PID-only stages and new leased generations.
+/// Dot-prefixed, so discovery never loads either kind as a package.
 fn staging_prefix(package: &str) -> String {
     format!(".{package}.installing-")
 }
@@ -1186,6 +1395,8 @@ fn is_structural_admission_failure(error: &PluginError) -> bool {
         | PluginError::PayloadDigestRequired(_)
         | PluginError::AlreadyLoaded(_)
         | PluginError::UnadmittedPackage { .. }
+        | PluginError::NamespaceChanged(_)
+        | PluginError::RecoveryRetained { .. }
         | PluginError::InvalidConfig(_)
         | PluginError::InvalidInstanceId(_)
         | PluginError::InvalidEndpoint(_)
@@ -1199,37 +1410,49 @@ fn is_structural_admission_failure(error: &PluginError) -> bool {
 /// Write an admitted package into `dir`: the exact manifest and component
 /// bytes admission read, plus the `skills/` subtree of a skill-capable package.
 fn write_package(
-    dir: &Path,
+    dir: &Dir,
     manifest: &PluginManifest,
     manifest_toml: &str,
     source_dir: &Path,
     component: Option<&AdmittedComponent>,
 ) -> Result<(), PluginError> {
-    std::fs::create_dir(dir)?;
-
     // Persist the exact manifest and payload generations admitted above.
     #[cfg(test)]
     write_fault::inject(
         write_fault::Step::Manifest,
-        &dir.join("manifest.toml"),
+        dir,
+        Path::new("manifest.toml"),
         manifest_toml.as_bytes(),
     )?;
-    std::fs::write(dir.join("manifest.toml"), manifest_toml.as_bytes())?;
+    dir.write("manifest.toml", manifest_toml.as_bytes())?;
     if let (Some(rel), Some(component)) = (manifest.wasm_path.as_deref(), component) {
-        let dest = dir.join(rel);
+        let dest = Path::new(rel);
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+            dir.create_dir_all(parent)?;
         }
         #[cfg(test)]
-        write_fault::inject(write_fault::Step::Payload, &dest, component.bytes())?;
-        std::fs::write(&dest, component.bytes())?;
+        write_fault::inject(write_fault::Step::Payload, dir, dest, component.bytes())?;
+        dir.write(dest, component.bytes())?;
     }
 
     // Copy skills/ subtree for skill-capable plugins.
     if manifest.capabilities.contains(&PluginCapability::Skill) {
         let src_skills = source_dir.join(SKILLS_SUBDIR);
         if src_skills.is_dir() {
-            copy_dir_recursive(&src_skills, &dir.join(SKILLS_SUBDIR))?;
+            copy_skills_into(&src_skills, dir, Path::new(SKILLS_SUBDIR))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_skills_into(src: &Path, dir: &Dir, dest: &Path) -> Result<(), PluginError> {
+    dir.create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            copy_skills_into(&entry.path(), dir, &dest.join(entry.file_name()))?;
+        } else if entry.file_type()?.is_file() {
+            dir.write(dest.join(entry.file_name()), std::fs::read(entry.path())?)?;
         }
     }
     Ok(())
@@ -1319,12 +1542,17 @@ mod write_fault {
 
     /// When `step` is armed, write the first half of `bytes` to `path` and
     /// fail, leaving the truncated file an interrupted write would.
-    pub(super) fn inject(step: Step, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    pub(super) fn inject(
+        step: Step,
+        dir: &cap_std::fs::Dir,
+        path: &std::path::Path,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
         if ARMED.with(|armed| armed.get()) != Some(step) {
             return Ok(());
         }
         ARMED.with(|armed| armed.set(None));
-        std::fs::write(path, &bytes[..bytes.len() / 2])?;
+        dir.write(path, &bytes[..bytes.len() / 2])?;
         Err(std::io::Error::other(format!(
             "injected {step:?} write fault"
         )))
@@ -2134,7 +2362,7 @@ capabilities = ["tool"]
         assert!(matches!(err, PluginError::InvalidManifest(_)));
     }
 
-    fn write_tool_source(dir: &Path, name: &str, wasm: &[u8]) {
+    pub(super) fn write_tool_source(dir: &Path, name: &str, wasm: &[u8]) {
         std::fs::write(
             dir.join("manifest.toml"),
             format!(
@@ -2267,7 +2495,11 @@ capabilities = ["tool"]
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert!(left.is_empty(), "a failed install left {left:?} behind");
+        assert_eq!(
+            left,
+            [std::ffi::OsString::from(".zeroclaw-package-lock-v1")],
+            "only the persistent coordination file may remain"
+        );
         assert!(host.get_plugin("half").is_none());
 
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -2290,7 +2522,7 @@ capabilities = ["tool"]
     }
 
     /// Sorted names of every entry in `dir`, hidden ones included.
-    fn dir_entries(dir: &Path) -> Vec<String> {
+    pub(super) fn dir_entries(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -2300,7 +2532,7 @@ capabilities = ["tool"]
     }
 
     /// Every file of a flat package directory with its exact bytes.
-    fn package_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    pub(super) fn package_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
         dir_entries(dir)
             .into_iter()
             .map(|name| {
@@ -2335,7 +2567,7 @@ capabilities = ["tool"]
 
         assert_eq!(
             dir_entries(plugins.path()),
-            ["other"],
+            [".zeroclaw-package-lock-v1", "other"],
             "a {step:?} write fault left something behind"
         );
         assert!(host.get_plugin("faulty").is_none());
@@ -2454,7 +2686,10 @@ capabilities = ["tool"]
             host.remove("stranded")
                 .unwrap_or_else(|err| panic!("{shape}: remove must recover it: {err}"));
             assert!(!stranded.exists(), "{shape}: the directory survived");
-            assert!(!stale.exists(), "{shape}: its stale staging survived");
+            assert!(
+                stale.exists(),
+                "{shape}: ambiguous legacy staging must be retained"
+            );
             assert!(
                 unrelated.is_dir() && extended.is_dir(),
                 "{shape}: over-swept"
@@ -3091,7 +3326,7 @@ capabilities = ["tool"]
             !matches!(&read, Ok(bytes) if bytes.as_slice() == b"attacker component"),
             "package-root swap admitted attacker bytes"
         );
-        assert!(matches!(read, Err(PluginError::InvalidManifest(_))));
+        assert!(matches!(read, Err(PluginError::NamespaceChanged(_))));
     }
 
     #[cfg(unix)]
@@ -3118,7 +3353,7 @@ capabilities = ["tool"]
             !matches!(&read, Ok(bytes) if bytes.as_slice() == b"attacker component"),
             "intermediate-directory swap admitted attacker bytes"
         );
-        assert!(matches!(read, Err(PluginError::InvalidManifest(_))));
+        assert!(matches!(read, Err(PluginError::NamespaceChanged(_))));
     }
 
     #[test]

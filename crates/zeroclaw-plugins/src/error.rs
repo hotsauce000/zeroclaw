@@ -10,6 +10,14 @@ pub enum PluginError {
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
 
+    /// Filesystem identity changed; never evidence of defective package contents.
+    #[error("plugin namespace changed: {0}")]
+    NamespaceChanged(String),
+
+    /// A refused claim could not be restored without overwriting another occupant.
+    #[error("plugin recovery retained bytes at {path}: {reason}")]
+    RecoveryRetained { path: String, reason: String },
+
     #[error("invalid plugin config: {0}")]
     InvalidConfig(String),
 
