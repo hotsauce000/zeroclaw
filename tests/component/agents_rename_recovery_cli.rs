@@ -507,6 +507,7 @@ mod gateway_support {
         AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
