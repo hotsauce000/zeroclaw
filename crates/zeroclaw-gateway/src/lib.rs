@@ -662,17 +662,42 @@ impl AppState {
     }
 }
 
-/// Daemon-owned services a supervised gateway run borrows.
+/// What a gateway run borrows from the process that owns it: the daemon
+/// generation for a supervised run ([`GatewaySupervision::new`]), or, for the
+/// standalone `zeroclaw gateway` command, the daemon it forwards plugin
+/// webhooks to ([`GatewaySupervision::standalone`]).
 pub struct GatewaySupervision {
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
-    /// Outlives any one gateway run, so admission and dedup survive a gateway
-    /// restart within the daemon generation.
-    plugin_webhook_ingress: Arc<zeroclaw_infra::plugin_webhook::PluginWebhookIngress>,
+    plugin_webhooks: PluginWebhookSource,
     authority: zeroclaw_runtime::LiveConfigAuthority,
     /// The daemon generation's driver supervisor set. Approval surfaces
     /// register resumed headless drivers here so a reload drains them with the
     /// generation that owns them. `None` standalone, where no generation exists.
     sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
+}
+
+/// Where `/plugin/{path}` requests are resolved.
+enum PluginWebhookSource {
+    /// This process's ingress, the supervised gateway's. It outlives any one
+    /// gateway run, so admission and dedup survive a gateway restart within
+    /// the daemon generation.
+    InProcess(Arc<zeroclaw_infra::plugin_webhook::PluginWebhookIngress>),
+    /// The ingress of the daemon listening on this local socket: the
+    /// standalone gateway holds no routes of its own.
+    #[cfg(unix)]
+    Daemon { socket_path: std::path::PathBuf },
+}
+
+/// An ingress no channel supervisor publishes to, so every `/plugin/{path}`
+/// answers 404: the source for runs that have neither a daemon generation
+/// nor a daemon to forward to.
+fn unrouted_plugin_webhook_ingress(
+    config: &Config,
+) -> Arc<zeroclaw_infra::plugin_webhook::PluginWebhookIngress> {
+    Arc::new(zeroclaw_infra::plugin_webhook::PluginWebhookIngress::new(
+        config.gateway.idempotency_ttl_secs,
+        config.gateway.idempotency_max_keys,
+    ))
 }
 
 impl GatewaySupervision {
@@ -687,9 +712,74 @@ impl GatewaySupervision {
     ) -> Self {
         Self {
             readiness,
-            plugin_webhook_ingress,
+            plugin_webhooks: PluginWebhookSource::InProcess(plugin_webhook_ingress),
             authority,
             sop_driver_handles,
+        }
+    }
+
+    /// Run as the standalone `zeroclaw gateway` command, without a daemon
+    /// generation. Plugin webhooks forward to the daemon listening on the
+    /// local socket [`core_rpc::daemon_endpoint`] resolves for `config`, which
+    /// owns the routes, as long as that daemon runs as this process's user.
+    /// A running daemon owns its config state exclusively, so a gateway next
+    /// to one runs on a config dir of its own and names the daemon's socket
+    /// through `ZEROCLAW_SOCKET`. Fails when another process owns `config`'s
+    /// state.
+    #[cfg(unix)]
+    pub fn standalone(
+        readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+        config: &Config,
+    ) -> Result<Self> {
+        Ok(Self::forwarding_to_daemon(
+            readiness,
+            core_rpc::daemon_endpoint(config),
+            zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())?,
+        ))
+    }
+
+    /// Run as the standalone `zeroclaw gateway` command, without a daemon
+    /// generation. Plugin webhooks are not forwarded on Windows: named pipes
+    /// share one global namespace and the gateway cannot yet verify which
+    /// process serves the daemon's pipe, so every `/plugin/{path}` answers
+    /// 404, as it did before forwarding existed.
+    #[cfg(windows)]
+    pub fn standalone(
+        readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+        config: &Config,
+    ) -> Result<Self> {
+        #[cfg(feature = "plugins-wasm")]
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "error_key": "plugin_webhook_forwarding_disabled",
+                })
+            ),
+            "Plugin webhook forwarding is disabled on Windows until the gateway can verify the daemon's named pipe server; plugin webhook paths answer 404"
+        );
+        Ok(Self::new(
+            readiness,
+            unrouted_plugin_webhook_ingress(config),
+            zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())?,
+            None,
+        ))
+    }
+
+    /// Run without a daemon generation, forwarding plugin webhooks to the
+    /// daemon listening on `socket_path`. The run dials that socket for as
+    /// long as it lives and closes the connection when it returns.
+    #[cfg(unix)]
+    fn forwarding_to_daemon(
+        readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+        socket_path: std::path::PathBuf,
+        authority: zeroclaw_runtime::LiveConfigAuthority,
+    ) -> Self {
+        Self {
+            readiness,
+            plugin_webhooks: PluginWebhookSource::Daemon { socket_path },
+            authority,
+            sop_driver_handles: None,
         }
     }
 }
@@ -791,6 +881,11 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+///
+/// Plugin webhooks resolve against an empty in-process ingress, so every
+/// `/plugin/{path}` answers 404. This is the embedding and test entry point;
+/// the `zeroclaw gateway` command runs [`run_gateway_with_plugin_webhooks`]
+/// with [`GatewaySupervision::standalone`] instead.
 #[allow(clippy::too_many_lines)]
 // One parameter per daemon-owned dependency; a bundling struct would only
 // move the list. Matches the existing allowance on the runtime spawn paths.
@@ -860,11 +955,7 @@ pub async fn run_gateway_with_authority(
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     authority: zeroclaw_runtime::LiveConfigAuthority,
 ) -> Result<()> {
-    let plugin_webhook_ingress =
-        Arc::new(zeroclaw_infra::plugin_webhook::PluginWebhookIngress::new(
-            config.gateway.idempotency_ttl_secs,
-            config.gateway.idempotency_max_keys,
-        ));
+    let plugin_webhook_ingress = unrouted_plugin_webhook_ingress(&config);
     Box::pin(run_gateway_with_plugin_webhooks(
         host,
         port,
@@ -886,11 +977,13 @@ pub async fn run_gateway_with_authority(
     .await
 }
 
-/// Run the supervised gateway with the daemon generation's plugin webhook
-/// ingress and live-config authority. Standalone callers use [`run_gateway`],
-/// because no channel supervisor exists there to publish live routes.
+/// Run the gateway with an explicit plugin webhook source and live-config
+/// authority: the supervised gateway with the daemon generation's ingress, or
+/// the standalone gateway forwarding to a running daemon. A supervised run
+/// (one with an in-process RPC connector) that is asked to forward fails
+/// before it binds.
 #[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)] // supervised-run wiring; params mirror run_gateway plus the plugin webhook ingress
+#[allow(clippy::too_many_arguments)] // params mirror run_gateway, with the supervision replacing its trailing pair
 pub async fn run_gateway_with_plugin_webhooks(
     host: &str,
     port: u16,
@@ -910,10 +1003,19 @@ pub async fn run_gateway_with_plugin_webhooks(
 ) -> Result<()> {
     let GatewaySupervision {
         readiness,
-        plugin_webhook_ingress,
+        plugin_webhooks,
         authority,
         sop_driver_handles,
     } = supervision;
+    let inproc_connector = reload_controls
+        .as_ref()
+        .and_then(|controls| controls.inproc.clone());
+    #[cfg(unix)]
+    if inproc_connector.is_some() && matches!(plugin_webhooks, PluginWebhookSource::Daemon { .. }) {
+        anyhow::bail!(
+            "a supervised gateway resolves plugin webhooks in process and must not forward them to a daemon"
+        );
+    }
     let (shared_pairing, shared_inbound_auth, shared_config) = match daemon_authority {
         Some(authority) => (
             Some(authority.pairing),
@@ -930,10 +1032,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     // and the seam stays idle until that credential exists; it never rides
     // the daemon's anonymous compatibility path.
     let core_rpc = core_rpc::CoreRpc::default();
-    if let Some(connector) = reload_controls
-        .as_ref()
-        .and_then(|controls| controls.inproc.clone())
-    {
+    if let Some(connector) = inproc_connector {
         core_rpc.attach_inproc(connector, zeroclaw_rpc_client::ConnectOptions::default());
     }
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
@@ -2194,10 +2293,40 @@ pub async fn run_gateway_with_plugin_webhooks(
             get(canvas::handle_canvas_history),
         );
 
+    // The standalone gateway's forwarder dials the daemon on its own
+    // connection, never the `CoreRpc` extension every route can reach. The
+    // stop guard lives until this function returns, so in-flight webhooks
+    // keep the connection through the graceful drain, and an early return
+    // closes it.
+    #[cfg(all(unix, feature = "plugins-wasm"))]
+    let stop_plugin_webhook_forwarding = tokio_util::sync::CancellationToken::new();
+    #[cfg(all(unix, feature = "plugins-wasm"))]
+    let _stop_plugin_webhook_forwarding_on_exit =
+        stop_plugin_webhook_forwarding.clone().drop_guard();
     #[cfg(feature = "plugins-wasm")]
-    let inner = inner.merge(plugin_webhook::routes(plugin_webhook_ingress));
+    let plugin_webhook_backend = match plugin_webhooks {
+        PluginWebhookSource::InProcess(ingress) => {
+            plugin_webhook::PluginWebhookBackend::InProcess(ingress)
+        }
+        #[cfg(unix)]
+        PluginWebhookSource::Daemon { socket_path } => {
+            let forwarder = core_rpc::CoreRpc::default();
+            forwarder.attach_local(
+                socket_path,
+                zeroclaw_rpc_client::ConnectOptions::default(),
+                stop_plugin_webhook_forwarding.clone(),
+            );
+            plugin_webhook::PluginWebhookBackend::Core(forwarder)
+        }
+    };
+    #[cfg(feature = "plugins-wasm")]
+    let inner = inner.merge(plugin_webhook::routes(plugin_webhook_backend));
     #[cfg(not(feature = "plugins-wasm"))]
-    let _ = plugin_webhook_ingress;
+    match plugin_webhooks {
+        PluginWebhookSource::InProcess(ingress) => drop(ingress),
+        #[cfg(unix)]
+        PluginWebhookSource::Daemon { socket_path } => drop(socket_path),
+    }
 
     #[cfg(feature = "a2a")]
     let inner = inner.merge(a2a::a2a_routes_with_endpoint(Some(
@@ -6852,6 +6981,221 @@ path = "{trigger_path}"
         assert!(
             ready_rx.borrow().is_none(),
             "failed post-bind setup must not report gateway readiness"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervised_gateway_refuses_plugin_webhook_forwarding() {
+        // `run_gateway_with_plugin_webhooks` binds the process-global pricing
+        // config handle once it gets past its own checks.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let mut reload_controls =
+            zeroclaw_runtime::daemon::GatewayReloadControls::standalone(shutdown_tx, reload_tx);
+        reload_controls.inproc = Some(zeroclaw_runtime::rpc::inproc::InprocConnector::new(
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())
+            .expect("test config builds a live config authority");
+        let result = Box::pin(run_gateway_with_plugin_webhooks(
+            "127.0.0.1",
+            0,
+            config,
+            None,
+            Some(reload_controls),
+            None,
+            None,
+            None,
+            None,
+            None,
+            GatewaySupervision::forwarding_to_daemon(
+                None,
+                tmp.path().join("daemon.sock"),
+                authority,
+            ),
+        ))
+        .await;
+        let error = result.expect_err("a supervised run must not forward plugin webhooks");
+        assert!(error.to_string().contains("must not forward"), "{error}");
+    }
+
+    #[cfg(all(unix, feature = "plugins-wasm"))]
+    #[tokio::test]
+    async fn standalone_plugin_webhook_route_forwards_to_the_daemon_endpoint() {
+        use crate::core_rpc::test_support::{FakeCore, serve_fake_core};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Accept connections on `socket` and serve each as a core that
+        /// acknowledges every dispatch.
+        fn acknowledging_core(
+            socket: &std::path::Path,
+        ) -> (
+            tokio::task::JoinHandle<()>,
+            tokio::sync::mpsc::UnboundedReceiver<FakeCore>,
+        ) {
+            let listener = tokio::net::UnixListener::bind(socket).expect("bind the fake core");
+            let (accepted_tx, accepted) = tokio::sync::mpsc::unbounded_channel();
+            let acceptor = zeroclaw_spawn::spawn!(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let core = serve_fake_core(
+                        stream,
+                        &["plugin-webhook/dispatch", "plugin-webhook/cancel"],
+                        None,
+                        |method, _| match method {
+                            "plugin-webhook/dispatch" => {
+                                Some(Ok(serde_json::json!({"outcome": "ack"})))
+                            }
+                            _ => Some(Ok(serde_json::json!({"cancelled": false}))),
+                        },
+                    );
+                    if accepted_tx.send(core).is_err() {
+                        break;
+                    }
+                }
+            });
+            (acceptor, accepted)
+        }
+
+        async fn next_core(
+            accepted: &mut tokio::sync::mpsc::UnboundedReceiver<FakeCore>,
+        ) -> FakeCore {
+            tokio::time::timeout(Duration::from_secs(10), accepted.recv())
+                .await
+                .expect("the gateway dials the daemon endpoint")
+                .expect("the acceptor is alive")
+        }
+
+        async fn post_webhook(addr: SocketAddr) -> (u16, String) {
+            let mut stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("the gateway accepts connections");
+            stream
+                .write_all(
+                    b"POST /plugin/fixture HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                      Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .expect("send the webhook");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("read the response");
+            let response = String::from_utf8_lossy(&response).into_owned();
+            let status = response
+                .split_whitespace()
+                .nth(1)
+                .and_then(|status| status.parse().ok())
+                .expect("an HTTP status line");
+            let body = response
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body.to_owned())
+                .unwrap_or_default();
+            (status, body)
+        }
+
+        /// Post until the gateway answers `status`, within `within`.
+        async fn post_until(addr: SocketAddr, status: u16, within: Duration) -> String {
+            let deadline = tokio::time::Instant::now() + within;
+            loop {
+                let (seen, body) = post_webhook(addr).await;
+                if seen == status {
+                    return body;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the gateway kept answering {seen} {body:?}, not {status}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("daemon.sock");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.gateway.webhook_rate_limit_per_minute = 10_000;
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let (acceptor, mut accepted) = acknowledging_core(&socket);
+
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())
+            .expect("test config builds a live config authority");
+        let supervision =
+            GatewaySupervision::forwarding_to_daemon(Some(readiness), socket.clone(), authority);
+        let gateway = zeroclaw_spawn::spawn!(async move {
+            Box::pin(run_gateway_with_plugin_webhooks(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                supervision,
+            ))
+            .await
+        });
+        let addr = tokio::time::timeout(Duration::from_secs(5), async {
+            ready_rx.wait_for(Option::is_some).await.unwrap();
+            ready_rx.borrow().expect("the gateway reported its address")
+        })
+        .await
+        .expect("the standalone gateway binds");
+
+        let mut first = next_core(&mut accepted).await;
+        assert_eq!(post_until(addr, 200, Duration::from_secs(5)).await, "");
+        let dispatched = loop {
+            let frame = first
+                .frames
+                .recv()
+                .await
+                .expect("the core connection is open");
+            if frame["method"] == "plugin-webhook/dispatch" {
+                break frame;
+            }
+        };
+        assert_eq!(dispatched["params"]["path"], "fixture");
+
+        // With the daemon gone and nothing listening, the route fails fast.
+        acceptor.abort();
+        std::fs::remove_file(&socket).expect("remove the fake daemon socket");
+        first.close.cancel();
+        assert_eq!(
+            post_until(addr, 503, Duration::from_secs(2)).await,
+            "webhook unavailable"
+        );
+
+        // A daemon back on the endpoint is dialed again, and ending the run
+        // closes that connection.
+        let (_acceptor, mut accepted) = acknowledging_core(&socket);
+        let mut second = next_core(&mut accepted).await;
+        gateway.abort();
+        let eof = tokio::time::timeout(Duration::from_secs(2), async {
+            while second.frames.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            eof.is_ok(),
+            "ending the gateway run closes its daemon connection"
         );
     }
 

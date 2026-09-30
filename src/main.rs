@@ -12970,9 +12970,24 @@ async fn run_gateway_if_enabled(
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
-    // for canvas_store so the gateway falls back to its own default.
-    let result = Box::pin(gateway::run_gateway(
-        host, port, config, event_bus, None, None, None, None, None, None, None, readiness,
+    // for canvas_store so the gateway falls back to its own default. Plugin
+    // webhooks forward to the daemon at this process's local RPC endpoint,
+    // which owns the routes. Next to a running daemon that endpoint comes
+    // from `ZEROCLAW_SOCKET`, since the daemon owns its own config dir (Unix
+    // only; see `standalone`).
+    let supervision = gateway::GatewaySupervision::standalone(readiness, &config)?;
+    let result = Box::pin(gateway::run_gateway_with_plugin_webhooks(
+        host,
+        port,
+        config,
+        event_bus,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        supervision,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade

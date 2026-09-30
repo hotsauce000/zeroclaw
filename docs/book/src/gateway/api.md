@@ -64,6 +64,80 @@ instead of being acknowledged prematurely. Capacity is
 `gateway.idempotency_max_keys`, separate from the `/webhook` and `/sop/*`
 replay store.
 
+### Standalone gateway
+
+`zeroclaw gateway start` (and `zeroclaw gateway`, `zeroclaw gateway restart`) runs the gateway
+without a daemon generation. On Unix it holds no plugin routes of its own: each `/plugin/{path}`
+request is forwarded to the running daemon over the daemon's local RPC socket, using the
+`plugin-webhook/*` methods described in
+[RPC socket](../architecture/rpc-socket.md#plugin-webhook-dispatch). The daemon resolves the route,
+applies the queue bound, the ten-second deadline and message dedup, and returns the outcome, so
+statuses and bodies are the ones in the table above, and dedup holds across restarts of the
+standalone gateway. The rate limit, the method check, the request bounds and the 64 KiB body
+ceiling still apply in the gateway before anything is forwarded.
+
+A running daemon owns its config state exclusively, so a standalone gateway cannot start on the
+daemon's config directory: it exits with `config lifecycle is already owned`. Give the gateway a
+config directory of its own, whose `[gateway]` section sets a port the daemon's supervised gateway
+does not use, and point `ZEROCLAW_SOCKET` at the daemon's socket, `daemon.sock` in the daemon's
+data directory:
+
+```bash
+ZEROCLAW_SOCKET="$HOME/.zeroclaw/data/daemon.sock" \
+  zeroclaw --config-dir "$HOME/.zeroclaw-gateway" gateway start
+```
+
+Without `ZEROCLAW_SOCKET` the gateway dials `daemon.sock` in its own data directory, where no
+daemon listens, and every `/plugin/{path}` answers `503`. The gateway's config needs no plugin or
+channel settings: the daemon's config declares the routes.
+
+The gateway connects as the operating-system user it runs as, and only to a daemon running as
+that user. Before it sends anything on the socket, it compares the kernel-reported uid of the
+process serving it with its own effective uid. A socket served by any other user (root included)
+is closed unused, logged once with `error_key` `core_rpc_untrusted_peer`, and dialed again on the
+same slow backoff as a refused connection; webhooks answer `503` meanwhile. This keeps a socket
+another user binds, for example through a `ZEROCLAW_SOCKET` in a shared directory, from receiving
+webhook traffic and the platform credentials it carries.
+
+The daemon admits its own uid while `security.trust_daemon_uid` is on (the default). Under that
+default policy the standalone gateway connects as the shared operator, which holds every grant
+(see [Authentication](../security/authentication.md#local-connections)). Only the
+`/plugin/{path}` route uses this connection. With `security.trust_daemon_uid = false`, that uid
+needs a `[users.<name>].uid` entry whose profile grants `channels:execute`. The connection is listed among the daemon's clients (for example in
+`/api/tuis`), and a daemon started with `--ephemeral` stays up while a standalone gateway is
+connected.
+
+When the daemon cannot answer, the standalone gateway fails fast instead of queueing:
+
+| Condition | Status | Body |
+|---|---|---|
+| The daemon is not running, or the connection dropped | `503` | `webhook unavailable` |
+| The daemon's socket is served by another user | `503` | `webhook unavailable` |
+| The daemon refused the gateway's connection or call | `503` | `webhook unavailable` |
+| The daemon does not support plugin webhook dispatch | `503` | `webhook unavailable` |
+| The daemon returned a result the gateway cannot use | `503` | `webhook unavailable` |
+| The daemon did not answer within eleven seconds | `504` | `webhook processing timed out` |
+
+Every forwarded request shares the gateway's one RPC connection, and the daemon admits at most
+1024 dispatches in flight on a connection. Past that, the gateway answers `429`
+`webhook queue full` for every path: a gateway-wide limit on top of each route's own queue.
+
+Route ownership is resolved by the daemon, so while it is unreachable every path answers `503`,
+including paths no plugin owns. The gateway reconnects on its own after the daemon restarts or
+reloads; a refused connection is retried every 30 seconds at first, backing off to every five
+minutes while the refusal lasts. A standalone gateway bound to a public address serves the
+daemon's plugin routes on that listener.
+
+`zeroclaw gateway restart` first POSTs `/admin/shutdown` to the gateway address in the config it
+runs with, so run it with the standalone gateway's `--config-dir` and `ZEROCLAW_SOCKET`. With the
+daemon's config it would stop the daemon's own supervised gateway, which listens at that address.
+
+On Windows the standalone gateway does not forward yet. Named pipes share one global namespace and
+the gateway cannot yet verify which process serves the daemon's pipe, so it fails closed: every
+`/plugin/{path}` answers `404` `webhook not found`, as it did before forwarding existed, and the
+gateway logs once at startup (INFO, `error_key` `plugin_webhook_forwarding_disabled`) that
+forwarding is disabled. The daemon's own supervised gateway serves plugin webhooks on Windows.
+
 ## Discovering the surface
 
 Two endpoints answer the question "what can I do here?":

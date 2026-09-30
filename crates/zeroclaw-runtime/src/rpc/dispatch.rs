@@ -3762,12 +3762,14 @@ impl RpcDispatcher {
     // ── Plugin webhook handlers ──────────────────────────────────
 
     /// Plugin webhook methods carry public ingress traffic into the daemon,
-    /// so only local IPC peers may call them, whatever their grants.
+    /// so only local IPC peers may call them, whatever their grants. The
+    /// supervised gateway reaches the ingress directly, never through the
+    /// in-process seam.
     fn require_local_ipc(&self, method: Method) -> Result<(), JsonRpcError> {
         use crate::rpc::transport::TransportKind;
         match self.transport_kind {
             TransportKind::Local => Ok(()),
-            TransportKind::Wss => {
+            TransportKind::Wss | TransportKind::Inproc => {
                 let denied = crate::rpc::auth::AuthDenied::forbidden(
                     crate::i18n::get_required_cli_string_with_args(
                         "rpc-plugin-webhook-local-ipc-only",
@@ -14332,8 +14334,13 @@ mod tests {
             assert_no_more_frames(dispatcher, &mut served.responses).await;
         }
 
-        #[tokio::test]
-        async fn plugin_webhook_methods_are_refused_on_wss() {
+        /// Every plugin webhook method on an authenticated connection of
+        /// `transport` answers FORBIDDEN, writes one denial audit record, and
+        /// reaches no route.
+        async fn assert_plugin_webhook_methods_refused_on(
+            transport: crate::rpc::transport::TransportKind,
+            peer_label: &str,
+        ) {
             let _writer_guard = zeroclaw_log::__private_test_writer_lock();
             let _hook_guard = zeroclaw_log::__private_test_hook_lock();
             zeroclaw_log::try_install_capture_subscriber();
@@ -14346,12 +14353,9 @@ mod tests {
             let mut dispatcher = RpcDispatcher::new(
                 ctx_with_ingress(Config::default(), Some(ingress)),
                 tx,
-                "wss:test".into(),
+                peer_label.into(),
             )
-            .with_transport(
-                crate::rpc::transport::TransportKind::Wss,
-                crate::security::auth_provider::Credential::None,
-            );
+            .with_transport(transport, crate::security::auth_provider::Credential::None);
             dispatcher.set_authenticated_for_test();
             let principal_id = dispatcher
                 .auth
@@ -14363,8 +14367,8 @@ mod tests {
                 .to_owned();
 
             for (id, (method, request)) in [
-                (DISPATCH, params("wss-1", "fixture")),
-                (CANCEL, json!({"request_id": "wss-1"})),
+                (DISPATCH, params("refused-1", "fixture")),
+                (CANCEL, json!({"request_id": "refused-1"})),
                 (ROUTES, json!({})),
             ]
             .into_iter()
@@ -14399,6 +14403,24 @@ mod tests {
             assert!(dispatcher.plugin_webhook_tasks.is_empty());
             assert!(dispatcher.plugin_webhook_inflight.lock().is_empty());
             assert!(routes.seen.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn plugin_webhook_methods_are_refused_on_wss() {
+            assert_plugin_webhook_methods_refused_on(
+                crate::rpc::transport::TransportKind::Wss,
+                "wss:test",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn plugin_webhook_methods_are_refused_on_inproc() {
+            assert_plugin_webhook_methods_refused_on(
+                crate::rpc::transport::TransportKind::Inproc,
+                "inproc:test",
+            )
+            .await;
         }
 
         fn channel_grant_config(verb: zeroclaw_api::grants::Verb) -> Config {

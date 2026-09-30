@@ -29,6 +29,11 @@
 # helpers and the committed-key set the ingress stores its delivered message
 # keys in, and the manifest defines the ingress's dependencies. Other gateway
 # and infra paths stay out: the default-feature Test job covers them.
+# The standalone gateway's forwarder and the two-process IPC proof run only
+# here, so the gateway's core connection, the RPC client and wire crates they
+# compile against, the JSON-RPC request plumbing in zeroclaw-api that the
+# client sends through (`RpcOutbound`), the root IPC e2e target, and the
+# channel fixture helpers shared by both root e2e targets are listed too.
 # Prints "false" otherwise. Always exits 0; the workflow step forwards the
 # printed value to GITHUB_OUTPUT.
 
@@ -43,11 +48,17 @@ while IFS= read -r path; do
         crates/zeroclaw-config/*|\
         tests/plugin_channel_runtime_e2e.rs|\
         tests/channel_egress_e2e.rs|\
+        tests/plugin_webhook_ipc_e2e.rs|\
+        tests/support/plugin_channel_fixture.rs|\
+        crates/zeroclaw-gateway/src/core_rpc.rs|\
+        crates/zeroclaw-rpc-client/*|\
+        crates/zeroclaw-rpc-proto/*|\
         crates/zeroclaw-gateway/src/plugin_webhook*|\
         crates/zeroclaw-gateway/src/lib.rs|\
         crates/zeroclaw-gateway/Cargo.toml|\
         crates/zeroclaw-gateway/tests/golden*|\
         crates/zeroclaw-api/src/webhook.rs|\
+        crates/zeroclaw-api/src/jsonrpc.rs|\
         crates/zeroclaw-infra/src/plugin_webhook*|\
         crates/zeroclaw-infra/src/lib.rs|\
         crates/zeroclaw-infra/Cargo.toml|\

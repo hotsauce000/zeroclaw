@@ -24,12 +24,17 @@ fn fixture_route(sink: tokio::sync::mpsc::Sender<RawWebhook>) -> PluginWebhookRo
 }
 
 fn plugin_webhook_test_router(state: AppState, ingress: Arc<PluginWebhookIngress>) -> Router {
-    routes(ingress)
+    backend_test_router(state, PluginWebhookBackend::InProcess(ingress))
+}
+
+/// The plugin webhook route over `backend`, with the gateway's body limit.
+pub(super) fn backend_test_router(state: AppState, backend: PluginWebhookBackend) -> Router {
+    routes(backend)
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
 }
 
-fn plugin_webhook_request(
+pub(super) fn plugin_webhook_request(
     path: &str,
     body: impl Into<Body>,
     peer: SocketAddr,
@@ -48,7 +53,7 @@ fn plugin_webhook_request(
     request
 }
 
-async fn response_text(response: Response) -> String {
+pub(super) async fn response_text(response: Response) -> String {
     let bytes = response
         .into_body()
         .collect()

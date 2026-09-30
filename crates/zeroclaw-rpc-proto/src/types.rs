@@ -1809,6 +1809,59 @@ impl From<zeroclaw_api::webhook::PluginWebhookOutcome> for PluginWebhookDispatch
     }
 }
 
+/// Why a `plugin-webhook/dispatch` result cannot be read as an outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidDispatchResult {
+    /// `reply` arrived without its `body`.
+    ReplyWithoutBody,
+    /// A `body` arrived with an outcome other than `reply`.
+    BodyWithoutReply,
+}
+
+impl InvalidDispatchResult {
+    /// Stable log key.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::ReplyWithoutBody => "reply_without_body",
+            Self::BodyWithoutReply => "body_without_reply",
+        }
+    }
+}
+
+impl PluginWebhookDispatchResult {
+    /// Read the result a core sent back. A reply body over
+    /// [`zeroclaw_api::webhook::MAX_WEBHOOK_RESPONSE_BODY_BYTES`] is the
+    /// `InvalidResponse` outcome, as it is in process, so a caller never
+    /// forwards a reply the ingress would have refused.
+    pub fn into_outcome(
+        self,
+    ) -> Result<zeroclaw_api::webhook::PluginWebhookOutcome, InvalidDispatchResult> {
+        use PluginWebhookDispatchOutcome as Wire;
+        use zeroclaw_api::webhook::{
+            MAX_WEBHOOK_RESPONSE_BODY_BYTES, PluginWebhookOutcome as Ingress,
+        };
+        let outcome = match (self.outcome, self.body) {
+            (Wire::Reply, Some(body)) if body.len() <= MAX_WEBHOOK_RESPONSE_BODY_BYTES => {
+                Ingress::Reply(body)
+            }
+            (Wire::Reply, Some(_)) => Ingress::InvalidResponse,
+            (Wire::Reply, None) => return Err(InvalidDispatchResult::ReplyWithoutBody),
+            (_, Some(_)) => return Err(InvalidDispatchResult::BodyWithoutReply),
+            (Wire::Ack, None) => Ingress::Ack,
+            (Wire::NotFound, None) => Ingress::NotFound,
+            (Wire::QueueFull, None) => Ingress::QueueFull,
+            (Wire::Unavailable, None) => Ingress::Unavailable,
+            (Wire::Unauthorized, None) => Ingress::Unauthorized,
+            (Wire::BadRequest, None) => Ingress::BadRequest,
+            (Wire::InvalidResponse, None) => Ingress::InvalidResponse,
+            (Wire::Timeout, None) => Ingress::Timeout,
+            (Wire::Cancelled, None) => Ingress::Cancelled,
+        };
+        Ok(outcome)
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // ── Quickstart (wire-stable subset) ──────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
@@ -2278,6 +2331,67 @@ mod tests {
             zeroclaw_api::webhook::MAX_WEBHOOK_RESPONSE_BODY_BYTES,
             4096,
             "the `body` doc and rpc-socket.md state this bound"
+        );
+    }
+
+    #[test]
+    fn plugin_webhook_dispatch_result_round_trips_every_outcome() {
+        use zeroclaw_api::webhook::{MAX_WEBHOOK_RESPONSE_BODY_BYTES, PluginWebhookOutcome};
+        for outcome in [
+            PluginWebhookOutcome::Ack,
+            PluginWebhookOutcome::Reply("challenge".into()),
+            PluginWebhookOutcome::Reply(String::new()),
+            PluginWebhookOutcome::Reply("x".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES)),
+            PluginWebhookOutcome::NotFound,
+            PluginWebhookOutcome::QueueFull,
+            PluginWebhookOutcome::Unavailable,
+            PluginWebhookOutcome::Unauthorized,
+            PluginWebhookOutcome::BadRequest,
+            PluginWebhookOutcome::InvalidResponse,
+            PluginWebhookOutcome::Timeout,
+            PluginWebhookOutcome::Cancelled,
+        ] {
+            let result = PluginWebhookDispatchResult::from(outcome.clone());
+            assert_eq!(result.clone().into_outcome(), Ok(outcome.clone()));
+            let wire = serde_json::to_value(&result).unwrap();
+            let parsed: PluginWebhookDispatchResult = serde_json::from_value(wire).unwrap();
+            assert_eq!(parsed.into_outcome(), Ok(outcome));
+        }
+    }
+
+    #[test]
+    fn plugin_webhook_dispatch_result_rejects_inconsistent_bodies() {
+        use zeroclaw_api::webhook::{MAX_WEBHOOK_RESPONSE_BODY_BYTES, PluginWebhookOutcome};
+        let result = |wire: Value| serde_json::from_value::<PluginWebhookDispatchResult>(wire);
+
+        assert_eq!(
+            result(json!({"outcome": "reply"})).unwrap().into_outcome(),
+            Err(InvalidDispatchResult::ReplyWithoutBody)
+        );
+        for outcome in ["ack", "not_found", "unavailable", "timeout", "cancelled"] {
+            assert_eq!(
+                result(json!({"outcome": outcome, "body": "x"}))
+                    .unwrap()
+                    .into_outcome(),
+                Err(InvalidDispatchResult::BodyWithoutReply),
+                "{outcome}"
+            );
+        }
+        let oversized = "x".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES + 1);
+        assert_eq!(
+            result(json!({"outcome": "reply", "body": oversized}))
+                .unwrap()
+                .into_outcome(),
+            Ok(PluginWebhookOutcome::InvalidResponse)
+        );
+        assert!(result(json!({"outcome": "bogus"})).is_err());
+        assert_eq!(
+            InvalidDispatchResult::ReplyWithoutBody.reason(),
+            "reply_without_body"
+        );
+        assert_eq!(
+            InvalidDispatchResult::BodyWithoutReply.reason(),
+            "body_without_reply"
         );
     }
 

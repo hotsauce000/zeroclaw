@@ -253,7 +253,9 @@ Each daemon generation runs one plugin webhook ingress. It owns route lookup,
 per-route queue admission, the request deadline, and message dedup for
 channel plugins. The gateway's `/plugin/{path}` route is one caller of it; the
 `plugin-webhook/*` methods let a local process deliver the same requests over
-this socket.
+this socket. In builds with plugin support, on Unix, the standalone
+`zeroclaw gateway` calls these methods over the local socket; the supervised gateway inside the daemon calls the same
+ingress in process.
 
 | Method | Grant | Purpose |
 |---|---|---|
@@ -262,8 +264,9 @@ this socket.
 | `plugin-webhook/routes` | `channels:read` | List the published routes and their owners |
 
 All three are served only on the local IPC endpoint. A WSS connection,
-including one that arrives through the relay, gets `FORBIDDEN` whatever its
-grants. Grants are checked when a request is admitted. A dispatch ends within
+including one that arrives through the relay, and an in-process connection get
+`FORBIDDEN` whatever their grants. Grants are checked when a request is
+admitted. A dispatch ends within
 the ingress deadline, so it is not rechecked while it runs.
 
 ```json
@@ -349,6 +352,9 @@ at least one client has connected.
 Daemons started without `--ephemeral` ignore client count and run until
 explicitly stopped.
 
+In builds with plugin support, a standalone `zeroclaw gateway` on Unix holds a
+connection for as long as it runs, so it counts as a client and keeps an ephemeral daemon up.
+
 ## Security
 
 - Unix socket directory: `0o700` (owner only)
@@ -357,11 +363,22 @@ explicitly stopped.
 - `SO_PEERCRED` on Linux provides the connecting process PID and UID for
   audit logging; Windows logs `pipe:local` as the peer label
 - The `plugin-webhook/*` methods are refused with `FORBIDDEN` on WSS,
-  including relayed connections, whatever the caller's grants
+  including relayed connections, and on in-process connections, whatever the
+  caller's grants
 - A local caller holding `channels:execute` can dispatch to any plugin's
   route: the grant is not scoped by channel alias, and the gateway's
   per-client webhook rate limit does not apply. Plugins still verify each
   request's platform signature, and the core enforces the request bounds
+- In builds with plugin support, the standalone `zeroclaw gateway` on Unix
+  forwards `/plugin/{path}` only to a
+  socket whose kernel-reported peer uid equals its own effective uid, checked
+  before it sends anything, so a socket another user serves never sees
+  webhook traffic. Under the default `security.trust_daemon_uid = true` it
+  then connects as the shared operator, which holds every grant (see
+  [Authentication](../security/authentication.md#local-connections)); only
+  its `/plugin/{path}` route uses that connection. On Windows it does not
+  forward at all, because nothing verifies which process serves the
+  daemon's named pipe yet
 
 ## Quick test
 

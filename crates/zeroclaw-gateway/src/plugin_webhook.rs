@@ -1,7 +1,8 @@
 //! HTTP adapter for channel-plugin webhooks.
 //!
 //! Rate limiting and request bounds happen here; route admission, the
-//! deadline, and dedup belong to the core ingress.
+//! deadline, and dedup belong to the core ingress, reached in process or, from
+//! the standalone gateway on Unix, over RPC.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,11 +22,42 @@ use zeroclaw_infra::plugin_webhook::PluginWebhookIngress;
 
 use crate::{AppState, MAX_BODY_SIZE, RATE_LIMIT_WINDOW_SECS, client_key_from_request};
 
+#[cfg(unix)]
+mod forward;
+
 // A body the gateway admits must never be one the ingress refuses: that would
 // turn a 413 into a 400.
 const _: () = assert!(MAX_BODY_SIZE <= MAX_PLUGIN_WEBHOOK_BODY_BYTES);
 
-pub(super) fn routes(ingress: Arc<PluginWebhookIngress>) -> Router<AppState> {
+/// Where admitted requests are resolved. Chosen once at startup; a request
+/// never falls back from one to the other.
+#[derive(Clone)]
+pub(crate) enum PluginWebhookBackend {
+    /// This process's ingress: the supervised gateway inside the daemon.
+    InProcess(Arc<PluginWebhookIngress>),
+    /// The daemon's ingress over its local RPC socket: the standalone
+    /// gateway. This connection is the forwarder's own, never the one other
+    /// routes reach through the `CoreRpc` extension.
+    #[cfg(unix)]
+    Core(crate::core_rpc::CoreRpc),
+}
+
+impl PluginWebhookBackend {
+    /// The public response for an admitted request.
+    async fn respond(&self, request: PluginWebhookRequest) -> Response {
+        match self {
+            Self::InProcess(ingress) => {
+                let cancellation = WebhookCancellation::new();
+                let _cancel_on_exit = cancellation.clone().drop_guard();
+                outcome_response(ingress.dispatch(request, &cancellation).await)
+            }
+            #[cfg(unix)]
+            Self::Core(core) => forward::respond(core, request).await,
+        }
+    }
+}
+
+pub(super) fn routes(backend: PluginWebhookBackend) -> Router<AppState> {
     Router::new()
         .route(
             "/plugin/{path}",
@@ -34,7 +66,7 @@ pub(super) fn routes(ingress: Arc<PluginWebhookIngress>) -> Router<AppState> {
                 .head(unsupported_method)
                 .fallback(unsupported_method),
         )
-        .layer(axum::Extension(ingress))
+        .layer(axum::Extension(backend))
 }
 
 async fn unsupported_method() -> impl IntoResponse {
@@ -49,7 +81,7 @@ async fn unsupported_method() -> impl IntoResponse {
 async fn handle_plugin_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    axum::Extension(ingress): axum::Extension<Arc<PluginWebhookIngress>>,
+    axum::Extension(backend): axum::Extension<PluginWebhookBackend>,
     Path(path): Path<String>,
     method: Method,
     RawQuery(query): RawQuery,
@@ -115,9 +147,7 @@ async fn handle_plugin_webhook(
             return (StatusCode::BAD_REQUEST, "invalid webhook").into_response();
         }
     };
-    let cancellation = WebhookCancellation::new();
-    let _cancel_on_exit = cancellation.clone().drop_guard();
-    outcome_response(ingress.dispatch(request, &cancellation).await)
+    backend.respond(request).await
 }
 
 /// The fixed public status and body for each ingress outcome. Guest and host
