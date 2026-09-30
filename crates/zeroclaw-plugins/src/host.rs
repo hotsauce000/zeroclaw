@@ -1234,9 +1234,14 @@ fn validate_skill_bundle(
     // Like a package root, the skills root is an admission boundary: a
     // symlink here would let the bundle validated and later copied live
     // outside the package.
-    if dir
-        .symlink_metadata(SKILLS_SUBDIR)
-        .is_ok_and(|m| m.file_type().is_symlink())
+    let skills_metadata = match dir.symlink_metadata(SKILLS_SUBDIR) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if skills_metadata
+        .as_ref()
+        .is_some_and(|m| m.file_type().is_symlink())
     {
         return Err(PluginError::InvalidManifest(format!(
             "skill plugin '{}' has a symlinked `skills/` directory at {}; package the skills in place",
@@ -1244,7 +1249,7 @@ fn validate_skill_bundle(
             skills_dir.display()
         )));
     }
-    if !dir.is_dir(SKILLS_SUBDIR) {
+    if !skills_metadata.is_some_and(|metadata| metadata.is_dir()) {
         return Err(PluginError::InvalidManifest(format!(
             "skill plugin '{}' is missing `skills/` directory at {}",
             plugin_name,
@@ -1262,7 +1267,14 @@ fn validate_skill_bundle(
         }
         found_any = true;
         let skill_md = path.join("SKILL.md");
-        if !dir.is_file(relative.join("SKILL.md")) {
+        // Missing or wrong-type content is structural; an operational lookup
+        // failure says nothing about the package and must not authorize recovery.
+        let skill_metadata = match dir.metadata(relative.join("SKILL.md")) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if !skill_metadata.is_some_and(|metadata| metadata.is_file()) {
             return Err(PluginError::InvalidManifest(format!(
                 "skill plugin '{}' subdirectory '{}' is missing SKILL.md",
                 plugin_name,
@@ -2796,6 +2808,111 @@ capabilities = ["tool"]
             assert!(reason.contains(expected), "{mode:o}: {reason}");
             assert!(staging.is_dir(), "{mode:o}: staging was swept");
             assert_eq!(dir_entries(&locked), ["manifest.toml"], "{mode:o}");
+        }
+    }
+
+    fn nested_package_bytes(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut result = Vec::new();
+        for name in dir_entries(dir) {
+            let path = dir.join(&name);
+            if path.is_dir() {
+                for (child, bytes) in nested_package_bytes(&path) {
+                    result.push((Path::new(&name).join(child), bytes));
+                }
+            } else {
+                result.push((PathBuf::from(name), std::fs::read(path).unwrap()));
+            }
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_refuses_inaccessible_nested_skill_and_preserves_all_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let plugins = tempdir().unwrap();
+        // Discover before the package appears so remove takes the unloaded path.
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        write_skill_bundle_plugin(plugins.path(), "locked-skill", &["nested"]);
+        let package = plugins.path().join("locked-skill");
+        std::fs::write(package.join("sentinel"), b"readable sibling must survive").unwrap();
+        let before = nested_package_bytes(&package);
+        let stage = host
+            .recovery_root
+            .transaction("locked-skill", "installing")
+            .unwrap();
+        stage.dir.create_dir(recovery::PACKAGE).unwrap();
+        stage
+            .dir
+            .write(
+                Path::new(recovery::PACKAGE).join("sentinel"),
+                b"protocol-stage bytes must survive",
+            )
+            .unwrap();
+        let protocol_stage = plugins.path().join(&stage.entry).join(recovery::PACKAGE);
+        drop(stage); // A real abandoned generation would be eligible after recovery.
+        let staging = plugins.path().join(".locked-skill.installing-7");
+        let unrelated = plugins.path().join(".other.installing-7");
+        for stage in [&staging, &unrelated] {
+            std::fs::create_dir(stage).unwrap();
+            std::fs::write(stage.join("sentinel"), b"stage bytes must survive").unwrap();
+        }
+        let nested = package.join("skills/nested");
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let probe = std::fs::symlink_metadata(nested.join("SKILL.md"));
+        if probe.is_ok() {
+            // Privileged identities may bypass DAC. Do not count that as proof
+            // that recovery refused a real permission error.
+            std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("permission control inapplicable: identity can inspect mode-0600 child");
+            return;
+        }
+        let source_result = host.admit_source(package.to_str().unwrap());
+        let remove_result = host.remove("locked-skill");
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            probe.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(
+            matches!(source_result, Err(PluginError::Io(ref error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert!(
+            matches!(remove_result, Err(PluginError::UnadmittedPackage { .. })),
+            "{remove_result:?}"
+        );
+        assert_eq!(nested_package_bytes(&package), before);
+        assert_eq!(
+            std::fs::read(protocol_stage.join("sentinel")).unwrap(),
+            b"protocol-stage bytes must survive"
+        );
+        for stage in [&staging, &unrelated] {
+            assert_eq!(
+                std::fs::read(stage.join("sentinel")).unwrap(),
+                b"stage bytes must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_recovers_missing_skill_md_but_refuses_valid_skill_bundle() {
+        for missing in [false, true] {
+            let plugins = tempdir().unwrap();
+            let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+            write_skill_bundle_plugin(plugins.path(), "bundle", &["nested"]);
+            let package = plugins.path().join("bundle");
+            if missing {
+                std::fs::remove_file(package.join("skills/nested/SKILL.md")).unwrap();
+            }
+            let before = nested_package_bytes(&package);
+            let result = host.remove("bundle");
+            if missing {
+                result.expect("missing skill file is structural recovery evidence");
+                assert!(!package.exists());
+            } else {
+                assert!(matches!(result, Err(PluginError::UnadmittedPackage { .. })));
+                assert_eq!(nested_package_bytes(&package), before);
+            }
         }
     }
 
