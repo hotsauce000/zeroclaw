@@ -7313,21 +7313,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 );
 
                 // One ingress per daemon generation: the channel supervisor
-                // publishes routes into its registry and every gateway run of
-                // this generation dispatches through it, so message dedup
-                // outlives a gateway restart but not a reload.
-                #[cfg(feature = "gateway")]
+                // publishes routes into its registry, and every gateway run
+                // and RPC connection of this generation dispatches through it,
+                // so message dedup outlives a gateway restart but not a reload.
                 let plugin_webhook_ingress =
                     Arc::new(zeroclaw_infra::plugin_webhook::PluginWebhookIngress::new(
                         current_config.gateway.idempotency_ttl_secs,
                         current_config.gateway.idempotency_max_keys,
                     ));
-                #[cfg(feature = "gateway")]
                 let channel_plugin_webhooks = Some(Arc::clone(plugin_webhook_ingress.registry()));
-                #[cfg(not(feature = "gateway"))]
-                let channel_plugin_webhooks: Option<
-                    Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
-                > = None;
 
                 // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
                 // (or empty) by default, so SOP runtime behavior is off until an
@@ -8022,6 +8016,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         .as_ref()
                         .map(|supervisor| supervisor.drivers.clone()),
                 );
+                registry.set_plugin_webhooks(plugin_webhook_ingress);
 
                 let exit = Box::pin(daemon::run_with_authority(
                     authority,

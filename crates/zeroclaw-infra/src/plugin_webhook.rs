@@ -14,8 +14,8 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{oneshot, watch};
 use zeroclaw_api::webhook::{
     MAX_WEBHOOK_RESPONSE_BODY_BYTES, PLUGIN_WEBHOOK_DEADLINE, PluginWebhookOutcome,
-    PluginWebhookOwner, PluginWebhookRegistry, PluginWebhookRequest, WebhookCancellation,
-    WebhookIdempotency, WebhookOutcome, WebhookReject, WebhookReservation,
+    PluginWebhookOwner, PluginWebhookRegistry, PluginWebhookRequest, PluginWebhookRoutes,
+    WebhookCancellation, WebhookIdempotency, WebhookOutcome, WebhookReject, WebhookReservation,
     WebhookReservationStatus, WebhookReservationToken, WebhookReservationWaiter,
     is_valid_plugin_webhook_path,
 };
@@ -48,6 +48,13 @@ impl PluginWebhookIngress {
     #[must_use]
     pub fn registry(&self) -> &Arc<PluginWebhookRegistry> {
         &self.registry
+    }
+
+    /// The live routes and their owners, for diagnostics. Dispatch never
+    /// consults this listing; it resolves each path when the request arrives.
+    #[must_use]
+    pub fn routes(&self) -> PluginWebhookRoutes {
+        self.registry.routes()
     }
 
     /// Deliver `request` to the worker that owns its path and wait for the
@@ -151,7 +158,10 @@ fn worker_outcome(
         Ok(Err(WebhookReject::InvalidResponse)) => PluginWebhookOutcome::InvalidResponse,
         // The worker reports a timeout only when its request token fires, and
         // while dispatch still waits only the caller's cancellation fires it.
-        Ok(Err(WebhookReject::Timeout)) if cancel.is_cancelled() => PluginWebhookOutcome::Cancelled,
+        // A worker may also drop a cancelled request without answering.
+        Ok(Err(WebhookReject::Timeout)) | Err(_) if cancel.is_cancelled() => {
+            PluginWebhookOutcome::Cancelled
+        }
         Ok(Err(WebhookReject::Timeout)) => PluginWebhookOutcome::Timeout,
         Err(_) => {
             ::zeroclaw_log::record!(

@@ -81,6 +81,10 @@ catalog! {
     SubscribeParams, LogsSubscribeResult, LogsQueryParams, LogsQueryResult, LogsGetParams,
     LogsGetResult, EventsHistoryResult, SubscriptionCancelParams, SubscriptionCancelResult,
     SubscriptionLagged,
+    // Plugin webhooks
+    PluginWebhookHeader, PluginWebhookDispatchParams, PluginWebhookDispatchOutcome,
+    PluginWebhookDispatchResult, PluginWebhookCancelParams, PluginWebhookCancelResult,
+    PluginWebhookRouteInfo, PluginWebhookRoutesResult,
     // Notifications
     SessionUpdateEvent, TurnCompletionOutcome,
     // Quickstart (wire-stable subset)

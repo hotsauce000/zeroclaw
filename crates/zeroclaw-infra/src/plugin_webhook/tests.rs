@@ -179,6 +179,29 @@ fn new_normalizes_zero_limits() {
     assert_eq!(configured.reservations.max_keys, 3);
 }
 
+#[test]
+fn routes_delegates_to_the_registry() {
+    let ingress = test_ingress();
+    let (_lease, _receivers) = publish(
+        &ingress,
+        &[
+            ("second", owner("p", "b"), 1),
+            ("first", owner("p", "a"), 1),
+        ],
+    );
+
+    let listed = ingress.routes();
+    assert_eq!(listed, ingress.registry().routes());
+    assert_eq!(listed.generation(), 1);
+    assert_eq!(
+        listed.routes(),
+        [
+            ("first".to_string(), owner("p", "a")),
+            ("second".to_string(), owner("p", "b")),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn dispatch_forwards_the_exact_request_to_the_route_worker() {
     let ingress = test_ingress();
@@ -688,4 +711,65 @@ async fn dispatch_logs_route_and_worker_failures_with_the_route_owner() {
         assert_eq!(attr(record, "path"), Some(path), "{record:#?}");
     }
     zeroclaw_log::clear_broadcast_hook();
+}
+
+/// Dispatch to a worker that drops its reply sender without answering,
+/// cancelling the caller first when `caller_cancels`. Returns the outcome and
+/// the log records that name the route's plugin.
+async fn dispatch_to_a_dropped_reply(
+    caller_cancels: bool,
+) -> (PluginWebhookOutcome, Vec<serde_json::Value>) {
+    let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+    zeroclaw_log::try_install_capture_subscriber();
+    let mut records = zeroclaw_log::subscribe_or_install();
+    while records.try_recv().is_ok() {}
+
+    let ingress = test_ingress();
+    let (_lease, mut receivers) = publish(
+        &ingress,
+        &[("dropped", owner("drop-plugin", "drop-alias"), 1)],
+    );
+    let mut receiver = receivers.remove(0);
+    let cancel = WebhookCancellation::new();
+    let caller = cancel.clone();
+    zeroclaw_spawn::spawn!(async move {
+        let request = receiver.recv().await.expect("route forwards the request");
+        if caller_cancels {
+            caller.cancel();
+            request.cancellation.cancelled().await;
+        }
+        drop(request);
+    });
+    let outcome = ingress.dispatch(post("dropped", b"body"), &cancel).await;
+
+    let mut logged = Vec::new();
+    while let Ok(record) = records.try_recv() {
+        if attr(&record, "plugin") == Some("drop-plugin") {
+            logged.push(record);
+        }
+    }
+    zeroclaw_log::clear_broadcast_hook();
+    (outcome, logged)
+}
+
+#[tokio::test]
+async fn a_reply_dropped_after_caller_cancellation_is_cancelled_and_not_logged() {
+    let (outcome, logged) = dispatch_to_a_dropped_reply(true).await;
+    assert_eq!(outcome, PluginWebhookOutcome::Cancelled);
+    assert!(logged.is_empty(), "{logged:#?}");
+}
+
+#[tokio::test]
+async fn a_reply_dropped_without_caller_cancellation_is_unavailable_and_logged() {
+    let (outcome, logged) = dispatch_to_a_dropped_reply(false).await;
+    assert_eq!(outcome, PluginWebhookOutcome::Unavailable);
+    let [record] = logged.as_slice() else {
+        panic!("expected one plugin_webhook_reply_dropped record, got {logged:#?}");
+    };
+    assert_eq!(record["severity_text"], "WARN", "{record:#?}");
+    assert_eq!(
+        attr(record, "error_key"),
+        Some("plugin_webhook_reply_dropped"),
+        "{record:#?}"
+    );
 }

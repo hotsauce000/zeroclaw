@@ -1424,6 +1424,7 @@ rpc-auth-remote-token-required = Remote connections must present auth_token in i
 rpc-auth-first-call-initialize = First call must be 'initialize'
 rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
+rpc-plugin-webhook-local-ipc-only = { $method } is served only on the local IPC endpoint
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
 

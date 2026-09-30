@@ -273,6 +273,29 @@ impl PluginWebhookRoute {
     }
 }
 
+/// A read-only listing of the published routes, taken under one registry lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginWebhookRoutes {
+    generation: u64,
+    routes: Vec<(String, PluginWebhookOwner)>,
+}
+
+impl PluginWebhookRoutes {
+    /// The registry's route generation: it increments each time the channel
+    /// supervisor starts a generation, not on each publication, and starts
+    /// over with every new registry, that is with every daemon reload.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Each published path and its owner, sorted by path.
+    #[must_use]
+    pub fn routes(&self) -> &[(String, PluginWebhookOwner)] {
+        &self.routes
+    }
+}
+
 /// Why a transport request cannot become a [`PluginWebhookRequest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PluginWebhookRequestError {
@@ -547,6 +570,22 @@ impl PluginWebhookRegistry {
         self.lock_state().routes.get(path).cloned()
     }
 
+    /// List the live routes and the current route generation.
+    #[must_use]
+    pub fn routes(&self) -> PluginWebhookRoutes {
+        let state = self.lock_state();
+        let mut routes: Vec<(String, PluginWebhookOwner)> = state
+            .routes
+            .iter()
+            .map(|(path, route)| (path.clone(), route.owner().clone()))
+            .collect();
+        routes.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        PluginWebhookRoutes {
+            generation: state.generation,
+            routes,
+        }
+    }
+
     fn lock_state(&self) -> MutexGuard<'_, PluginWebhookRegistryState> {
         self.state
             .lock()
@@ -674,6 +713,60 @@ mod tests {
         assert_eq!(published.owner().plugin(), "fixture-plugin");
         assert_eq!(published.owner().channel_alias(), "fixture");
         assert!(!published.sink().is_closed());
+    }
+
+    #[test]
+    fn routes_lists_owners_sorted_by_path_for_the_current_generation() {
+        let registry = PluginWebhookRegistry::new();
+        let empty = registry.routes();
+        assert_eq!(empty.generation(), 0);
+        assert!(empty.routes().is_empty());
+
+        let (b_sink, _b_rx) = mpsc::channel(1);
+        let (a_sink, _a_rx) = mpsc::channel(1);
+        let lease = registry.start_generation();
+        assert!(lease.replace(HashMap::from([
+            (
+                "b-path".to_string(),
+                PluginWebhookRoute::new(PluginWebhookOwner::new("plugin-b", "beta"), b_sink),
+            ),
+            (
+                "a-path".to_string(),
+                PluginWebhookRoute::new(PluginWebhookOwner::new("plugin-a", "alpha"), a_sink),
+            ),
+        ])));
+        let listed = registry.routes();
+        assert_eq!(listed.generation(), 1);
+        assert_eq!(
+            listed.routes(),
+            [
+                (
+                    "a-path".to_string(),
+                    PluginWebhookOwner::new("plugin-a", "alpha")
+                ),
+                (
+                    "b-path".to_string(),
+                    PluginWebhookOwner::new("plugin-b", "beta")
+                ),
+            ]
+        );
+
+        let (sink, _rx) = mpsc::channel(1);
+        assert!(lease.replace(HashMap::from([("c-path".to_string(), route(sink))])));
+        assert_eq!(
+            registry.routes().generation(),
+            1,
+            "republishing within a generation keeps its number"
+        );
+
+        let next = registry.start_generation();
+        let restarted = registry.routes();
+        assert_eq!(restarted.generation(), 2);
+        assert!(restarted.routes().is_empty());
+        drop(lease);
+        drop(next);
+        assert!(registry.routes().routes().is_empty());
+        assert_eq!(registry.routes().generation(), 2);
     }
 
     #[test]

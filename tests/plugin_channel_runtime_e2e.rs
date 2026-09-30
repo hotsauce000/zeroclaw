@@ -241,6 +241,14 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
     );
     drop(route);
     assert_eq!(
+        ingress.routes().routes(),
+        [(
+            "fixture".to_string(),
+            PluginWebhookOwner::new("channel-fixture", "operations")
+        )],
+        "the route listing names the same owner"
+    );
+    assert_eq!(
         ingress
             .dispatch(
                 fixture_webhook(
