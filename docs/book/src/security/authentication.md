@@ -533,8 +533,10 @@ layer in follow-ups.
 
 ## Denial audit records
 
-When authorization refuses an RPC request, the daemon writes one `WARN` log
-record with the message `RPC authorization denied` and these attributes:
+When the per-operation check (credential liveness, policy re-resolution, and
+the method's grant) or one of the selectors above refuses an RPC request, the
+daemon writes one `WARN` log record with the message `RPC authorization
+denied` and these attributes:
 
 | Attribute | Value |
 |---|---|
@@ -545,17 +547,21 @@ record with the message `RPC authorization denied` and these attributes:
 | `principal_id` | The principal the connection was bound to, or `null` when it was not bound. |
 | `auth_provider` | The provider that verified that principal, such as `peercred` or `oidc.<alias>`, or `null` when the connection was not bound. |
 
-Group and alert on `reason`, not `denial_message`. The identifier does not change
-with wording or locale, while a message names the path, agent, or grant
+Group and alert on `reason`, not `denial_message`. The identifier does not
+change with wording or locale, while a message names the path, agent, or grant
 involved, so one cause yields many texts and two causes can share one
 (`policy_generation_moved` carries the `revalidation_due` text).
 
-Four cases read differently:
+Some cases read differently:
 
 - `cron_job_agent_not_entitled` is recorded while the client is told the job
-  was not found, the answer a missing job gets, so the refusal does not
-  confirm that the job exists. The record's `denial_message` names the owning agent
-  and the job, and its `code` is the `-32602` the client received.
+  was not found, the answer a missing job gets, so the response does not
+  confirm that the job exists. The record's `denial_message` names the owning
+  agent and the job, and its `code` is the `-32602` the client received.
+- Records are operator data. `logs/query` and `logs/get` return persisted
+  records, these included, to any principal granted `Logs:Read`; unlike the
+  log and event streams, they are not limited to administrators and the
+  shared operator.
 - When a policy change leaves an established connection unable to re-resolve,
   as when its credential no longer verifies, it loses its binding and must
   initialize again. That record still carries the principal and provider the
@@ -564,8 +570,12 @@ Four cases read differently:
 - An open `logs/subscribe` or `events/subscribe` stream is rechecked on every
   delivery. A refused recheck ends the stream without an error response, and
   its record names the method that opened the stream.
-- A refused `initialize` handshake is answered but not recorded, so a missing
-  or rejected credential leaves no record.
+- Some refusals are answered but not recorded: a refused `initialize`
+  handshake (so a missing or rejected credential leaves no record), the
+  not-found-or-not-owned session refusal, a scoped principal's request for the
+  shared memory plane, an SOP decision the approval policy does not authorize,
+  a failed TUI signature check, and the `sops/run-detail` and `sops/rename`
+  refusals over remote WSS.
 
 The identifiers `reason` can hold:
 
