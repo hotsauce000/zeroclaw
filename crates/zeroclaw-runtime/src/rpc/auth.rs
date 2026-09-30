@@ -922,6 +922,7 @@ mod tests {
 
         {
             let lease = auth.hold_authority();
+            assert_ne!(lease.state.resolver.generation(), conn.generation);
             let grants = lease
                 .current_grants(&conn)
                 .expect("the bound identity revalidates under the lease");
@@ -1048,6 +1049,40 @@ mod tests {
             .expect("an unbound pairing token authenticates");
         assert_eq!(conn.principal.id.as_str(), PrincipalId::SHARED_OPERATOR);
         assert!(conn.grants.admin);
+    }
+
+    /// An unbound token beside a roster revalidates at a moved generation,
+    /// directly and under a lease, as the shared operator it was admitted as.
+    #[tokio::test]
+    async fn unbound_connection_revalidates_as_the_shared_operator() {
+        let config = config_with_bound_token();
+        let auth = auth_from_gateway(&config);
+        let conn = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("zc_shared"),
+                None,
+            )
+            .await
+            .expect("an unbound pairing token authenticates");
+        let mut next = config.clone();
+        next.permission_profiles
+            .insert("extra".into(), PermissionProfileConfig::default());
+        auth.refresh_from_config(&next).expect("valid refresh");
+        assert_ne!(auth.generation(), conn.generation);
+
+        let resolved = auth
+            .resolve_current(&conn)
+            .expect("the connection revalidates as the shared operator");
+        assert_eq!(resolved.principal.id.as_str(), PrincipalId::SHARED_OPERATOR);
+        let lease = auth.hold_authority();
+        assert!(
+            lease
+                .current_grants(&conn)
+                .expect("the connection revalidates under the lease")
+                .admin
+        );
     }
 
     #[tokio::test]
