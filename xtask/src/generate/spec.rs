@@ -554,6 +554,16 @@ pub fn non_row_features(
     read_registry_list(pkg, "non_row_features")
 }
 
+/// Whether `text` names `feature` as a whole token. Feature names share
+/// prefixes (`plugins-wasm` is a prefix of `plugins-wasm-cranelift`), so a
+/// substring search cannot tell a leaked feature from a longer name that
+/// belongs in the rendered list.
+#[cfg(test)]
+pub(crate) fn mentions_feature(text: &str, feature: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .any(|token| token == feature)
+}
+
 /// Features intentionally added to Cargo defaults for standard distribution
 /// artifacts. This policy is not derivable from the feature graph, so it lives
 /// in the canonical registry rather than in release or packaging scripts.
@@ -1437,6 +1447,7 @@ mod tests {
                 "channel-lark",
                 "channel-git",
                 "whatsapp-web",
+                "plugins-wasm-cranelift",
             ]
             .map(str::to_owned),
         );
@@ -1604,14 +1615,17 @@ mod tests {
             .unwrap();
         let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
 
-        assert_eq!(exclusions["aarch64-linux-android"], vec!["whatsapp-web"]);
+        assert_eq!(
+            exclusions["aarch64-linux-android"],
+            vec!["whatsapp-web", "plugins-wasm-cranelift"]
+        );
         assert_eq!(
             exclusions["arm-unknown-linux-gnueabihf"],
-            vec!["observability-prometheus"]
+            vec!["observability-prometheus", "plugins-wasm-cranelift"]
         );
         assert_eq!(
             exclusions["armv7-unknown-linux-gnueabihf"],
-            vec!["observability-prometheus"]
+            vec!["observability-prometheus", "plugins-wasm-cranelift"]
         );
     }
 
