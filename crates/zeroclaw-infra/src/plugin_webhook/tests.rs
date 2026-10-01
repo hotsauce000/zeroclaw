@@ -1,8 +1,12 @@
 use super::*;
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use tokio::sync::mpsc;
 use zeroclaw_api::webhook::{
     PLUGIN_WEBHOOK_QUEUE_DEPTH, PluginWebhookRegistryLease, PluginWebhookRoute, RawWebhook,
+    WebhookReservation, WebhookReservationStatus, WebhookReservationToken,
 };
 
 use crate::IDEMPOTENCY_MAX_KEYS_DEFAULT;
@@ -57,7 +61,7 @@ fn owned(reservation: WebhookReservation) -> WebhookReservationToken {
 
 #[tokio::test]
 async fn reservation_waits_for_owner_outcome_and_fences_stale_tokens() {
-    let store = Arc::new(ReservationStore::new(Duration::from_secs(300), 8));
+    let store = Arc::new(WebhookReservationStore::new(Duration::from_secs(300), 8));
     let idempotency = idempotency_bridge(&store, &owner("p", "a"), "fixture");
     let first = owned(idempotency.begin("stable-id"));
     let mut duplicate = match idempotency.begin("stable-id") {
@@ -85,49 +89,6 @@ async fn reservation_waits_for_owner_outcome_and_fences_stale_tokens() {
         idempotency.begin("stable-id"),
         WebhookReservation::Committed
     ));
-}
-
-#[test]
-fn pending_capacity_reports_unavailable_until_rollback_frees_a_slot() {
-    let store = ReservationStore::new(Duration::from_secs(300), 1);
-    let first = owned(store.begin("first"));
-    assert!(matches!(
-        store.begin("second"),
-        WebhookReservation::Unavailable
-    ));
-    assert!(store.rollback(&first));
-
-    let second = owned(store.begin("second"));
-    assert!(store.commit(&second));
-    let entries = store.entries.lock();
-    assert_eq!(entries.pending.len(), 0);
-    assert_eq!(entries.committed.len(), 1);
-    assert!(entries.committed.seen.contains_key(second.key()));
-}
-
-#[test]
-fn committed_key_expires_after_its_ttl() {
-    let store = ReservationStore::new(Duration::from_millis(1), 8);
-    let token = owned(store.begin("key"));
-    assert!(store.commit(&token));
-    assert!(store.entries.lock().committed.seen.contains_key("key"));
-
-    std::thread::sleep(Duration::from_millis(5));
-    owned(store.begin("key"));
-}
-
-#[test]
-fn committed_capacity_evicts_the_oldest_key() {
-    let store = ReservationStore::new(Duration::from_secs(300), 2);
-    for key in ["k1", "k2", "k3"] {
-        let token = owned(store.begin(key));
-        assert!(store.commit(&token));
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    owned(store.begin("k1"));
-    assert!(matches!(store.begin("k2"), WebhookReservation::Committed));
-    assert!(matches!(store.begin("k3"), WebhookReservation::Committed));
 }
 
 #[test]
@@ -162,21 +123,27 @@ fn dedup_key_separates_every_identity_component() {
     );
 }
 
+/// The ingress bounds in-flight deliveries by `gateway.idempotency_max_keys`,
+/// with zero selecting the default. The TTL floor is covered where
+/// `effective_idempotency_ttl` is defined.
 #[test]
-fn new_normalizes_zero_limits() {
-    let defaults = PluginWebhookIngress::new(0, 0);
+fn new_applies_the_configured_or_default_key_bound() {
+    fn in_flight_capacity(ingress: &PluginWebhookIngress) -> usize {
+        let idempotency = idempotency_bridge(&ingress.reservations, &owner("p", "a"), "fixture");
+        (0..)
+            .take_while(|n| {
+                matches!(
+                    idempotency.begin(&format!("m{n}")),
+                    WebhookReservation::Owner(_)
+                )
+            })
+            .count()
+    }
     assert_eq!(
-        defaults.reservations.entries.lock().committed.ttl,
-        Duration::from_secs(1)
+        in_flight_capacity(&PluginWebhookIngress::new(0, 0)),
+        IDEMPOTENCY_MAX_KEYS_DEFAULT
     );
-    assert_eq!(defaults.reservations.max_keys, IDEMPOTENCY_MAX_KEYS_DEFAULT);
-
-    let configured = PluginWebhookIngress::new(7, 3);
-    assert_eq!(
-        configured.reservations.entries.lock().committed.ttl,
-        Duration::from_secs(7)
-    );
-    assert_eq!(configured.reservations.max_keys, 3);
+    assert_eq!(in_flight_capacity(&PluginWebhookIngress::new(7, 3)), 3);
 }
 
 #[test]
