@@ -53,6 +53,11 @@ impl PluginWebhookIngress {
     /// Deliver `request` to the worker that owns its path and wait for the
     /// outcome, at most [`PLUGIN_WEBHOOK_DEADLINE`] after enqueue.
     ///
+    /// The ingress does not rate-limit. A transport applies the shared
+    /// webhook rate limit before calling, and refuses a body over its ceiling
+    /// before buffering it, as the gateway's HTTP adapter does;
+    /// [`PluginWebhookRequest::new`] then re-checks the request bounds.
+    ///
     /// Cancelling `cancel`, or dropping the returned future, cancels the
     /// worker's copy of the request.
     pub async fn dispatch(
