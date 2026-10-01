@@ -117,6 +117,7 @@ fn activation_config(plugins: &TempDir, alias: &str, retry_count: &str) -> Confi
         PluginChannelConfig {
             package: "channel-fixture".to_string(),
             enabled: true,
+            ..PluginChannelConfig::default()
         },
     );
     config.agents.insert(
@@ -370,6 +371,7 @@ async fn duplicate_guest_routes_reject_every_claimant_before_registry_mutation()
         PluginChannelConfig {
             package: "channel-fixture".to_string(),
             enabled: true,
+            ..PluginChannelConfig::default()
         },
     );
     config

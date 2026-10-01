@@ -266,6 +266,25 @@ including one that arrives through the relay, gets `FORBIDDEN` whatever its
 grants. Grants are checked when a request is admitted. A dispatch ends within
 the ingress deadline, so it is not rechecked while it runs.
 
+Each grant reaches only the channel instances the caller's permission profile
+names in `allowed_channels`, written `<type>.<alias>` (for example
+`plugin.support`), or every instance with the explicit `"*"` entry; `admin`
+reaches all of them. Config can also close the path for a channel or an agent
+whatever grants exist. A dispatch that meets any of these refusals is answered
+`FORBIDDEN` with an audit record, and nothing is queued or reserved. The check
+runs at dispatch, on the route owner the request would be queued to, so a
+route that changes owner meanwhile cannot redirect it.
+
+| Refusal | Config |
+|---|---|
+| The caller's profile does not name the route's channel instance | `[permission_profiles.<name>] allowed_channels` |
+| The channel instance refuses injected webhooks | `[channels.plugin.<alias>] accept_injected_webhooks = false` |
+| An agent that handles the channel refuses them | `[agents.<alias>] accept_injected_webhooks = false` |
+
+Both `accept_injected_webhooks` fields default to `true`. They govern only
+webhooks delivered through `plugin-webhook/dispatch`, which a standalone
+gateway also uses; webhooks through the daemon's own gateway are not affected.
+
 ```json
 {"jsonrpc":"2.0","method":"plugin-webhook/dispatch","params":{"request_id":"gw-1","path":"ops","method":"POST","query":"","headers":[{"name":"content-type","value":"application/json"}],"body_b64":"e30="},"id":3}
 {"jsonrpc":"2.0","result":{"outcome":"ack"},"id":3}
@@ -332,8 +351,9 @@ A `plugin-webhook/dispatch` sent as a notification, with no `id`, is dropped
 and logged with `error_key` `plugin_webhook_dispatch_notification`, because
 its outcome would have nowhere to go.
 
-`plugin-webhook/routes` returns the routes sorted by `path`, each with its
-`plugin` package and `channel_alias`, and a `generation` that counts the
+`plugin-webhook/routes` returns the routes of the channel instances the
+caller is granted, sorted by `path`, each with its `plugin` package and
+`channel_alias`, and a `generation` that counts the
 channel supervisor's route generations. `generation` starts over after a
 reload, so compare it only within one connection. The list is for
 diagnostics: a dispatch resolves its path when it arrives. When the daemon
@@ -358,10 +378,14 @@ explicitly stopped.
   audit logging; Windows logs `pipe:local` as the peer label
 - The `plugin-webhook/*` methods are refused with `FORBIDDEN` on WSS,
   including relayed connections, whatever the caller's grants
-- A local caller holding `channels:execute` can dispatch to any plugin's
-  route: the grant is not scoped by channel alias, and the gateway's
+- A local caller holding `channels:execute` can dispatch to the routes of
+  the channel instances its profile names in `allowed_channels`, unless the
+  instance or an agent handling it refuses injected webhooks. The gateway's
   per-client webhook rate limit does not apply. Plugins still verify each
   request's platform signature, and the core enforces the request bounds
+- `channels:read` lists the paths of those routes. Some vendors treat an
+  unguessable webhook path as the shared secret, so grant it only to callers
+  that may know those paths
 
 ## Quick test
 

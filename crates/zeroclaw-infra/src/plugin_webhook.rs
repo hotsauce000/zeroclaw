@@ -66,15 +66,37 @@ impl PluginWebhookIngress {
         request: PluginWebhookRequest,
         cancel: &WebhookCancellation,
     ) -> PluginWebhookOutcome {
+        match self
+            .dispatch_admitted(request, cancel, |_| Ok::<(), std::convert::Infallible>(()))
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(never) => match never {},
+        }
+    }
+
+    /// [`Self::dispatch`], with `admit` deciding whether the route's owner
+    /// may take this request. It runs once the path has resolved to a route
+    /// and before anything is queued or reserved, on the owner the request
+    /// would be queued to, so a route republished meanwhile cannot redirect an
+    /// admitted request to an owner `admit` never saw. A refusal returns
+    /// `admit`'s error and queues nothing.
+    pub async fn dispatch_admitted<E>(
+        &self,
+        request: PluginWebhookRequest,
+        cancel: &WebhookCancellation,
+        admit: impl FnOnce(&PluginWebhookOwner) -> Result<(), E>,
+    ) -> Result<PluginWebhookOutcome, E> {
         if cancel.is_cancelled() {
-            return PluginWebhookOutcome::Cancelled;
+            return Ok(PluginWebhookOutcome::Cancelled);
         }
         if !is_valid_plugin_webhook_path(request.path()) {
-            return PluginWebhookOutcome::NotFound;
+            return Ok(PluginWebhookOutcome::NotFound);
         }
         let Some(route) = self.registry.get(request.path()) else {
-            return PluginWebhookOutcome::NotFound;
+            return Ok(PluginWebhookOutcome::NotFound);
         };
+        admit(route.owner())?;
         let owner = route.owner().clone();
         let path = request.path().to_owned();
         let request_cancel = cancel.child_token();
@@ -87,7 +109,7 @@ impl PluginWebhookIngress {
         drop(route);
         match sent {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => return PluginWebhookOutcome::QueueFull,
+            Err(TrySendError::Full(_)) => return Ok(PluginWebhookOutcome::QueueFull),
             Err(TrySendError::Closed(_)) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -96,19 +118,19 @@ impl PluginWebhookIngress {
                         .with_attrs(route_attrs(&owner, &path, "plugin_webhook_route_closed")),
                     "Channel plugin webhook route stopped accepting requests"
                 );
-                return PluginWebhookOutcome::Unavailable;
+                return Ok(PluginWebhookOutcome::Unavailable);
             }
         }
 
         let received = tokio::select! {
             biased;
             received = answer => received,
-            () = cancel.cancelled() => return PluginWebhookOutcome::Cancelled,
+            () = cancel.cancelled() => return Ok(PluginWebhookOutcome::Cancelled),
             () = tokio::time::sleep(PLUGIN_WEBHOOK_DEADLINE) => {
-                return PluginWebhookOutcome::Timeout;
+                return Ok(PluginWebhookOutcome::Timeout);
             }
         };
-        worker_outcome(received, cancel, &owner, &path)
+        Ok(worker_outcome(received, cancel, &owner, &path))
     }
 }
 

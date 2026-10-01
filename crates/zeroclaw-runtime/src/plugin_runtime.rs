@@ -1044,6 +1044,7 @@ mod tests {
                 PluginChannelConfig {
                     package: "alpha".to_string(),
                     enabled: true,
+                    ..PluginChannelConfig::default()
                 },
             ),
             (
@@ -1051,6 +1052,7 @@ mod tests {
                 PluginChannelConfig {
                     package: "alpha".to_string(),
                     enabled: true,
+                    ..PluginChannelConfig::default()
                 },
             ),
         ]);
@@ -1232,6 +1234,7 @@ mod tests {
             PluginChannelConfig {
                 package: "real".to_string(),
                 enabled: true,
+                ..PluginChannelConfig::default()
             },
         )]);
         config.agents = HashMap::from([(
@@ -1393,6 +1396,7 @@ mod tests {
             PluginChannelConfig {
                 package: "not-installed".to_string(),
                 enabled: true,
+                ..PluginChannelConfig::default()
             },
         );
         // `zeta` is installed but declares only the tool capability.
@@ -1401,6 +1405,7 @@ mod tests {
             PluginChannelConfig {
                 package: "zeta".to_string(),
                 enabled: true,
+                ..PluginChannelConfig::default()
             },
         );
         let agent = config.agents.get_mut("operator").unwrap();

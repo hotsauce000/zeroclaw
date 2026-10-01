@@ -2784,7 +2784,11 @@ impl RpcDispatcher {
     pub(crate) async fn shutdown(&mut self) {
         self.connection_cancel.cancel();
         join_in_place(&mut self.prompt_tasks, Self::log_prompt_task_failure).await;
-        join_in_place(&mut self.plugin_webhook_tasks, |_| {}).await;
+        join_in_place(
+            &mut self.plugin_webhook_tasks,
+            Self::log_plugin_webhook_task_failure,
+        )
+        .await;
     }
 
     async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
@@ -2986,6 +2990,23 @@ impl RpcDispatcher {
                     .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 &format!("RPC session/prompt task failed: {error}")
+            );
+        }
+    }
+
+    /// A dispatch task that failed left its caller without a response, so
+    /// leave a record of it.
+    fn log_plugin_webhook_task_failure(result: Result<(), tokio::task::JoinError>) {
+        if let Err(error) = result {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "method": Method::PluginWebhookDispatch.wire_name(),
+                        "error_key": "plugin_webhook_dispatch_task_failed",
+                    })),
+                &format!("RPC plugin-webhook/dispatch task failed: {error}")
             );
         }
     }
@@ -3870,13 +3891,17 @@ impl RpcDispatcher {
         let id = id.clone();
         self.plugin_webhook_tasks.retain(|task| !task.is_finished());
         let task = zeroclaw_spawn::spawn!(async move {
-            let outcome = ingress.dispatch(request, &cancel).await;
+            let decided = ingress
+                .dispatch_admitted(request, &cancel, |owner| handle.admit_plugin_webhook(owner))
+                .await;
             // Release the id before answering: the caller may reuse it as soon
             // as it has read this response.
             drop(entry);
             let connection = handle.connection_cancel.clone();
             let respond = async {
-                match to_result(PluginWebhookDispatchResult::from(outcome)) {
+                match decided
+                    .and_then(|outcome| to_result(PluginWebhookDispatchResult::from(outcome)))
+                {
                     Ok(result) => handle.send_result(id, result).await,
                     Err(error) => handle.send_error(id, error.code, &error.message).await,
                 }
@@ -3914,6 +3939,69 @@ impl RpcDispatcher {
         })
     }
 
+    /// Decide, on the owner the ingress is about to queue to, whether this
+    /// connection may deliver there. The caller's channel selector must name
+    /// the owning channel instance, and neither that instance nor an agent
+    /// that handles it may refuse injected webhooks
+    /// (`accept_injected_webhooks = false`), whatever the caller's grants. A
+    /// refusal is audited and answered FORBIDDEN.
+    fn admit_plugin_webhook(
+        &self,
+        owner: &zeroclaw_api::webhook::PluginWebhookOwner,
+    ) -> Result<(), JsonRpcError> {
+        let channel = plugin_webhook_channel(owner);
+        let refusal = if self
+            .auth
+            .as_ref()
+            .is_some_and(|auth| !auth.grants.may_use_channel(&channel))
+        {
+            Some(crate::i18n::get_required_cli_string_with_args(
+                "rpc-plugin-webhook-channel-not-granted",
+                &[("channel", &channel)],
+            ))
+        } else {
+            let config = self.ctx.config.read();
+            if config
+                .channels
+                .plugin
+                .get(owner.channel_alias())
+                .is_some_and(|instance| !instance.accept_injected_webhooks)
+            {
+                Some(crate::i18n::get_required_cli_string_with_args(
+                    "rpc-plugin-webhook-channel-refuses",
+                    &[("channel", &channel)],
+                ))
+            } else {
+                config
+                    .agents
+                    .iter()
+                    .filter(|(_, agent)| {
+                        !agent.accept_injected_webhooks
+                            && agent
+                                .channels
+                                .iter()
+                                .any(|handled| handled.trim() == channel)
+                    })
+                    .map(|(alias, _)| alias)
+                    .min()
+                    .map(|agent| {
+                        crate::i18n::get_required_cli_string_with_args(
+                            "rpc-plugin-webhook-agent-refuses",
+                            &[("agent", agent), ("channel", &channel)],
+                        )
+                    })
+            }
+        };
+        match refusal {
+            None => Ok(()),
+            Some(message) => {
+                let denied = crate::rpc::auth::AuthDenied::forbidden(message);
+                self.audit_auth_denial(Method::PluginWebhookDispatch, &denied);
+                Err(rpc_err(denied.code, denied.message))
+            }
+        }
+    }
+
     fn handle_plugin_webhook_routes(&self) -> RpcResult {
         self.require_local_ipc(Method::PluginWebhookRoutes)?;
         let Some(ingress) = self.ctx.plugin_webhooks.as_ref() else {
@@ -3923,11 +4011,18 @@ impl RpcDispatcher {
             });
         };
         let listed = ingress.routes();
+        // A caller sees only the routes of channel instances it may reach.
+        let granted = |owner: &zeroclaw_api::webhook::PluginWebhookOwner| {
+            self.auth
+                .as_ref()
+                .is_none_or(|auth| auth.grants.may_use_channel(&plugin_webhook_channel(owner)))
+        };
         to_result(PluginWebhookRoutesResult {
             generation: listed.generation(),
             routes: listed
                 .routes()
                 .iter()
+                .filter(|(_, owner)| granted(owner))
                 .map(|(path, owner)| PluginWebhookRouteInfo {
                     path: path.clone(),
                     plugin: owner.plugin().to_owned(),
@@ -12087,6 +12182,12 @@ fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> 
     serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
 }
 
+/// The channel instance a plugin webhook route belongs to, in the
+/// `<type>.<alias>` form that channel selectors and agent `channels` use.
+fn plugin_webhook_channel(owner: &zeroclaw_api::webhook::PluginWebhookOwner) -> String {
+    format!("plugin.{}", owner.channel_alias())
+}
+
 fn require_plugin_webhook_request_id(request_id: &str) -> Result<(), JsonRpcError> {
     if is_valid_plugin_webhook_request_id(request_id) {
         Ok(())
@@ -14882,13 +14983,30 @@ mod tests {
             assert!(routes.seen.try_recv().is_err());
         }
 
-        fn channel_grant_config(verb: zeroclaw_api::grants::Verb) -> Config {
-            let mut config = roster_config(4242);
+        /// Declare plugin channel instances under `aliases`, so a profile may
+        /// name them in `allowed_channels`.
+        fn with_plugin_channels(mut config: Config, aliases: &[&str]) -> Config {
+            for alias in aliases {
+                config.channels.plugin.insert(
+                    (*alias).to_string(),
+                    zeroclaw_config::schema::PluginChannelConfig {
+                        package: "fixture-plugin".into(),
+                        ..zeroclaw_config::schema::PluginChannelConfig::default()
+                    },
+                );
+            }
             config
+        }
+
+        fn channel_grant_config(verb: zeroclaw_api::grants::Verb) -> Config {
+            let mut config = with_plugin_channels(roster_config(4242), &["fixture-alias"]);
+            let profile = config
                 .permission_profiles
                 .get_mut("reader")
-                .expect("the roster profile exists")
-                .grants = HashMap::from([(zeroclaw_api::grants::Resource::Channels, vec![verb])]);
+                .expect("the roster profile exists");
+            profile.grants =
+                HashMap::from([(zeroclaw_api::grants::Resource::Channels, vec![verb])]);
+            profile.allowed_channels = vec!["plugin.fixture-alias".into()];
             config
         }
 
@@ -14957,6 +15075,191 @@ mod tests {
                 5,
                 DISPATCH,
                 params("exec-1", "fixture"),
+            )
+            .await;
+            assert_eq!(response["result"], json!({"outcome": "ack"}), "{response}");
+            assert_eq!(next_seen(&mut routes).await.path, "fixture");
+        }
+
+        /// A `channels` grant reaches only the channel instances the profile
+        /// names: a dispatch to another channel's route is refused and
+        /// audited before anything is queued, and the route listing leaves
+        /// that route out.
+        #[tokio::test]
+        async fn plugin_webhook_dispatch_reaches_only_granted_channels() {
+            use zeroclaw_api::grants::{Resource, Verb};
+            let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+            let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+            zeroclaw_log::try_install_capture_subscriber();
+            let mut records = zeroclaw_log::subscribe_or_install();
+            while records.try_recv().is_ok() {}
+
+            let ingress = test_ingress();
+            let (_, plugin, _, depth, worker) = ack_route();
+            let mut routes = publish(
+                &ingress,
+                &[ack_route(), ("other", plugin, "other-alias", depth, worker)],
+            );
+            let mut config =
+                with_plugin_channels(roster_config(4242), &["fixture-alias", "other-alias"]);
+            let profile = config
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the roster profile exists");
+            profile.grants = HashMap::from([(Resource::Channels, vec![Verb::Execute, Verb::Read])]);
+            profile.allowed_channels = vec!["plugin.fixture-alias".into()];
+            let (mut caller, mut rx) = roster_connection(config, Arc::clone(&ingress)).await;
+            let principal_id = caller
+                .auth
+                .as_ref()
+                .expect("the roster uid is bound")
+                .principal
+                .id
+                .as_str()
+                .to_owned();
+
+            let response = call(
+                &mut caller,
+                &mut rx,
+                1,
+                DISPATCH,
+                params("granted-1", "fixture"),
+            )
+            .await;
+            assert_eq!(response["result"], json!({"outcome": "ack"}), "{response}");
+            assert_eq!(next_seen(&mut routes).await.path, "fixture");
+
+            let response = call(
+                &mut caller,
+                &mut rx,
+                2,
+                DISPATCH,
+                params("other-1", "other"),
+            )
+            .await;
+            assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{response}");
+            let message = response["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains("plugin.other-alias"), "{message}");
+            // Other tests share the log stream and this roster principal, so
+            // pick this refusal's record by its reason too.
+            let audited: Vec<Value> = std::iter::from_fn(|| records.try_recv().ok())
+                .filter(|record| {
+                    record["message"] == "RPC authorization denied"
+                        && record["attributes"]["method"] == DISPATCH
+                        && record["attributes"]["principal_id"] == principal_id
+                        && record["attributes"]["reason"] == message
+                })
+                .collect();
+            let [record] = audited.as_slice() else {
+                panic!("expected one denial record, got {audited:#?}");
+            };
+            assert_eq!(record["severity_text"], "WARN", "{record:#?}");
+            assert_eq!(record["attributes"]["code"], FORBIDDEN, "{record:#?}");
+
+            let response = call(&mut caller, &mut rx, 3, ROUTES, json!({})).await;
+            let listed: Vec<Value> = response["result"]["routes"]
+                .as_array()
+                .expect("a route listing")
+                .iter()
+                .map(|route| route["path"].clone())
+                .collect();
+            assert_eq!(listed, [json!("fixture")], "{response}");
+
+            zeroclaw_log::clear_broadcast_hook();
+            assert!(
+                routes.seen.try_recv().is_err(),
+                "a refused dispatch reaches no worker"
+            );
+        }
+
+        /// Config can close the path whatever the caller's grants: a channel
+        /// instance that refuses injected webhooks, or an agent handling it
+        /// that refuses them, turns the dispatch away before anything is
+        /// queued.
+        #[tokio::test]
+        async fn plugin_webhook_dispatch_honors_channel_and_agent_refusal() {
+            use zeroclaw_config::schema::{AliasedAgentConfig, PluginChannelConfig};
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[ack_route()]);
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 8);
+            let instance = |accept_injected_webhooks: bool| PluginChannelConfig {
+                package: "fixture-plugin".into(),
+                accept_injected_webhooks,
+                ..PluginChannelConfig::default()
+            };
+
+            dispatcher
+                .ctx
+                .config
+                .write()
+                .channels
+                .plugin
+                .insert("fixture-alias".into(), instance(false));
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                1,
+                DISPATCH,
+                params("refused-1", "fixture"),
+            )
+            .await;
+            assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{response}");
+            let message = response["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("plugin.fixture-alias") && message.contains("refuses webhooks"),
+                "{message}"
+            );
+
+            {
+                let mut config = dispatcher.ctx.config.write();
+                config
+                    .channels
+                    .plugin
+                    .insert("fixture-alias".into(), instance(true));
+                config.agents.insert(
+                    "ops".into(),
+                    AliasedAgentConfig {
+                        channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                            "plugin.fixture-alias",
+                        )],
+                        accept_injected_webhooks: false,
+                        ..AliasedAgentConfig::default()
+                    },
+                );
+            }
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                2,
+                DISPATCH,
+                params("refused-2", "fixture"),
+            )
+            .await;
+            assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{response}");
+            let message = response["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("Agent ops") && message.contains("refuses turns"),
+                "{message}"
+            );
+            assert!(
+                routes.seen.try_recv().is_err(),
+                "a refused dispatch reaches no worker"
+            );
+
+            dispatcher
+                .ctx
+                .config
+                .write()
+                .agents
+                .get_mut("ops")
+                .expect("the agent was added")
+                .accept_injected_webhooks = true;
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                3,
+                DISPATCH,
+                params("accepted-1", "fixture"),
             )
             .await;
             assert_eq!(response["result"], json!({"outcome": "ack"}), "{response}");

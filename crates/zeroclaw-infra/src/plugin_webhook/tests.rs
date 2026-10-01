@@ -169,6 +169,41 @@ fn routes_delegates_to_the_registry() {
     );
 }
 
+/// Admission sees the owner the request would be queued to, and a refusal
+/// queues and reserves nothing. A path no route owns is decided before
+/// admission is consulted.
+#[tokio::test]
+async fn a_refused_admission_queues_nothing_and_sees_the_resolved_owner() {
+    let ingress = test_ingress();
+    let (_lease, mut receivers) = publish(&ingress, &[("fixture", owner("p", "a"), 1)]);
+    let mut seen = None;
+    let refused = ingress
+        .dispatch_admitted(
+            post("fixture", b"body"),
+            &WebhookCancellation::new(),
+            |owner| {
+                seen = Some(owner.clone());
+                Err("refused")
+            },
+        )
+        .await;
+    assert_eq!(refused, Err("refused"));
+    assert_eq!(seen, Some(owner("p", "a")));
+    assert!(
+        receivers[0].try_recv().is_err(),
+        "a refused request is never queued"
+    );
+
+    let unknown = ingress
+        .dispatch_admitted(
+            post("missing", b"body"),
+            &WebhookCancellation::new(),
+            |_| -> Result<(), &str> { panic!("admission runs only for a resolved route") },
+        )
+        .await;
+    assert_eq!(unknown, Ok(PluginWebhookOutcome::NotFound));
+}
+
 #[tokio::test]
 async fn dispatch_forwards_the_exact_request_to_the_route_worker() {
     let ingress = test_ingress();
