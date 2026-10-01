@@ -4054,6 +4054,28 @@ capabilities = ["tool"]
         );
     }
 
+    /// A lock file this user cannot write, such as one another user created in
+    /// a shared plugins directory, still coordinates install and remove.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_this_user_cannot_write_still_coordinates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let plugins = tempdir().unwrap();
+        let lock = plugins.path().join(".zeroclaw-package-lock-v1");
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let source = tempdir().unwrap();
+        write_tool_source(source.path(), "shared", b"\0asm shared");
+        assert_eq!(
+            host.install(source.path().to_str().unwrap()).unwrap(),
+            "shared"
+        );
+        host.remove("shared").unwrap();
+        assert_eq!(dir_entries(plugins.path()), [".zeroclaw-package-lock-v1"]);
+    }
+
     /// Run `admit` on its own thread, and fail rather than hang if it blocks.
     #[cfg(unix)]
     fn without_blocking<T: Send + 'static>(admit: impl FnOnce() -> T + Send + 'static) -> T {

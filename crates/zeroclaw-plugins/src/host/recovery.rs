@@ -92,8 +92,26 @@ impl Root {
                             "package lock is not a regular file".into(),
                         ));
                     }
-                    self.dir
-                        .open_with(LOCK, OpenOptions::new().read(true).write(true))?
+                    // An exclusive lock over NFS needs a descriptor open for
+                    // writing. A lock file this user cannot write, such as one
+                    // another user created, is opened for reading only, which
+                    // a local filesystem locks just as well.
+                    match self
+                        .dir
+                        .open_with(LOCK, OpenOptions::new().read(true).write(true))
+                    {
+                        Ok(file) => file,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::PermissionDenied
+                                    | std::io::ErrorKind::ReadOnlyFilesystem
+                            ) =>
+                        {
+                            self.dir.open_with(LOCK, OpenOptions::new().read(true))?
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -373,6 +391,23 @@ fn pin_ancestors(path: &Path) -> Result<Vec<Dir>, PluginError> {
         return Err(PluginError::NamespaceChanged(path.display().to_string()));
     }
     Ok(held)
+}
+
+#[cfg(all(test, unix))]
+mod lock_descriptor_tests {
+    use super::*;
+
+    /// An existing lock file this user can write is held through a writable
+    /// descriptor, which an exclusive lock over NFS needs.
+    #[test]
+    fn a_writable_lock_file_is_locked_through_a_writable_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(LOCK), b"").unwrap();
+        let root = Root::open(temp.path()).unwrap();
+        let _guard = root.lock().unwrap();
+        let flags = rustix::fs::fcntl_getfl(root.lock.get().unwrap()).unwrap();
+        assert!(flags.contains(rustix::fs::OFlags::RDWR), "{flags:?}");
+    }
 }
 
 #[cfg(all(test, unix))]
