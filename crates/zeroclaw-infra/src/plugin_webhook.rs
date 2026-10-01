@@ -5,28 +5,22 @@
 //! and message dedup. Transports adapt their requests to
 //! [`PluginWebhookIngress::dispatch`] and map its outcome.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::oneshot;
 use zeroclaw_api::webhook::{
     MAX_WEBHOOK_RESPONSE_BODY_BYTES, PLUGIN_WEBHOOK_DEADLINE, PluginWebhookOutcome,
     PluginWebhookOwner, PluginWebhookRegistry, PluginWebhookRequest, PluginWebhookRoutes,
-    WebhookCancellation, WebhookIdempotency, WebhookOutcome, WebhookReject, WebhookReservation,
-    WebhookReservationStatus, WebhookReservationToken, WebhookReservationWaiter,
-    is_valid_plugin_webhook_path,
+    WebhookCancellation, WebhookIdempotency, WebhookOutcome, WebhookReject,
+    WebhookReservationStore, is_valid_plugin_webhook_path,
 };
-
-use crate::CommittedKeys;
 
 /// Route admission, the request deadline, and message dedup for one daemon
 /// generation.
 pub struct PluginWebhookIngress {
     registry: Arc<PluginWebhookRegistry>,
-    reservations: Arc<ReservationStore>,
+    reservations: Arc<WebhookReservationStore>,
 }
 
 impl PluginWebhookIngress {
@@ -37,7 +31,7 @@ impl PluginWebhookIngress {
     pub fn new(dedup_ttl_secs: u64, dedup_max_keys: usize) -> Self {
         Self {
             registry: Arc::new(PluginWebhookRegistry::new()),
-            reservations: Arc::new(ReservationStore::new(
+            reservations: Arc::new(WebhookReservationStore::new(
                 crate::effective_idempotency_ttl(dedup_ttl_secs),
                 crate::normalize_max_keys(dedup_max_keys, crate::IDEMPOTENCY_MAX_KEYS_DEFAULT),
             )),
@@ -60,6 +54,11 @@ impl PluginWebhookIngress {
     /// Deliver `request` to the worker that owns its path and wait for the
     /// outcome, at most [`PLUGIN_WEBHOOK_DEADLINE`] after enqueue.
     ///
+    /// The ingress does not rate-limit. A transport applies the shared
+    /// webhook rate limit before calling, and refuses a body over its ceiling
+    /// before buffering it, as the gateway's HTTP adapter does;
+    /// [`PluginWebhookRequest::new`] then re-checks the request bounds.
+    ///
     /// Cancelling `cancel`, or dropping the returned future, cancels the
     /// worker's copy of the request.
     pub async fn dispatch(
@@ -67,15 +66,37 @@ impl PluginWebhookIngress {
         request: PluginWebhookRequest,
         cancel: &WebhookCancellation,
     ) -> PluginWebhookOutcome {
+        match self
+            .dispatch_admitted(request, cancel, |_| Ok::<(), std::convert::Infallible>(()))
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(never) => match never {},
+        }
+    }
+
+    /// [`Self::dispatch`], with `admit` deciding whether the route's owner
+    /// may take this request. It runs once the path has resolved to a route
+    /// and before anything is queued or reserved, on the owner the request
+    /// would be queued to, so a route republished meanwhile cannot redirect an
+    /// admitted request to an owner `admit` never saw. A refusal returns
+    /// `admit`'s error and queues nothing.
+    pub async fn dispatch_admitted<E>(
+        &self,
+        request: PluginWebhookRequest,
+        cancel: &WebhookCancellation,
+        admit: impl FnOnce(&PluginWebhookOwner) -> Result<(), E>,
+    ) -> Result<PluginWebhookOutcome, E> {
         if cancel.is_cancelled() {
-            return PluginWebhookOutcome::Cancelled;
+            return Ok(PluginWebhookOutcome::Cancelled);
         }
         if !is_valid_plugin_webhook_path(request.path()) {
-            return PluginWebhookOutcome::NotFound;
+            return Ok(PluginWebhookOutcome::NotFound);
         }
         let Some(route) = self.registry.get(request.path()) else {
-            return PluginWebhookOutcome::NotFound;
+            return Ok(PluginWebhookOutcome::NotFound);
         };
+        admit(route.owner())?;
         let owner = route.owner().clone();
         let path = request.path().to_owned();
         let request_cancel = cancel.child_token();
@@ -88,7 +109,7 @@ impl PluginWebhookIngress {
         drop(route);
         match sent {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => return PluginWebhookOutcome::QueueFull,
+            Err(TrySendError::Full(_)) => return Ok(PluginWebhookOutcome::QueueFull),
             Err(TrySendError::Closed(_)) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -97,19 +118,19 @@ impl PluginWebhookIngress {
                         .with_attrs(route_attrs(&owner, &path, "plugin_webhook_route_closed")),
                     "Channel plugin webhook route stopped accepting requests"
                 );
-                return PluginWebhookOutcome::Unavailable;
+                return Ok(PluginWebhookOutcome::Unavailable);
             }
         }
 
         let received = tokio::select! {
             biased;
             received = answer => received,
-            () = cancel.cancelled() => return PluginWebhookOutcome::Cancelled,
+            () = cancel.cancelled() => return Ok(PluginWebhookOutcome::Cancelled),
             () = tokio::time::sleep(PLUGIN_WEBHOOK_DEADLINE) => {
-                return PluginWebhookOutcome::Timeout;
+                return Ok(PluginWebhookOutcome::Timeout);
             }
         };
-        worker_outcome(received, cancel, &owner, &path)
+        Ok(worker_outcome(received, cancel, &owner, &path))
     }
 }
 
@@ -207,7 +228,7 @@ fn dedup_key(owner: &PluginWebhookOwner, path: &str, message_id: &str) -> String
 }
 
 fn idempotency_bridge(
-    store: &Arc<ReservationStore>,
+    store: &Arc<WebhookReservationStore>,
     owner: &PluginWebhookOwner,
     path: &str,
 ) -> WebhookIdempotency {
@@ -221,108 +242,6 @@ fn idempotency_bridge(
         move |token| commit.commit(token),
         move |token| rollback.rollback(token),
     )
-}
-
-/// Delivered message keys, and the in-flight owners of undelivered ones.
-///
-/// Pending and committed keys are bounded separately by `max_keys`. A full
-/// pending set refuses new owners; a full committed set evicts its oldest key.
-#[derive(Debug)]
-struct ReservationStore {
-    max_keys: usize,
-    entries: Mutex<ReservationEntries>,
-}
-
-#[derive(Debug)]
-struct ReservationEntries {
-    next_generation: u64,
-    committed: CommittedKeys,
-    pending: HashMap<String, PendingReservation>,
-}
-
-#[derive(Debug)]
-struct PendingReservation {
-    generation: u64,
-    status: watch::Sender<WebhookReservationStatus>,
-}
-
-impl ReservationStore {
-    fn new(ttl: Duration, max_keys: usize) -> Self {
-        let max_keys = max_keys.max(1);
-        Self {
-            max_keys,
-            entries: Mutex::new(ReservationEntries {
-                next_generation: 0,
-                committed: CommittedKeys::new(ttl, max_keys),
-                pending: HashMap::new(),
-            }),
-        }
-    }
-
-    fn begin(&self, key: &str) -> WebhookReservation {
-        let now = Instant::now();
-        let mut entries = self.entries.lock();
-        if entries.committed.contains(key, now) {
-            return WebhookReservation::Committed;
-        }
-        if let Some(pending) = entries.pending.get(key) {
-            return WebhookReservation::InFlight(WebhookReservationWaiter::new(
-                pending.status.subscribe(),
-            ));
-        }
-        if entries.pending.len() >= self.max_keys {
-            return WebhookReservation::Unavailable;
-        }
-
-        entries.next_generation = entries.next_generation.wrapping_add(1);
-        let generation = entries.next_generation;
-        let (status, _) = watch::channel(WebhookReservationStatus::InFlight);
-        entries
-            .pending
-            .insert(key.to_owned(), PendingReservation { generation, status });
-        WebhookReservation::Owner(WebhookReservationToken::new(key.to_owned(), generation))
-    }
-
-    fn commit(&self, token: &WebhookReservationToken) -> bool {
-        let mut entries = self.entries.lock();
-        let Some(pending) = take_owned(&mut entries, token) else {
-            return false;
-        };
-        pending
-            .status
-            .send_replace(WebhookReservationStatus::Committed);
-        entries
-            .committed
-            .insert(token.key().to_owned(), Instant::now());
-        true
-    }
-
-    fn rollback(&self, token: &WebhookReservationToken) -> bool {
-        let mut entries = self.entries.lock();
-        let Some(pending) = take_owned(&mut entries, token) else {
-            return false;
-        };
-        pending
-            .status
-            .send_replace(WebhookReservationStatus::RolledBack);
-        true
-    }
-}
-
-/// Remove the pending reservation only while `token` still owns its
-/// generation.
-fn take_owned(
-    entries: &mut ReservationEntries,
-    token: &WebhookReservationToken,
-) -> Option<PendingReservation> {
-    if entries
-        .pending
-        .get(token.key())
-        .is_none_or(|pending| pending.generation != token.generation())
-    {
-        return None;
-    }
-    entries.pending.remove(token.key())
 }
 
 #[cfg(test)]

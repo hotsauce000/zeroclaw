@@ -372,28 +372,27 @@ impl GatewayRateLimiter {
     }
 }
 
-/// Replay store behind `X-Idempotency-Key` on `/webhook` and `/sop/*`.
+/// Request keys the generic `/webhook` and `/sop/*` routes have admitted.
+///
+/// One store per gateway run, with a committed-key budget of its own
+/// (`[gateway] idempotency_max_keys`). Plugin webhook deliveries deduplicate
+/// in the core ingress's store instead, so the two kinds no longer evict each
+/// other's keys.
 #[derive(Debug)]
 pub struct IdempotencyStore {
-    committed: Mutex<zeroclaw_infra::CommittedKeys>,
+    store: zeroclaw_api::webhook::WebhookReservationStore,
 }
 
 impl IdempotencyStore {
     pub fn new(ttl: Duration, max_keys: usize) -> Self {
         Self {
-            committed: Mutex::new(zeroclaw_infra::CommittedKeys::new(ttl, max_keys)),
+            store: zeroclaw_api::webhook::WebhookReservationStore::new(ttl, max_keys),
         }
     }
 
     /// Returns true if this key is new and is now recorded.
     fn record_if_new(&self, key: &str) -> bool {
-        let now = Instant::now();
-        let mut committed = self.committed.lock();
-        if committed.contains(key, now) {
-            return false;
-        }
-        committed.insert(key.to_owned(), now);
-        true
+        self.store.record_if_new(key)
     }
 }
 
@@ -7439,12 +7438,10 @@ path = "{trigger_path}"
         std::thread::sleep(Duration::from_millis(2));
         assert!(store.record_if_new("k3"));
 
-        let mut committed = store.committed.lock();
-        let now = Instant::now();
-        assert_eq!(committed.len(), 2);
-        assert!(!committed.contains("k1", now));
-        assert!(committed.contains("k2", now));
-        assert!(committed.contains("k3", now));
+        assert_eq!(store.store.committed_len(), 2);
+        assert!(!store.record_if_new("k3"), "k3 is still held");
+        assert!(!store.record_if_new("k2"), "k2 is still held");
+        assert!(store.record_if_new("k1"), "k1 was evicted");
     }
 
     #[test]
@@ -11906,11 +11903,9 @@ data: [DONE]\n\n";
         std::thread::sleep(Duration::from_millis(2));
         assert!(store.record_if_new("new-key"));
 
-        let mut committed = store.committed.lock();
-        let now = Instant::now();
-        assert_eq!(committed.len(), 1);
-        assert!(!committed.contains("old-key", now));
-        assert!(committed.contains("new-key", now));
+        assert_eq!(store.store.committed_len(), 1);
+        assert!(!store.record_if_new("new-key"), "the newest key is kept");
+        assert!(store.record_if_new("old-key"), "the oldest key was evicted");
     }
 
     #[test]
@@ -12038,8 +12033,10 @@ data: [DONE]\n\n";
             handle.join().unwrap();
         }
 
-        let committed = store.committed.lock();
-        assert!(committed.len() <= 1000, "should respect max_keys");
+        assert!(
+            store.store.committed_len() <= 1000,
+            "should respect max_keys"
+        );
     }
 
     #[test]

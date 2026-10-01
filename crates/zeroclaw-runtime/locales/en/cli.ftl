@@ -1408,6 +1408,10 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+# ── Peer-agent delivery ──
+peer-delivery-control-plane-unavailable = in-process peer delivery requires an available durable task store: {$error}
+peer-delivery-registration-failed = peer delivery rejected: {$error}
+peer-delivery-accepted = accepted for in-process delivery to peer agent "{$recipient}" (task_id={$task_id})
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
 
 # ── RPC inbound authentication ──
@@ -1425,6 +1429,9 @@ rpc-auth-first-call-initialize = First call must be 'initialize'
 rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
 rpc-plugin-webhook-local-ipc-only = { $method } is served only on the local IPC endpoint
+rpc-plugin-webhook-channel-not-granted = Principal is not granted channel { $channel } (required by plugin-webhook/dispatch)
+rpc-plugin-webhook-channel-refuses = Channel { $channel } refuses webhooks delivered over the RPC socket (accept_injected_webhooks = false)
+rpc-plugin-webhook-agent-refuses = Agent { $agent } refuses turns from webhooks delivered over the RPC socket (accept_injected_webhooks = false), so channel { $channel } cannot take them
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
 

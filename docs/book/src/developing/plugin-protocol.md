@@ -502,11 +502,14 @@ The unauthenticated edge remains host-governed:
 - Non-empty guest message IDs are deduplicated by the core ingress, keyed by
   the owning plugin package, channel alias, route path, and message ID. The
   store lives for one daemon generation: it survives gateway restarts and
-  starts empty after a reload or restart. Delivery is at most once per owner,
-  path, and message ID within a generation and the
-  `gateway.idempotency_ttl_secs` window; a retry after a reload can be
-  delivered again. Its capacity is `gateway.idempotency_max_keys`, separate
-  from the `/webhook` and `/sop/*` replay store. An in-flight duplicate waits
+  starts empty after a reload or restart. Duplicate suppression is best
+  effort: a repeated message ID is not delivered again while its key is held,
+  which is for `gateway.idempotency_ttl_secs` or until
+  `gateway.idempotency_max_keys` newer message IDs across all plugin routes
+  displace it, and never past a reload. This collapses platform retries. It is
+  not replay protection, which stays with the guest's signature and timestamp
+  checks. The capacity is separate from the `/webhook` and `/sop/*` replay
+  store. An in-flight duplicate waits
   for the owning delivery to commit or roll back; generation-scoped ownership
   tokens prevent a stale owner from erasing a replacement reservation. Failed
   or cancelled delivery rolls back, so a provider retry can become the new

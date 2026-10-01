@@ -59,10 +59,13 @@ After guest authentication, the host applies the live peer group for
 service, not the gateway, deduplicates stable message IDs. Reservations are
 keyed by the owning plugin instance (package and alias), route path, and
 message ID, and last for one daemon generation, so a gateway restart keeps them
-and a reload clears them. An in-flight duplicate waits for commit or rollback
-instead of being acknowledged prematurely. Capacity is
-`gateway.idempotency_max_keys`, separate from the `/webhook` and `/sop/*`
-replay store.
+and a reload clears them. Suppression is best effort: a key is held for
+`gateway.idempotency_ttl_secs` or until `gateway.idempotency_max_keys` newer
+message IDs across all plugin routes displace it. It collapses platform
+retries and is not replay protection, which stays with the plugin's signature
+and timestamp checks. An in-flight duplicate waits for commit or rollback
+instead of being acknowledged prematurely. The capacity is separate from the
+`/webhook` and `/sop/*` replay store.
 
 ### Standalone gateway
 

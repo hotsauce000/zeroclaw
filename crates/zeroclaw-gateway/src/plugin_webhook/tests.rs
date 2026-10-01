@@ -587,6 +587,69 @@ async fn plugin_webhook_dedup_state_outlives_a_gateway_router() {
     }
 }
 
+/// Plugin deliveries and the generic `/webhook` and `/sop/*` routes keep
+/// separate committed-key budgets. With room for one key in each store, a
+/// plugin commit does not evict a generic key, and generic records do not
+/// evict a committed plugin delivery. The stores are the ones a gateway run
+/// uses: the core ingress's and the run's `IdempotencyStore`.
+#[tokio::test]
+async fn plugin_and_generic_webhook_keys_have_separate_budgets() {
+    use zeroclaw_api::webhook::WebhookReservation;
+
+    let ingress = Arc::new(PluginWebhookIngress::new(300, 1));
+    let lease = ingress.registry().start_generation();
+    let (sink, mut receiver) = tokio::sync::mpsc::channel(2);
+    assert!(lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(sink)
+    )])));
+    let (reports, mut reported) = tokio::sync::mpsc::unbounded_channel();
+    zeroclaw_spawn::spawn!(async move {
+        while let Some(request) = receiver.recv().await {
+            let report = match &request.idempotency {
+                Some(idempotency) => match idempotency.begin("stable-id") {
+                    WebhookReservation::Owner(token) if idempotency.commit(&token) => "owner",
+                    WebhookReservation::Committed => "committed",
+                    _ => "unexpected reservation",
+                },
+                None => "no idempotency bridge",
+            };
+            let _ = reports.send(report);
+            let _ = request.reply.send(Ok(WebhookOutcome::Ack));
+        }
+    });
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let deliver = |ingress: Arc<PluginWebhookIngress>| {
+        plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), ingress).oneshot(
+            plugin_webhook_request(
+                "fixture",
+                "{}",
+                SocketAddr::from(([127, 0, 0, 1], 31001)),
+                None,
+            ),
+        )
+    };
+    let generic = crate::IdempotencyStore::new(Duration::from_secs(300), 1);
+
+    assert!(generic.record_if_new("generic"));
+    let response = deliver(Arc::clone(&ingress)).await.expect("route responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(reported.recv().await, Some("owner"));
+    assert!(
+        !generic.record_if_new("generic"),
+        "a plugin commit must not evict a generic key"
+    );
+
+    assert!(generic.record_if_new("generic-2"));
+    let response = deliver(Arc::clone(&ingress)).await.expect("route responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        reported.recv().await,
+        Some("committed"),
+        "generic records must not evict a committed plugin delivery"
+    );
+}
+
 /// The name the request constructor forwards for `name`, or `None` when it
 /// refuses the request.
 fn ingress_header_name(name: &str) -> Option<String> {

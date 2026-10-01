@@ -123,6 +123,7 @@ pub(crate) fn activation_config(plugins: &TempDir, alias: &str, retry_count: &st
         PluginChannelConfig {
             package: PACKAGE.to_string(),
             enabled: true,
+            ..PluginChannelConfig::default()
         },
     );
     config.agents.insert(
