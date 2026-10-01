@@ -1006,7 +1006,10 @@ claims a single directory generation before admission and deletion; it never
 uses a stale verdict to recursively delete a replacement at the package name.
 
 Install and recovery coordinate through a persistent hidden OS lock under the
-plugins root. New staging directories use unique generations and an OS-held
+plugins root. A process that cannot take it within 60 seconds gives up and
+names the lock file. Any account that can read that file can hold the lock,
+and where the operating system or filesystem offers no file locking, install
+and remove refuse. New staging directories use unique generations and an OS-held
 lease, rather than a PID as ownership evidence. Recovery cleans an abandoned
 protocol stage only while recovering an actual final package. Legacy PID-only
 stages without proof of abandonment are retained and their paths are printed;

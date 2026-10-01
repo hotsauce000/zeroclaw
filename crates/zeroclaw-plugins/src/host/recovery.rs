@@ -9,6 +9,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 const LOCK: &str = ".zeroclaw-package-lock-v1";
+/// How long `lock` waits for another holder of the package lock before it gives
+/// up and names the lock file.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 const LEASE: &str = "lease";
 pub(super) const PACKAGE: &str = "package";
 
@@ -79,6 +82,14 @@ impl Root {
     }
 
     pub fn lock(&self) -> Result<Guard<'_>, PluginError> {
+        self.lock_within(LOCK_WAIT)
+    }
+
+    /// Take the package lock, waiting at most `wait` for another holder. Any
+    /// account that can read the lock file can hold it, so a holder that never
+    /// lets go makes this fail, naming the file, rather than block install and
+    /// remove without end.
+    fn lock_within(&self, wait: std::time::Duration) -> Result<Guard<'_>, PluginError> {
         self.check()?;
         if self.lock.get().is_none() {
             let lock = match self.dir.open_with(
@@ -124,7 +135,27 @@ impl Root {
             .lock
             .get()
             .ok_or_else(|| std::io::Error::other("package lock unavailable"))?;
-        lock.lock()?;
+        let started = std::time::Instant::now();
+        let mut pause = std::time::Duration::from_millis(10);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < wait => {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_millis(250));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(PluginError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "another process did not release the package lock at {} within {wait:?}; try again once it finishes",
+                            self.path.join(LOCK).display()
+                        ),
+                    )));
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
         let guard = Guard(lock);
         self.check()?;
         Ok(guard)
@@ -391,6 +422,35 @@ fn pin_ancestors(path: &Path) -> Result<Vec<Dir>, PluginError> {
         return Err(PluginError::NamespaceChanged(path.display().to_string()));
     }
     Ok(held)
+}
+
+#[cfg(test)]
+mod lock_wait_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A lock another holder keeps makes the waiter give up after its wait,
+    /// naming the lock file, instead of blocking without end. Once the holder
+    /// lets go, the waiter takes it.
+    #[test]
+    fn a_held_package_lock_is_given_up_after_the_wait_and_named() {
+        let temp = tempfile::tempdir().unwrap();
+        let holder = Root::open(temp.path()).unwrap();
+        let waiter = Root::open(temp.path()).unwrap();
+        let held = holder.lock().unwrap();
+        let started = Instant::now();
+        let Err(error) = waiter.lock_within(Duration::from_millis(300)) else {
+            panic!("a held package lock was taken twice");
+        };
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let message = error.to_string();
+        assert!(
+            message.contains(LOCK) && message.contains("did not release"),
+            "{message}"
+        );
+        drop(held);
+        drop(waiter.lock_within(Duration::from_millis(300)).unwrap());
+    }
 }
 
 #[cfg(all(test, unix))]
