@@ -205,6 +205,12 @@ service_profile_map = {{ acceptance-service = "acceptance" }}
             except Exception as failure:
                 errors.append(str(failure))
 
+        if self.daemon is not None and self.daemon.poll() is not None:
+            errors.append(f"daemon exited unexpectedly (status {self.daemon.returncode})")
+        if error is None:
+            for terminal in self.terminals:
+                if not terminal.closed:
+                    cleanup(terminal.screen)
         owned = self.owned_processes()
         for terminal in reversed(self.terminals):
             cleanup(terminal.close)
