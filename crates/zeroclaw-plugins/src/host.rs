@@ -572,9 +572,10 @@ impl PluginHost {
                 return self.restore_refused(
                     name,
                     tx,
-                    PluginError::InvalidConfig(format!(
-                        "it cannot be listed or cannot be inspected ({error})"
-                    )),
+                    kept(
+                        name,
+                        format!("it cannot be listed or cannot be inspected ({error})"),
+                    ),
                 );
             }
         };
@@ -586,7 +587,7 @@ impl PluginHost {
             drop(claimed);
             return self.restore_refused(name, tx, PluginError::NamespaceChanged(name.into()));
         }
-        if let Err(error) = self.recovery_verdict(&claimed) {
+        if let Err(error) = self.recovery_verdict(name, &claimed) {
             drop(claimed);
             return self.restore_refused(name, tx, error);
         }
@@ -607,7 +608,7 @@ impl PluginHost {
                 reason: error.to_string(),
             })?;
         // Admission is about these bytes, not a verdict retained across stage IO.
-        let empty = match self.recovery_verdict(&claimed) {
+        let empty = match self.recovery_verdict(name, &claimed) {
             Ok(empty) => empty,
             Err(error) => {
                 drop(claimed);
@@ -631,25 +632,25 @@ impl PluginHost {
         Ok(retained)
     }
 
-    fn recovery_verdict(&self, dir: &Dir) -> Result<bool, PluginError> {
+    fn recovery_verdict(&self, name: &str, dir: &Dir) -> Result<bool, PluginError> {
         match dir.symlink_metadata("manifest.toml") {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if dir.entries()?.next().transpose()?.is_none() {
                     return Ok(true);
                 }
-                return Err(PluginError::InvalidConfig(
-                    "it holds files but no manifest.toml, so no interrupted install left it".into(),
+                return Err(kept(
+                    name,
+                    "it holds files but no manifest.toml, so no interrupted install left it",
                 ));
             }
             Err(error) => {
-                return Err(PluginError::InvalidConfig(format!(
-                    "its manifest.toml cannot be inspected ({error})"
-                )));
+                return Err(kept(
+                    name,
+                    format!("its manifest.toml cannot be inspected ({error})"),
+                ));
             }
             Ok(metadata) if !metadata.is_file() => {
-                return Err(PluginError::InvalidConfig(
-                    "its manifest.toml is not a regular file".into(),
-                ));
+                return Err(kept(name, "its manifest.toml is not a regular file"));
             }
             Ok(_) => {}
         }
@@ -660,13 +661,10 @@ impl PluginHost {
             Path::new("claimed package"),
             std::ffi::OsStr::new("manifest.toml"),
         ) {
-            Ok(_) => Err(PluginError::InvalidConfig(
-                "admission accepts this package".into(),
-            )),
+            Ok(_) => Err(kept(name, "admission accepts this package")),
             Err(error) if is_structural_admission_failure(&error) => {
-                dir.entries().map_err(|error| {
-                    PluginError::InvalidConfig(format!("it cannot be listed ({error})"))
-                })?;
+                dir.entries()
+                    .map_err(|error| kept(name, format!("it cannot be listed ({error})")))?;
                 Ok(false)
             }
             Err(error) => Err(error),
@@ -679,6 +677,12 @@ impl PluginHost {
         tx: recovery::Transaction,
         reason: PluginError,
     ) -> Result<T, PluginError> {
+        // Recovery's own reason reads as written; any other error keeps its
+        // description.
+        let reason = match reason {
+            PluginError::UnadmittedPackage { reason, .. } => reason,
+            other => other.to_string(),
+        };
         #[cfg(test)]
         recovery::pause("before-restore");
         if let Err(error) = tx.publish(&self.recovery_root, name) {
@@ -690,7 +694,7 @@ impl PluginHost {
         tx.finish(&self.recovery_root)?;
         Err(PluginError::UnadmittedPackage {
             name: name.into(),
-            reason: reason.to_string(),
+            reason,
         })
     }
 
@@ -1720,6 +1724,14 @@ fn is_structural_admission_failure(error: &PluginError) -> bool {
         | PluginError::ExecutionFailed(_)
         | PluginError::PermissionDenied { .. }
         | PluginError::UnsupportedCapability(_) => false,
+    }
+}
+
+/// Why recovery keeps a directory it claimed, worded for the operator.
+fn kept(name: &str, reason: impl Into<String>) -> PluginError {
+    PluginError::UnadmittedPackage {
+        name: name.into(),
+        reason: reason.into(),
     }
 }
 
@@ -3062,7 +3074,12 @@ capabilities = ["tool"]
                 panic!("{label}: {err}");
             };
             assert_eq!(name, occupant);
-            assert!(reason.contains("manifest.toml"), "{label}: {reason}");
+            let expected = if occupant == "notes" {
+                "it holds files but no manifest.toml, so no interrupted install left it"
+            } else {
+                "its manifest.toml is not a regular file"
+            };
+            assert_eq!(reason, expected, "{label}");
             assert_eq!(dir_entries(&dir), before, "{label}: contents changed");
             assert!(staging.is_dir(), "{label}: staging was swept");
         }
@@ -3078,7 +3095,10 @@ capabilities = ["tool"]
     fn remove_refuses_a_directory_it_cannot_inspect_and_sweeps_nothing() {
         use std::os::unix::fs::PermissionsExt;
 
-        for (mode, expected) in [(0o600, "cannot be inspected"), (0o300, "cannot be listed")] {
+        for (mode, expected) in [
+            (0o600, "its manifest.toml cannot be inspected ("),
+            (0o300, "it cannot be listed"),
+        ] {
             let plugins = tempdir().unwrap();
             let locked = plugins.path().join("locked");
             std::fs::create_dir(&locked).unwrap();
@@ -3109,7 +3129,7 @@ capabilities = ["tool"]
             let Err(PluginError::UnadmittedPackage { reason, .. }) = &err else {
                 panic!("{mode:o}: an uninspectable directory must be refused: {err:?}");
             };
-            assert!(reason.contains(expected), "{mode:o}: {reason}");
+            assert!(reason.starts_with(expected), "{mode:o}: {reason}");
             assert!(staging.is_dir(), "{mode:o}: staging was swept");
             assert_eq!(dir_entries(&locked), ["manifest.toml"], "{mode:o}");
         }
@@ -3288,7 +3308,7 @@ capabilities = ["tool"]
             .remove("late-tool")
             .expect_err("a package that admits cleanly is not incomplete");
         assert!(
-            matches!(&err, PluginError::UnadmittedPackage { reason, .. } if reason.contains("admission accepts")),
+            matches!(&err, PluginError::UnadmittedPackage { reason, .. } if reason == "admission accepts this package"),
             "{err}"
         );
         assert!(later.path().join("late-tool/plugin.wasm").is_file());
