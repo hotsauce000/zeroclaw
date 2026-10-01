@@ -708,6 +708,9 @@ impl PluginHost {
                 continue;
             }
             let Some(tx) = self.recovery_root.reopen_transaction(entry_name.clone())? else {
+                if self.recovery_root.remove_empty_entry(&entry_name)? {
+                    continue;
+                }
                 return Err(PluginError::RecoveryRetained {
                     path: self.plugins_dir.join(entry_name).display().to_string(),
                     reason: "recovery transaction ownership is unavailable".into(),
@@ -782,7 +785,9 @@ impl PluginHost {
                 continue;
             }
             let Some(tx) = self.recovery_root.reopen_transaction(entry_name.clone())? else {
-                retained.push(self.plugins_dir.join(entry_name));
+                if !self.recovery_root.remove_empty_entry(&entry_name)? {
+                    retained.push(self.plugins_dir.join(entry_name));
+                }
                 continue;
             };
             // A protocol stage's held lease is the ownership fact. Never create

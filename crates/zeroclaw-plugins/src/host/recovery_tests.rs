@@ -218,6 +218,43 @@ fn a_second_remover_and_an_installer_wait_for_a_remover_paused_before_its_delete
     );
 }
 
+/// A process stopped between creating a transaction's entry and its lease
+/// leaves an empty entry with no lease. It holds nothing, so the next recovery
+/// removes it instead of refusing every later remove. An entry without a lease
+/// that holds a package is still kept and reported.
+#[test]
+fn an_entry_stopped_before_its_lease_is_removed_and_one_holding_a_package_is_kept() {
+    let root = tempfile::tempdir().unwrap();
+    broken(root.path());
+    Paused::start(root.path(), "transaction-entry", "remove").crash();
+    let entry = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|p| p.contains("recovering-v1"))
+        .unwrap();
+    assert!(tests::dir_entries(&root.path().join(&entry)).is_empty());
+    let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+    host.remove("race").unwrap();
+    assert_eq!(
+        tests::dir_entries(root.path()),
+        [".zeroclaw-package-lock-v1"]
+    );
+
+    let held = root
+        .path()
+        .join(".race.recovering-v1-0123456789abcdef0123456789abcdef");
+    std::fs::create_dir_all(held.join("package")).unwrap();
+    std::fs::write(held.join("package/keep"), b"claimed bytes").unwrap();
+    broken(root.path());
+    assert!(matches!(
+        host.remove("race"),
+        Err(PluginError::RecoveryRetained { .. })
+    ));
+    assert_eq!(
+        std::fs::read(held.join("package/keep")).unwrap(),
+        b"claimed bytes"
+    );
+}
+
 #[test]
 fn crash_after_claim_restores_then_recovers_on_retry() {
     let root = tempfile::tempdir().unwrap();

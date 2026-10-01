@@ -120,6 +120,8 @@ impl Root {
         let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
         let entry = format!(".{name}.{kind}-v1-{suffix}");
         self.dir.create_dir(&entry)?;
+        #[cfg(test)]
+        pause("transaction-entry");
         let dir = self.dir.open_dir(&entry)?;
         let lease = dir
             .open_with(
@@ -150,6 +152,15 @@ impl Root {
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
         }
+    }
+
+    /// Remove a transaction entry no process holds, if it is empty: what a
+    /// process stopped between creating the entry and its lease, or while
+    /// finishing it, leaves. The removal is empty-only, so a live transaction,
+    /// which holds its lease file, or a claimed package is never touched.
+    pub fn remove_empty_entry(&self, entry: &str) -> Result<bool, PluginError> {
+        self.check()?;
+        Ok(self.dir.remove_dir(entry).is_ok())
     }
 
     pub fn retained_path(&self, tx: &Transaction) -> String {
