@@ -170,8 +170,8 @@ enum ZeroclawPane {
 }
 
 /// Top-level Config sub-tab: the daemon RPC editor (`zeroclaw`) first,
-/// the local client config (`zerocode`) second, and the read-only daemon
-/// plugin catalog (`plugins`) third.
+/// the local client config (`zerocode`) second, and the daemon plugin
+/// catalog with its channel instance `enabled` toggles (`plugins`) third.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigSection {
     Zeroclaw,
@@ -409,8 +409,8 @@ pub(crate) struct App {
     config_dir_display: String,
     section: ConfigSection,
     zerocode: crate::zerocode_pane::ZerocodePane,
-    /// Read-only plugin catalog. It holds no client: the manager passes its
-    /// own at fetch time.
+    /// Plugin catalog and channel instance toggles. It holds no client: the
+    /// manager passes its own when a fetch or a toggle starts.
     plugins: crate::plugins_pane::PluginsPane,
     section_tab_area: Option<Rect>,
     screen: Screen,
@@ -566,10 +566,11 @@ impl App {
     }
 
     /// Apply finished background work without blocking. The app loop calls
-    /// this every frame so a completed plugin catalog fetch renders without a
-    /// keypress.
+    /// this every frame so a completed plugin catalog fetch or channel
+    /// instance toggle renders without a keypress.
     pub(crate) async fn poll_background(&mut self) {
         self.plugins.poll_refresh().await;
+        self.plugins.poll_toggle().await;
     }
 
     /// Draw the current screen into the given area, beneath the Config
@@ -855,6 +856,7 @@ impl App {
             match self.plugins.handle_key(key) {
                 PluginsKeyOutcome::Consumed => {}
                 PluginsKeyOutcome::RefreshRequested => self.plugins.refresh(&self.rpc),
+                PluginsKeyOutcome::ToggleRequested => self.plugins.start_toggle(&self.rpc),
                 PluginsKeyOutcome::NotConsumed => {
                     // Left/Back at the filter list crosses to the previous
                     // (zerocode) sub-tab, the way the zerocode pane crosses
@@ -4488,8 +4490,8 @@ impl App {
     /// create, personality/skills editor). Filters out the bracket-paste
     /// terminator bytes and normalises CRLF.
     pub(crate) fn handle_paste(&mut self, text: &str) {
-        // The plugin catalog is read-only and has no text surface; a paste
-        // there must not reach hidden zeroclaw editor state.
+        // The plugins sub-tab has no text surface; a paste there must not
+        // reach hidden zeroclaw editor state.
         if self.section == ConfigSection::Plugins {
             return;
         }
@@ -4552,8 +4554,8 @@ impl App {
         if self.section == ConfigSection::Zerocode {
             return self.zerocode.wants_text_input();
         }
-        // Read-only: stale zeroclaw filter or edit state must not make the
-        // plugins sub-tab swallow global keys.
+        // The plugins sub-tab takes no text: stale zeroclaw filter or edit
+        // state must not make it swallow global keys.
         if self.section == ConfigSection::Plugins {
             return false;
         }
@@ -5826,6 +5828,8 @@ mod tests {
 
     // ── plugins sub-tab ──────────────────────────────────────────
 
+    use crate::plugins_pane::fake_daemon;
+
     /// A catalog with one row per record case: installed and listed at
     /// different versions, registry only, and installed only.
     fn plugins_body() -> serde_json::Value {
@@ -5874,36 +5878,19 @@ mod tests {
         })
     }
 
-    /// Manager wired to a responder task that records every request method
-    /// and answers each one with `reply`.
+    /// Manager served by a scripted daemon that answers the catalog with
+    /// `reply`, lists no channel instances, and records every request.
     fn plugins_manager(
         reply: std::result::Result<serde_json::Value, crate::jsonrpc::JsonRpcError>,
-    ) -> (App, Arc<std::sync::Mutex<Vec<String>>>) {
-        use crate::jsonrpc::RpcOutbound;
-        use tokio::sync::mpsc;
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(16);
-        let outbound = Arc::new(RpcOutbound::new(writer_tx));
-        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
-        let manager = App::new(rpc, std::path::Path::new("/tmp"));
-        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let calls_for_task = Arc::clone(&calls);
-        tokio::spawn(async move {
-            while let Some(raw) = writer_rx.recv().await {
-                let Ok(req) = serde_json::from_str::<serde_json::Value>(&raw) else {
-                    continue;
-                };
-                calls_for_task
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(req["method"].as_str().unwrap_or_default().to_string());
-                let id = req["id"].as_str().unwrap_or_default().to_string();
-                match &reply {
-                    Ok(body) => outbound.dispatch_response(&id, Some(body.clone()), None),
-                    Err(error) => outbound.dispatch_response(&id, None, Some(error.clone())),
-                }
-            }
-        });
-        (manager, calls)
+    ) -> (App, Arc<std::sync::Mutex<fake_daemon::State>>) {
+        served_manager(fake_daemon::State::new(reply))
+    }
+
+    fn served_manager(
+        state: fake_daemon::State,
+    ) -> (App, Arc<std::sync::Mutex<fake_daemon::State>>) {
+        let (rpc, _outbound, daemon) = fake_daemon::serve(state);
+        (App::new(rpc, std::path::Path::new("/tmp")), daemon)
     }
 
     /// Manager whose requests the test answers by hand, so a request can be
@@ -5929,6 +5916,26 @@ mod tests {
         let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(request["method"], crate::client::method::PLUGINS_LIST);
         request["id"].as_str().unwrap().to_string()
+    }
+
+    /// Receive the instance read that follows a loaded catalog, assert it is
+    /// `config/list` over the instance table, and answer it with no rows.
+    async fn answer_instances_request(
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        outbound: &crate::jsonrpc::RpcOutbound,
+    ) {
+        let raw = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a config/list request should follow the catalog")
+            .expect("the RPC writer should remain connected");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], crate::client::method::CONFIG_LIST);
+        assert_eq!(
+            request["params"],
+            serde_json::json!({ "prefix": "channels.plugin" })
+        );
+        let id = request["id"].as_str().unwrap();
+        outbound.dispatch_response(id, Some(serde_json::json!({ "entries": [] })), None);
     }
 
     /// Give any spawned fetch time to reach the wire, then assert none did.
@@ -5975,9 +5982,13 @@ mod tests {
         panic!("the plugin catalog fetch never finished");
     }
 
-    fn recorded(calls: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
-        calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    fn recorded(daemon: &Arc<std::sync::Mutex<fake_daemon::State>>) -> Vec<String> {
+        daemon.lock().unwrap_or_else(|e| e.into_inner()).methods()
     }
+
+    /// The requests one catalog fetch sends: the catalog, then the channel
+    /// instances when the catalog loaded.
+    const FETCH: [&str; 2] = ["plugins/list", "config/list"];
 
     fn render_manager(manager: &mut App, w: u16, h: u16) -> Vec<String> {
         use ratatui::backend::TestBackend;
@@ -6007,10 +6018,11 @@ mod tests {
     async fn plugins_tab_with(
         reply: std::result::Result<serde_json::Value, crate::jsonrpc::JsonRpcError>,
     ) -> App {
+        let expected: &[&str] = if reply.is_ok() { &FETCH } else { &FETCH[..1] };
         let (mut manager, calls) = plugins_manager(reply);
         manager.set_section(ConfigSection::Plugins);
         settle_plugins(&mut manager).await;
-        assert_eq!(recorded(&calls), ["plugins/list"]);
+        assert_eq!(recorded(&calls), expected);
         manager
     }
 
@@ -6099,7 +6111,7 @@ mod tests {
         settle_plugins(&mut manager).await;
         assert_eq!(
             recorded(&calls),
-            ["plugins/list"],
+            FETCH,
             "the first entry fetches once; re-entering a loaded catalog does not"
         );
     }
@@ -6129,7 +6141,7 @@ mod tests {
         assert_eq!(manager.section, ConfigSection::Plugins);
         assert!(manager.plugins.is_loading(), "the click starts the fetch");
         settle_plugins(&mut manager).await;
-        assert_eq!(recorded(&calls), ["plugins/list"]);
+        assert_eq!(recorded(&calls), FETCH);
 
         let rows = render_manager(&mut manager, 80, 24);
         assert_row(&rows, "calendar");
@@ -6144,6 +6156,7 @@ mod tests {
         manager.set_section(ConfigSection::Plugins);
         let id = next_plugins_request(&mut rx).await;
         outbound.dispatch_response(&id, Some(plugins_body()), None);
+        answer_instances_request(&mut rx, &outbound).await;
         settle_plugins(&mut manager).await;
 
         manager
@@ -6165,6 +6178,7 @@ mod tests {
         assert!(manager.plugins.is_loading());
         assert_eq!(outbound.pending_count(), 1, "the refresh stays pending");
         outbound.dispatch_response(&id, Some(plugins_body()), None);
+        answer_instances_request(&mut rx, &outbound).await;
         settle_plugins(&mut manager).await;
 
         // Right, Enter, Back, Back walks Filters -> Packages -> Detail and
@@ -6239,7 +6253,7 @@ mod tests {
                 "Choose a filter",
                 "Show the packages",
                 "Previous sub-tab",
-                "Refresh the catalog",
+                "Refresh the catalog and channel instances",
                 "This help",
                 "",
                 crate::i18n::t("zc-config-help-mouse-open").as_str(),
@@ -6553,6 +6567,212 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(manager.section, ConfigSection::Plugins);
-        assert_eq!(recorded(&calls), ["plugins/list"]);
+        assert_eq!(recorded(&calls), FETCH);
+    }
+
+    // ── plugins sub-tab: channel instances ───────────────────────
+
+    /// An installed channel package and an installed package that provides
+    /// no channel.
+    fn channel_plugins_body() -> serde_json::Value {
+        serde_json::json!({
+            "plugins_enabled": true,
+            "wasm_plugins_available": true,
+            "plugins_dir": "~/.zeroclaw/plugins",
+            "plugins": [
+                {
+                    "name": "chat",
+                    "installed": {
+                        "version": "0.1.0",
+                        "description": "Chat bridge",
+                        "capabilities": ["channel"],
+                        "permissions": []
+                    },
+                    "available": null
+                },
+                {
+                    "name": "calendar",
+                    "installed": {
+                        "version": "0.1.0",
+                        "description": null,
+                        "capabilities": ["tool"],
+                        "permissions": []
+                    },
+                    "available": null
+                }
+            ],
+            "issues": []
+        })
+    }
+
+    fn chat_state() -> fake_daemon::State {
+        fake_daemon::State::new(Ok(channel_plugins_body())).with(vec![
+            fake_daemon::declaration("ops", "chat", "true"),
+            fake_daemon::declaration("alerts", "chat", "false"),
+        ])
+    }
+
+    /// Drive the app loop's per-frame poll until the toggle lands.
+    async fn settle_plugins_toggle(manager: &mut App) {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            manager.poll_background().await;
+            if !manager.plugins.is_toggling() {
+                return;
+            }
+        }
+        panic!("the channel instance toggle never finished");
+    }
+
+    /// The drawn rows flowed into one line with box-drawing borders and runs
+    /// of whitespace collapsed, so a wrapped sentence can be found whole.
+    fn flowing(rows: &[String]) -> String {
+        rows.iter()
+            .flat_map(|row| row.split(|c: char| ('\u{2500}'..='\u{257f}').contains(&c)))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn plugins_channel_instances_render_and_toggle_through_the_config_pane() {
+        let _keymap = default_keymap();
+        let reload = crate::keymap::action_key_labels(crate::keymap::GlobalAction::ReloadDaemon)
+            .into_iter()
+            .next()
+            .expect("the reload action has a default chord");
+        // The pane's share of an 80x24 and a 120x40 terminal, and the full
+        // size of each.
+        for (w, h) in [
+            (80, 24 - IN_APP_CHROME_ROWS),
+            (80, 24),
+            (120, 40 - IN_APP_CHROME_ROWS),
+            (120, 40),
+        ] {
+            let (mut manager, daemon) = served_manager(chat_state());
+            let mut term = test_term();
+            manager.set_section(ConfigSection::Plugins);
+            settle_plugins(&mut manager).await;
+            assert_eq!(recorded(&daemon), FETCH);
+
+            // Into chat's detail, then its instance list.
+            for code in [KeyCode::Right, KeyCode::Enter, KeyCode::Enter] {
+                manager.handle_key(key(code), &mut term).await.unwrap();
+            }
+            let rows = render_manager(&mut manager, w, h);
+            let all = rows.join("\n");
+            assert_row(&rows, "Name: chat");
+            assert_row(&rows, "Channel instances");
+            assert_row(&rows, "› alerts  disabled in config");
+            assert_row(&rows, "  ops     enabled in config");
+            let text = flowing(&rows);
+            assert!(
+                text.contains(
+                    "An enabled instance starts after a daemon reload only if [plugins] \
+                     enabled is on and an enabled agent lists plugin.<alias> in its channels."
+                ),
+                "{all}"
+            );
+            let footer = &rows[usize::from(h) - 1];
+            assert!(footer.contains("Enter=toggle"), "{footer:?}");
+            assert_eq!(recorded(&daemon), FETCH, "navigation sends nothing");
+
+            // Enter on alerts flips it through config/set.
+            manager
+                .handle_key(key(KeyCode::Enter), &mut term)
+                .await
+                .unwrap();
+            settle_plugins_toggle(&mut manager).await;
+            assert_eq!(
+                recorded(&daemon)[FETCH.len()..],
+                ["config/list", "config/set", "config/list"]
+            );
+            assert_eq!(
+                daemon
+                    .lock()
+                    .unwrap()
+                    .find("alerts")
+                    .and_then(|decl| decl.enabled.clone())
+                    .as_deref(),
+                Some("true")
+            );
+            let rows = render_manager(&mut manager, w, h);
+            let all = rows.join("\n");
+            assert_row(&rows, "› alerts  enabled in config");
+            let text = flowing(&rows);
+            assert!(
+                text.contains(&format!(
+                    "Saved: alerts is now enabled in config. Takes effect after a daemon \
+                     reload ({reload})."
+                )),
+                "{all}"
+            );
+            // The block reports configuration only.
+            let block = &text[text.find("Channel instances").unwrap_or(0)..];
+            for word in ["running", "started", "stopped", "active", "healthy"] {
+                assert!(!block.contains(word), "{word}:\n{all}");
+            }
+
+            // Back out to the detail and the packages.
+            for code in [KeyCode::Esc, KeyCode::Esc] {
+                manager.handle_key(key(code), &mut term).await.unwrap();
+            }
+            let rows = render_manager(&mut manager, w, h);
+            assert_row(&rows, "● chat");
+            assert_eq!(manager.section, ConfigSection::Plugins);
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn plugins_instance_read_failure_renders_in_the_block_at_both_sizes() {
+        let _keymap = default_keymap();
+        let reason = "Principal is not granted config:read (required by config/list)";
+        for (w, h) in [
+            (80, 24 - IN_APP_CHROME_ROWS),
+            (80, 24),
+            (120, 40 - IN_APP_CHROME_ROWS),
+            (120, 40),
+        ] {
+            let mut state = chat_state();
+            state.list_error = Some(crate::jsonrpc::JsonRpcError {
+                code: zeroclaw_api::jsonrpc::error_codes::FORBIDDEN,
+                message: reason.to_string(),
+                data: None,
+            });
+            let (mut manager, daemon) = served_manager(state);
+            let mut term = test_term();
+            manager.set_section(ConfigSection::Plugins);
+            settle_plugins(&mut manager).await;
+            assert_eq!(recorded(&daemon), FETCH);
+
+            // The catalog renders whatever the instance read did.
+            let rows = render_manager(&mut manager, w, h);
+            assert_row(&rows, "● chat  v0.1.0 installed");
+            assert_row(&rows, "All (2)");
+
+            for code in [KeyCode::Right, KeyCode::Enter, KeyCode::Enter] {
+                manager.handle_key(key(code), &mut term).await.unwrap();
+            }
+            let rows = render_manager(&mut manager, w, h);
+            let all = rows.join("\n");
+            assert_row(&rows, "Name: chat");
+            assert_row(&rows, "Channel instances");
+            let text = flowing(&rows);
+            assert!(
+                text.contains(&format!(
+                    "The daemon refused to list channel instances: {reason}"
+                )),
+                "{all}"
+            );
+            assert!(text.contains("Press r to refresh."), "{all}");
+            let footer = &rows[usize::from(h) - 1];
+            assert!(
+                !footer.contains("Enter="),
+                "no instance to move into: {footer:?}"
+            );
+            assert_eq!(recorded(&daemon), FETCH, "nothing is written");
+        }
     }
 }

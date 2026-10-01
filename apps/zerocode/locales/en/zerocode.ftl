@@ -767,8 +767,10 @@ zc-config-section-cron-help = Scheduled tasks that bind a schedule to a prompt, 
 zc-config-section-tunnel-help = Optionally expose the gateway through Cloudflare or ngrok, or keep it local only.
 zc-config-section-onboard-state-help = Quickstart lifecycle state and its legacy per-section completion ledger.
 
-## plugins_pane.rs: the read-only plugins sub-tab of the Config pane. It lists
-## the daemon's plugin catalog and never claims a package is loaded or running.
+## plugins_pane.rs: the plugins sub-tab of the Config pane. It lists the
+## daemon's plugin catalog and the plugin channel instances configured for each
+## package, and flips an instance's enabled setting in config. It never claims a
+## package or channel is loaded, running, started, or stopped.
 zc-plugins-tab-label = plugins
 zc-plugins-filters-title = Filter
 zc-plugins-filter-all = All
@@ -831,6 +833,8 @@ zc-plugins-footer-open = open
 zc-plugins-footer-scroll = scroll
 zc-plugins-footer-back = back
 zc-plugins-footer-refresh = refresh
+zc-plugins-footer-instances = instances
+zc-plugins-footer-toggle = toggle
 zc-plugins-help-choose-filter = Choose a filter
 zc-plugins-help-show-packages = Show the packages
 zc-plugins-help-previous-subtab = Previous sub-tab
@@ -839,5 +843,31 @@ zc-plugins-help-open = Open
 zc-plugins-help-back-to-filters = Back to the filters
 zc-plugins-help-scroll = Scroll
 zc-plugins-help-back-to-packages = Back to the packages
-zc-plugins-help-refresh = Refresh the catalog
+zc-plugins-help-refresh = Refresh the catalog and channel instances
 zc-plugins-help-this-help = This help
+zc-plugins-help-instances = Go to the channel instances
+zc-plugins-help-toggle = Toggle enabled in config
+zc-plugins-help-back-to-detail = Back to the package detail
+zc-plugins-instances-title = Channel instances
+zc-plugins-instance-enabled = enabled in config
+zc-plugins-instance-disabled = disabled in config
+zc-plugins-instance-unknown = unknown
+zc-plugins-instances-none = No channel instance in config names this package. Declare one under channels in the zeroclaw sub-tab.
+zc-plugins-instances-footnote = An enabled instance starts after a daemon reload only if [plugins] enabled is on and an enabled agent lists plugin.<alias> in its channels.
+zc-plugins-instances-error-forbidden = The daemon refused to list channel instances: { $error }
+zc-plugins-instances-error-timeout = Reading the channel instances timed out.
+zc-plugins-instances-error-other = Could not read channel instances: { $error }
+zc-plugins-refresh-hint = Press { $keys } to refresh.
+zc-plugins-reload-hint = Takes effect after a daemon reload ({ $keys }).
+zc-plugins-reload-hint-unbound = Takes effect after a daemon reload or restart.
+zc-plugins-toggle-saving = Saving { $alias }…
+zc-plugins-toggle-unknown = { $alias } has no known value to toggle.
+zc-plugins-toggle-saved-enabled = Saved: { $alias } is now enabled in config.
+zc-plugins-toggle-saved-disabled = Saved: { $alias } is now disabled in config.
+zc-plugins-toggle-saved-unread = Saved { $alias }, but its stored value could not be read back.
+zc-plugins-toggle-stale = { $alias } was not changed: it changed since it was read.
+zc-plugins-toggle-invalid-alias = { $alias } was not changed: its name is outside the alias grammar, so it can only be fixed in the config file.
+zc-plugins-toggle-forbidden = { $alias } was not changed: not permitted ({ $error }).
+zc-plugins-toggle-failed = { $alias } was not changed: { $error }
+zc-plugins-toggle-unconfirmed = { $alias } may or may not have changed ({ $error }).
+zc-plugins-toggle-no-answer = the daemon did not answer in time

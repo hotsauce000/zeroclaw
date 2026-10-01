@@ -1,12 +1,19 @@
-//! Read-only `plugins` sub-tab of the Config pane.
+//! `plugins` sub-tab of the Config pane.
 //!
 //! Renders the daemon's `plugins/list` catalog, the same body `GET
 //! /api/plugins` serves: one row per package in the daemon's order, with the
-//! installed record and the cached-registry record kept apart. The pane only
-//! ever sends `plugins/list`. It never writes config, never merges or re-sorts
-//! rows, and never claims that a package is loaded, running or healthy,
-//! because the catalog carries no runtime evidence.
+//! installed record and the cached-registry record kept apart. It never merges
+//! or re-sorts catalog rows, and never claims that a package is loaded,
+//! running or healthy, because the catalog carries no runtime evidence.
+//!
+//! A package's detail also lists the plugin channel instances configured for
+//! it (`[channels.plugin.<alias>]`, read with `config/list`) and can flip one
+//! instance's `enabled` setting with `config/set`. That is the pane's only
+//! write, made only to an instance it has just reread; it never installs or
+//! removes anything, and it reports the change as configuration intent that a
+//! daemon reload applies, never as a channel that started or stopped.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -23,8 +30,8 @@ use crate::client::{RpcCallError, RpcCallTimeout, RpcClient};
 use crate::i18n::{t, t_args};
 use crate::theme;
 use crate::wire::{
-    PluginCatalogEntry, PluginCatalogIssue, PluginCatalogIssueCode, PluginCatalogIssueSource,
-    PluginsListResult,
+    ConfigFieldEntry, PluginCatalogEntry, PluginCatalogIssue, PluginCatalogIssueCode,
+    PluginCatalogIssueSource, PluginsListResult,
 };
 
 /// Longest daemon-provided string kept for display, in characters.
@@ -44,6 +51,19 @@ const LEFT_COLUMN_WIDTH: u16 = 30;
 const HIGHLIGHT_GUTTER: usize = 2;
 
 const DETAIL_SCROLL_LINES: u16 = 3;
+
+/// Config path of the plugin channel instances, `[channels.plugin.<alias>]`.
+const INSTANCE_PREFIX: &str = "channels.plugin";
+
+/// The capability an installed package declares when it provides a channel.
+const CHANNEL_CAPABILITY: &str = "channel";
+
+/// Most instance rows the block shows at once; a longer list scrolls with
+/// its selection.
+const MAX_INSTANCE_ROWS: u16 = 6;
+
+/// Rows the package detail keeps above the instance block, borders included.
+const MIN_DETAIL_ROWS: u16 = 5;
 
 /// Make one daemon-provided string safe to render on a single terminal row.
 ///
@@ -170,7 +190,375 @@ impl CatalogError {
     }
 }
 
-type CatalogFetch = JoinHandle<Result<PluginsListResult, CatalogError>>;
+// ── Channel instances ────────────────────────────────────────────
+
+/// Why a channel-instance read or write failed, classified by its typed
+/// error like [`CatalogError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallFailure {
+    /// JSON-RPC forbidden, holding the display-safe daemon reason.
+    Forbidden(String),
+    /// No response within the client's budget.
+    TimedOut,
+    /// Any other failure, holding the display-safe daemon or client message.
+    Other(String),
+}
+
+impl CallFailure {
+    fn from_call(err: &anyhow::Error) -> Self {
+        if let Some(rpc) = err.downcast_ref::<RpcCallError>() {
+            return match rpc.code {
+                error_codes::FORBIDDEN => Self::Forbidden(display_safe(&rpc.message)),
+                _ => Self::Other(display_safe(&rpc.message)),
+            };
+        }
+        if err.downcast_ref::<RpcCallTimeout>().is_some() {
+            return Self::TimedOut;
+        }
+        Self::Other(display_safe(&format!("{err:#}")))
+    }
+
+    /// The message for an instance list the daemon would not give.
+    fn instances_message(&self) -> String {
+        match self {
+            Self::Forbidden(detail) => t_args(
+                "zc-plugins-instances-error-forbidden",
+                &[("error", detail.as_str())],
+            ),
+            Self::TimedOut => t("zc-plugins-instances-error-timeout"),
+            Self::Other(detail) => t_args(
+                "zc-plugins-instances-error-other",
+                &[("error", detail.as_str())],
+            ),
+        }
+    }
+
+    /// The failure as a clause inside a toggle status.
+    fn detail(&self) -> String {
+        match self {
+            Self::Forbidden(detail) | Self::Other(detail) => detail.clone(),
+            Self::TimedOut => t("zc-plugins-toggle-no-answer"),
+        }
+    }
+}
+
+/// One `[channels.plugin.<alias>]` declaration as `config/list` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChannelInstance {
+    alias: String,
+    /// The raw `package` value, or `None` when the daemon sent none.
+    package: Option<String>,
+    /// `None` when the value is missing or unreadable: unknown, never false.
+    enabled: Option<bool>,
+}
+
+/// Parse `config/list` rows into channel instances sorted by alias. The
+/// daemon lists `channels.plugin.<alias>.package` and `.enabled` for every
+/// alias in no stable order, and every value as a JSON string. Rows outside
+/// the instance table, and fields other than those two, are ignored.
+fn parse_instances(entries: &[ConfigFieldEntry]) -> Vec<ChannelInstance> {
+    let mut by_alias: BTreeMap<&str, ChannelInstance> = BTreeMap::new();
+    for entry in entries {
+        let Some(rest) = entry
+            .path
+            .strip_prefix(INSTANCE_PREFIX)
+            .and_then(|rest| rest.strip_prefix('.'))
+        else {
+            continue;
+        };
+        let Some((alias, field)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if alias.is_empty() || !matches!(field, "package" | "enabled") {
+            continue;
+        }
+        let value = entry.value.as_ref().and_then(serde_json::Value::as_str);
+        let instance = by_alias.entry(alias).or_insert_with(|| ChannelInstance {
+            alias: alias.to_string(),
+            package: None,
+            enabled: None,
+        });
+        if field == "package" {
+            instance.package = value.map(str::to_string);
+        } else {
+            instance.enabled = match value {
+                Some("true") => Some(true),
+                Some("false") => Some(false),
+                _ => None,
+            };
+        }
+    }
+    by_alias.into_values().collect()
+}
+
+/// Whether an alias fits the daemon's alias grammar: 1 to 63 lowercase ASCII
+/// letters, digits and single underscores, starting and ending with a letter
+/// or digit. Only a hand-edited config can hold any other alias, and the
+/// daemon resolves a write path by its first segment, so writing to such an
+/// alias (for example `a.b`) would make the daemon create a second,
+/// package-less declaration.
+fn is_grammar_alias(raw: &str) -> bool {
+    const MAX_ALIAS_LEN: usize = 63;
+    let bytes = raw.as_bytes();
+    let edge = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_ALIAS_LEN
+        && bytes.first().is_some_and(edge)
+        && bytes.last().is_some_and(edge)
+        && !raw.contains("__")
+        && bytes.iter().all(|byte| edge(byte) || *byte == b'_')
+}
+
+/// An alias as shown in the instance list and the status line: as is when it
+/// fits the alias grammar, otherwise escaped and quoted like an invalid
+/// package name.
+fn display_alias(raw: &str) -> String {
+    if is_grammar_alias(raw) {
+        raw.to_string()
+    } else {
+        quoted(raw)
+    }
+}
+
+/// What the catalog fetch read: the catalog, then the channel instances.
+struct FetchResult {
+    catalog: Result<PluginsListResult, CatalogError>,
+    /// `None` when the catalog failed and the instances were not read.
+    instances: Option<Result<Vec<ChannelInstance>, CallFailure>>,
+}
+
+type CatalogFetch = JoinHandle<FetchResult>;
+
+/// The channel instances as last read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstanceState {
+    /// Not read yet, or dropped with a catalog that failed to load.
+    NotLoaded,
+    Loaded(Vec<ChannelInstance>),
+    /// The read failed; the catalog may still have loaded.
+    Failed(CallFailure),
+}
+
+/// The instance a toggle acts on and the value the pane showed for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToggleTarget {
+    alias: String,
+    /// The raw name of the package whose detail showed the instance.
+    package: String,
+    shown: bool,
+}
+
+impl ToggleTarget {
+    /// Whether `current` is still the declaration the pane showed: present,
+    /// naming the same package, with the same value. Anything else means the
+    /// config changed since it was read, and writing would act on a
+    /// declaration the user never saw (or re-create a removed one).
+    fn still_matches(&self, current: Option<&ChannelInstance>) -> bool {
+        current.is_some_and(|current| {
+            current.package.as_deref() == Some(self.package.as_str())
+                && current.enabled == Some(self.shown)
+        })
+    }
+}
+
+/// Why a toggle left the config as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotChanged {
+    /// The declaration changed since it was read, so nothing was written.
+    Stale,
+    /// The alias is outside the alias grammar, so nothing was written.
+    InvalidAlias,
+    Failed(CallFailure),
+}
+
+/// How a toggle ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToggleOutcome {
+    /// The daemon saved the write; the value read back, or `None` when the
+    /// read-back could not tell.
+    Saved(Option<bool>),
+    NotChanged(NotChanged),
+    /// The write failed in a way that leaves its effect unknown, such as no
+    /// answer in time; `stored` is the value read back, if any.
+    Unconfirmed {
+        failure: CallFailure,
+        stored: Option<bool>,
+    },
+}
+
+type ToggleTask = JoinHandle<ToggleOutcome>;
+
+/// The toggle status line of one package's instance block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StatusKind {
+    Saving,
+    Done(ToggleOutcome),
+    /// Enter on an instance whose value is unknown: nothing to flip.
+    UnknownValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToggleStatus {
+    /// The raw package name; the line shows only in that package's detail.
+    package: String,
+    alias: String,
+    kind: StatusKind,
+}
+
+/// The sentence telling the user how to refresh, or nothing when the
+/// refresh action has no key.
+fn refresh_hint() -> Option<String> {
+    let keys = first_chord(crate::keymap::ConfigTabAction::Refresh);
+    (!keys.is_empty()).then(|| t_args("zc-plugins-refresh-hint", &[("keys", &keys)]))
+}
+
+/// The sentence saying a saved change waits for a daemon reload, naming the
+/// live reload chord.
+fn reload_hint() -> String {
+    let keys = first_chord(crate::keymap::GlobalAction::ReloadDaemon);
+    if keys.is_empty() {
+        t("zc-plugins-reload-hint-unbound")
+    } else {
+        t_args("zc-plugins-reload-hint", &[("keys", &keys)])
+    }
+}
+
+impl ToggleStatus {
+    /// Whether the line reports a problem rather than progress or success.
+    fn is_warning(&self) -> bool {
+        !matches!(
+            self.kind,
+            StatusKind::Saving | StatusKind::Done(ToggleOutcome::Saved(Some(_)))
+        )
+    }
+
+    /// The status sentence. It names configuration state only: a saved
+    /// change is "in config" and waits for a daemon reload, and nothing here
+    /// says a channel started, stopped, or is running.
+    fn text(&self) -> String {
+        let alias = display_alias(&self.alias);
+        let args = [("alias", alias.as_str())];
+        let mut sentences = Vec::new();
+        match &self.kind {
+            StatusKind::Saving => sentences.push(t_args("zc-plugins-toggle-saving", &args)),
+            StatusKind::UnknownValue => {
+                sentences.push(t_args("zc-plugins-toggle-unknown", &args));
+                sentences.extend(refresh_hint());
+            }
+            StatusKind::Done(ToggleOutcome::Saved(stored)) => {
+                let key = match stored {
+                    Some(true) => "zc-plugins-toggle-saved-enabled",
+                    Some(false) => "zc-plugins-toggle-saved-disabled",
+                    None => "zc-plugins-toggle-saved-unread",
+                };
+                sentences.push(t_args(key, &args));
+                if stored.is_none() {
+                    sentences.extend(refresh_hint());
+                }
+                sentences.push(reload_hint());
+            }
+            StatusKind::Done(ToggleOutcome::NotChanged(NotChanged::Stale)) => {
+                sentences.push(t_args("zc-plugins-toggle-stale", &args));
+                sentences.extend(refresh_hint());
+            }
+            StatusKind::Done(ToggleOutcome::NotChanged(NotChanged::InvalidAlias)) => {
+                sentences.push(t_args("zc-plugins-toggle-invalid-alias", &args));
+            }
+            StatusKind::Done(ToggleOutcome::NotChanged(NotChanged::Failed(failure))) => {
+                let detail = failure.detail();
+                let args = [("alias", alias.as_str()), ("error", detail.as_str())];
+                let key = match failure {
+                    CallFailure::Forbidden(_) => "zc-plugins-toggle-forbidden",
+                    CallFailure::TimedOut | CallFailure::Other(_) => "zc-plugins-toggle-failed",
+                };
+                sentences.push(t_args(key, &args));
+            }
+            StatusKind::Done(ToggleOutcome::Unconfirmed { failure, .. }) => {
+                let detail = failure.detail();
+                sentences.push(t_args(
+                    "zc-plugins-toggle-unconfirmed",
+                    &[("alias", alias.as_str()), ("error", detail.as_str())],
+                ));
+                sentences.extend(refresh_hint());
+            }
+        }
+        sentences.join(" ")
+    }
+}
+
+/// Read one alias's declaration back, `None` when the daemon lists no such
+/// alias. The prefix ends at the alias, and the daemon matches prefixes on
+/// whole path segments, so a longer alias that starts the same is never
+/// mistaken for this one.
+async fn read_instance(
+    rpc: &RpcClient,
+    alias: &str,
+) -> Result<Option<ChannelInstance>, CallFailure> {
+    let prefix = format!("{INSTANCE_PREFIX}.{alias}");
+    let entries = rpc
+        .config_list(Some(&prefix))
+        .await
+        .map_err(|err| CallFailure::from_call(&err))?;
+    Ok(parse_instances(&entries)
+        .into_iter()
+        .find(|instance| instance.alias == alias))
+}
+
+/// Flip one instance's `enabled` setting: re-read it and stop if it changed
+/// since the pane read it, write the opposite of the shown value as a JSON
+/// bool, then read back what the daemon stored. `config/set` creates a
+/// missing alias instead of failing, so the re-read is what keeps a toggle
+/// from re-creating a declaration removed before it ran; the daemon has no
+/// conditional write, so a removal landing between the re-read and the write
+/// is still re-created. An alias outside the alias grammar is never written.
+async fn run_toggle(rpc: Arc<RpcClient>, target: ToggleTarget) -> ToggleOutcome {
+    if !is_grammar_alias(&target.alias) {
+        return ToggleOutcome::NotChanged(NotChanged::InvalidAlias);
+    }
+    let current = match read_instance(&rpc, &target.alias).await {
+        Ok(current) => current,
+        Err(failure) => return ToggleOutcome::NotChanged(NotChanged::Failed(failure)),
+    };
+    if !target.still_matches(current.as_ref()) {
+        return ToggleOutcome::NotChanged(NotChanged::Stale);
+    }
+    let prop = format!("{INSTANCE_PREFIX}.{}.enabled", target.alias);
+    let failure = match rpc
+        .config_set(&prop, serde_json::Value::Bool(!target.shown))
+        .await
+    {
+        Ok(()) => {
+            let stored = read_instance(&rpc, &target.alias).await;
+            return ToggleOutcome::Saved(stored.ok().flatten().and_then(|i| i.enabled));
+        }
+        Err(err) => CallFailure::from_call(&err),
+    };
+    match failure {
+        // The daemon checks write authority before it stages anything.
+        CallFailure::Forbidden(_) => ToggleOutcome::NotChanged(NotChanged::Failed(failure)),
+        // The daemon may still be waiting for its config lock, so a read now
+        // could show the old value of a write that lands later.
+        CallFailure::TimedOut => ToggleOutcome::Unconfirmed {
+            failure,
+            stored: None,
+        },
+        // Other failures include a dropped connection, so the read-back
+        // decides whether the value is known to be unchanged.
+        CallFailure::Other(_) => match read_instance(&rpc, &target.alias).await {
+            Ok(Some(stored)) if stored.enabled == Some(target.shown) => {
+                ToggleOutcome::NotChanged(NotChanged::Failed(failure))
+            }
+            Ok(Some(stored)) => ToggleOutcome::Unconfirmed {
+                failure,
+                stored: stored.enabled,
+            },
+            Ok(None) | Err(_) => ToggleOutcome::Unconfirmed {
+                failure,
+                stored: None,
+            },
+        },
+    }
+}
 
 // ── Filters and projection ───────────────────────────────────────
 
@@ -665,12 +1053,14 @@ fn first_chord<A: crate::keymap::RebindableActions>(action: A) -> String {
 // ── Pane ─────────────────────────────────────────────────────────
 
 /// Which list the cursor drives: the filter list on the left, the package
-/// list on the right, or the package detail that replaces it.
+/// list on the right, the package detail that replaces it, or the channel
+/// instance list under that detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Filters,
     Packages,
     Detail,
+    Instances,
 }
 
 /// What the Config manager does after the pane saw a key.
@@ -681,6 +1071,20 @@ pub(crate) enum PluginsKeyOutcome {
     NotConsumed,
     /// The refresh chord: the manager starts a fetch with its live client.
     RefreshRequested,
+    /// Enter on a channel instance: the manager starts the toggle the pane
+    /// holds, with its live client.
+    ToggleRequested,
+}
+
+/// Display-safe content of one package's channel instance block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstanceBlock {
+    /// Alias and config state of each instance naming the package.
+    rows: Vec<(String, Option<bool>)>,
+    /// Why the instances could not be read, shown instead of rows.
+    error: Option<String>,
+    /// The latest toggle status for this package, and whether it warns.
+    status: Option<(String, bool)>,
 }
 
 pub(crate) struct PluginsPane {
@@ -688,6 +1092,15 @@ pub(crate) struct PluginsPane {
     error: Option<CatalogError>,
     /// A fetch in flight. Loading is exactly "a task is present".
     refresh_task: Option<CatalogFetch>,
+    instances: InstanceState,
+    /// Selection in the open package's instance list.
+    instance_state: ListState,
+    /// The toggle Enter asked for, until the manager starts it.
+    pending_toggle: Option<ToggleTarget>,
+    /// The toggle in flight, if any. At most one runs at a time.
+    toggle_task: Option<(ToggleTarget, ToggleTask)>,
+    /// Kept until the next toggle or refresh.
+    toggle_status: Option<ToggleStatus>,
     focus: Focus,
     filter: CatalogFilter,
     list_state: ListState,
@@ -698,6 +1111,7 @@ pub(crate) struct PluginsPane {
     last_filter_offset: usize,
     last_list_area: Option<Rect>,
     last_detail_area: Option<Rect>,
+    last_instances_area: Option<Rect>,
     double_click: crate::mouse::DoubleClickTracker,
 }
 
@@ -708,6 +1122,11 @@ impl PluginsPane {
             data: None,
             error: None,
             refresh_task: None,
+            instances: InstanceState::NotLoaded,
+            instance_state: ListState::default(),
+            pending_toggle: None,
+            toggle_task: None,
+            toggle_status: None,
             focus: Focus::Filters,
             filter: CatalogFilter::All,
             list_state: ListState::default(),
@@ -716,6 +1135,7 @@ impl PluginsPane {
             last_filter_offset: 0,
             last_list_area: None,
             last_detail_area: None,
+            last_instances_area: None,
             double_click: crate::mouse::DoubleClickTracker::new(),
         }
     }
@@ -725,14 +1145,15 @@ impl PluginsPane {
     /// Start the first fetch: only when nothing is loaded, no error is held
     /// and none is running. A held error waits for an explicit refresh.
     pub(crate) fn refresh_if_inactive(&mut self, rpc: &Arc<RpcClient>) {
-        if self.data.is_none() && self.error.is_none() && !self.is_loading() {
+        if self.data.is_none() && self.error.is_none() && !self.is_busy() {
             self.start_refresh(rpc);
         }
     }
 
-    /// Refetch on request. Ignored while a fetch is already running.
+    /// Refetch on request. Ignored while a fetch or a toggle is running, so
+    /// a read that started before a write can never land after it.
     pub(crate) fn refresh(&mut self, rpc: &Arc<RpcClient>) {
-        if !self.is_loading() {
+        if !self.is_busy() {
             self.start_refresh(rpc);
         }
     }
@@ -741,15 +1162,39 @@ impl PluginsPane {
         self.refresh_task.is_some()
     }
 
+    pub(crate) fn is_toggling(&self) -> bool {
+        self.toggle_task.is_some()
+    }
+
+    fn is_busy(&self) -> bool {
+        self.is_loading() || self.is_toggling()
+    }
+
+    /// One task reads the catalog, then the channel instances. The two are
+    /// independent: an instance read failure is kept beside a loaded catalog.
+    /// A catalog that fails has no package to show instances under, so the
+    /// instances are not read.
     fn start_refresh(&mut self, rpc: &Arc<RpcClient>) {
         // Loaded data stays on screen, marked as refreshing, until the result
         // lands; a held error gives way to the loading state.
         self.error = None;
+        self.toggle_status = None;
         let rpc = Arc::clone(rpc);
         self.refresh_task = Some(tokio::spawn(async move {
-            rpc.plugins_list()
+            let catalog = rpc
+                .plugins_list()
                 .await
-                .map_err(|err| CatalogError::from_call(&err))
+                .map_err(|err| CatalogError::from_call(&err));
+            let instances = match &catalog {
+                Ok(_) => Some(
+                    rpc.config_list(Some(INSTANCE_PREFIX))
+                        .await
+                        .map(|entries| parse_instances(&entries))
+                        .map_err(|err| CallFailure::from_call(&err)),
+                ),
+                Err(_) => None,
+            };
+            FetchResult { catalog, instances }
         }));
     }
 
@@ -759,13 +1204,142 @@ impl PluginsPane {
         let Some(task) = self.refresh_task.take_if(|task| task.is_finished()) else {
             return;
         };
-        let result = match task.await {
-            Ok(result) => result,
-            Err(join_error) => Err(CatalogError::Other(display_safe(&format!(
-                "plugin catalog request task failed: {join_error}"
-            )))),
+        let fetch = match task.await {
+            Ok(fetch) => fetch,
+            Err(join_error) => FetchResult {
+                catalog: Err(CatalogError::Other(display_safe(&format!(
+                    "plugin catalog request task failed: {join_error}"
+                )))),
+                instances: None,
+            },
         };
-        self.apply_result(result);
+        self.apply_fetch(fetch);
+    }
+
+    /// The instances replace the earlier ones before the catalog lands, so
+    /// the focus checks after it see the new list. The instance cursor
+    /// follows its alias, as the package cursor follows its name.
+    fn apply_fetch(&mut self, fetch: FetchResult) {
+        let anchor = self
+            .selected_instance()
+            .map(|instance| instance.alias.clone());
+        self.instances = match fetch.instances {
+            None => InstanceState::NotLoaded,
+            Some(Ok(instances)) => InstanceState::Loaded(instances),
+            Some(Err(failure)) => InstanceState::Failed(failure),
+        };
+        self.apply_result(fetch.catalog);
+        if let Some(row) = anchor.and_then(|alias| {
+            self.selected_instances()
+                .iter()
+                .position(|instance| instance.alias == alias)
+        }) {
+            self.instance_state.select(Some(row));
+        }
+        self.clamp_instances();
+    }
+
+    // ── Toggle lifecycle ─────────────────────────────────────────
+
+    /// Start the toggle Enter asked for. Ignored while a fetch or another
+    /// toggle runs, so at most one write is ever in flight.
+    pub(crate) fn start_toggle(&mut self, rpc: &Arc<RpcClient>) {
+        let Some(target) = self.pending_toggle.take() else {
+            return;
+        };
+        if self.is_busy() {
+            return;
+        }
+        self.toggle_status = Some(ToggleStatus {
+            package: target.package.clone(),
+            alias: target.alias.clone(),
+            kind: StatusKind::Saving,
+        });
+        let task = tokio::spawn(run_toggle(Arc::clone(rpc), target.clone()));
+        self.toggle_task = Some((target, task));
+    }
+
+    /// Apply a finished toggle without waiting on one still in flight.
+    pub(crate) async fn poll_toggle(&mut self) {
+        let Some((target, task)) = self.toggle_task.take_if(|(_, task)| task.is_finished()) else {
+            return;
+        };
+        let outcome = match task.await {
+            Ok(outcome) => outcome,
+            Err(join_error) => ToggleOutcome::Unconfirmed {
+                failure: CallFailure::Other(display_safe(&format!(
+                    "channel instance toggle task failed: {join_error}"
+                ))),
+                stored: None,
+            },
+        };
+        self.apply_toggle(&target, outcome);
+    }
+
+    /// Show the value the daemon reported: the one read back after a write,
+    /// unknown when that could not be read, and unchanged when nothing was
+    /// written.
+    fn apply_toggle(&mut self, target: &ToggleTarget, outcome: ToggleOutcome) {
+        let value = match &outcome {
+            ToggleOutcome::Saved(stored) => Some(*stored),
+            ToggleOutcome::Unconfirmed { stored, .. } => Some(*stored),
+            ToggleOutcome::NotChanged(_) => None,
+        };
+        if let (Some(value), InstanceState::Loaded(instances)) = (value, &mut self.instances)
+            && let Some(instance) = instances.iter_mut().find(|instance| {
+                instance.alias == target.alias
+                    && instance.package.as_deref() == Some(target.package.as_str())
+            })
+        {
+            instance.enabled = value;
+        }
+        self.toggle_status = Some(ToggleStatus {
+            package: target.package.clone(),
+            alias: target.alias.clone(),
+            kind: StatusKind::Done(outcome),
+        });
+    }
+
+    /// Enter on the selected instance: hold its toggle for the manager to
+    /// start. An instance whose value is unknown has nothing to flip, and one
+    /// whose alias is outside the alias grammar is never written, so each only
+    /// gets a status line.
+    fn request_toggle(&mut self) -> PluginsKeyOutcome {
+        if self.is_busy() {
+            return PluginsKeyOutcome::Consumed;
+        }
+        let (Some(entry), Some(instance)) = (self.selected_entry(), self.selected_instance())
+        else {
+            return PluginsKeyOutcome::Consumed;
+        };
+        let package = entry.name.clone();
+        let alias = instance.alias.clone();
+        if !is_grammar_alias(&alias) {
+            self.toggle_status = Some(ToggleStatus {
+                package,
+                alias,
+                kind: StatusKind::Done(ToggleOutcome::NotChanged(NotChanged::InvalidAlias)),
+            });
+            return PluginsKeyOutcome::Consumed;
+        }
+        match instance.enabled {
+            Some(shown) => {
+                self.pending_toggle = Some(ToggleTarget {
+                    alias,
+                    package,
+                    shown,
+                });
+                PluginsKeyOutcome::ToggleRequested
+            }
+            None => {
+                self.toggle_status = Some(ToggleStatus {
+                    package,
+                    alias,
+                    kind: StatusKind::UnknownValue,
+                });
+                PluginsKeyOutcome::Consumed
+            }
+        }
     }
 
     /// A failure replaces any earlier data, so stale rows are never shown as
@@ -804,7 +1378,7 @@ impl PluginsPane {
             Some(row) => self.list_state.select(Some(row)),
             None => {
                 self.detail_scroll = 0;
-                if self.focus == Focus::Detail {
+                if self.detail_open() {
                     self.focus = Focus::Packages;
                 }
                 self.clamp_selection();
@@ -814,6 +1388,13 @@ impl PluginsPane {
             self.focus = Focus::Filters;
             self.detail_scroll = 0;
         }
+        self.clamp_instances();
+    }
+
+    /// Whether the right pane shows a package detail: focus is on it or on
+    /// the instance list under it.
+    fn detail_open(&self) -> bool {
+        matches!(self.focus, Focus::Detail | Focus::Instances)
     }
 
     /// Whether the right pane draws a package list (or a detail opened from
@@ -869,9 +1450,114 @@ impl PluginsPane {
             (len, Some(row)) if row >= len => self.list_state.select(Some(len - 1)),
             _ => {}
         }
-        if self.focus == Focus::Detail && self.selected_entry().is_none() {
+        if self.detail_open() && self.selected_entry().is_none() {
             self.focus = Focus::Packages;
         }
+    }
+
+    // ── Channel instances ────────────────────────────────────────
+
+    /// The loaded instances whose `package` is exactly `package`. Raw string
+    /// equality: an instance naming a lookalike package is not shown here.
+    fn instances_of(&self, package: &str) -> Vec<&ChannelInstance> {
+        match &self.instances {
+            InstanceState::Loaded(instances) => instances
+                .iter()
+                .filter(|instance| instance.package.as_deref() == Some(package))
+                .collect(),
+            InstanceState::NotLoaded | InstanceState::Failed(_) => Vec::new(),
+        }
+    }
+
+    fn selected_instances(&self) -> Vec<&ChannelInstance> {
+        self.selected_entry()
+            .map(|entry| self.instances_of(&entry.name))
+            .unwrap_or_default()
+    }
+
+    fn selected_instance(&self) -> Option<&ChannelInstance> {
+        let row = self.instance_state.selected()?;
+        self.selected_instances().get(row).copied()
+    }
+
+    /// Whether a package's detail shows the instance block: its installed
+    /// record declares the channel capability, or a configured instance
+    /// names it. A failed read shows its error in the block of every
+    /// installed channel package; nothing shows before the first read.
+    fn shows_instance_block(&self, entry: &PluginCatalogEntry) -> bool {
+        let channel = entry.installed.as_ref().is_some_and(|installed| {
+            installed
+                .capabilities
+                .iter()
+                .any(|capability| capability == CHANNEL_CAPABILITY)
+        });
+        match &self.instances {
+            InstanceState::NotLoaded => false,
+            InstanceState::Failed(_) => channel,
+            InstanceState::Loaded(_) => channel || !self.instances_of(&entry.name).is_empty(),
+        }
+    }
+
+    /// Keep the instance cursor on a row, and move focus back to the detail
+    /// when the open package has no instance left to select.
+    fn clamp_instances(&mut self) {
+        let len = self.selected_instances().len();
+        match (len, self.instance_state.selected()) {
+            (0, _) => self.instance_state.select(None),
+            (_, None) => self.instance_state.select(Some(0)),
+            (len, Some(row)) if row >= len => self.instance_state.select(Some(len - 1)),
+            _ => {}
+        }
+        if self.focus == Focus::Instances && len == 0 {
+            self.focus = Focus::Detail;
+        }
+    }
+
+    fn step_instance(&mut self, delta: isize) {
+        let len = self.selected_instances().len();
+        if len == 0 {
+            self.instance_state.select(None);
+            return;
+        }
+        let current = self.instance_state.selected().unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, len as isize - 1) as usize;
+        self.instance_state.select(Some(next));
+    }
+
+    /// Enter in the detail moves into the instance list, only when the open
+    /// package has an instance to select.
+    fn enter_instances(&mut self) {
+        if !self.selected_instances().is_empty() {
+            self.focus = Focus::Instances;
+            self.clamp_instances();
+        }
+    }
+
+    /// The display-safe instance block of `entry`, or `None` when its detail
+    /// shows none.
+    fn instance_block(&self, entry: &PluginCatalogEntry) -> Option<InstanceBlock> {
+        if !self.shows_instance_block(entry) {
+            return None;
+        }
+        let rows = self
+            .instances_of(&entry.name)
+            .into_iter()
+            .map(|instance| (display_alias(&instance.alias), instance.enabled))
+            .collect();
+        let error = match &self.instances {
+            InstanceState::Failed(failure) => Some(failure.instances_message()),
+            InstanceState::NotLoaded | InstanceState::Loaded(_) => None,
+        };
+        let status = self
+            .toggle_status
+            .as_ref()
+            .filter(|status| status.package == entry.name)
+            .map(|status| (status.text(), status.is_warning()));
+        Some(InstanceBlock {
+            rows,
+            error,
+            status,
+        })
     }
 
     /// The data is unchanged, so the cursor follows the selected package by
@@ -924,6 +1610,8 @@ impl PluginsPane {
         if self.packages_shown() && self.selected_entry().is_some() {
             self.focus = Focus::Detail;
             self.detail_scroll = 0;
+            self.instance_state.select(None);
+            self.clamp_instances();
         }
     }
 
@@ -940,22 +1628,27 @@ impl PluginsPane {
                 Focus::Filters => self.step_filter(-1),
                 Focus::Packages => self.step_selection(-1),
                 Focus::Detail => self.scroll_detail(-1),
+                Focus::Instances => self.step_instance(-1),
             },
             A::Down => match self.focus {
                 Focus::Filters => self.step_filter(1),
                 Focus::Packages => self.step_selection(1),
                 Focus::Detail => self.scroll_detail(1),
+                Focus::Instances => self.step_instance(1),
             },
+            // Only Enter toggles; the inward chord never writes config.
+            A::Enter if self.focus == Focus::Instances => return self.request_toggle(),
             A::Enter | A::TabRight => match self.focus {
                 Focus::Filters if self.packages_shown() => self.focus = Focus::Packages,
-                Focus::Filters => {}
+                Focus::Filters | Focus::Instances => {}
                 Focus::Packages => self.open_detail(),
-                Focus::Detail => {}
+                Focus::Detail => self.enter_instances(),
             },
             A::Back | A::TabLeft => match self.focus {
                 Focus::Filters => return PluginsKeyOutcome::NotConsumed,
                 Focus::Packages => self.focus = Focus::Filters,
                 Focus::Detail => self.focus = Focus::Packages,
+                Focus::Instances => self.focus = Focus::Detail,
             },
             _ => {}
         }
@@ -999,6 +1692,19 @@ impl PluginsPane {
                     }
                     return;
                 }
+                // A click only selects an instance; toggling takes Enter.
+                if let Some(area) = self.last_instances_area
+                    && in_rect(col, row, area)
+                {
+                    // The instance list has no border of its own: its first
+                    // row is the top of its area.
+                    let idx = usize::from(row - area.y) + self.instance_state.offset();
+                    if idx < self.selected_instances().len() {
+                        self.focus = Focus::Instances;
+                        self.instance_state.select(Some(idx));
+                    }
+                    return;
+                }
                 if over(self.last_detail_area) {
                     self.focus = Focus::Detail;
                 }
@@ -1007,6 +1713,8 @@ impl PluginsPane {
             MouseEventKind::ScrollUp if over(self.last_filter_area) => self.step_filter(-1),
             MouseEventKind::ScrollDown if over(self.last_list_area) => self.step_selection(1),
             MouseEventKind::ScrollUp if over(self.last_list_area) => self.step_selection(-1),
+            MouseEventKind::ScrollDown if over(self.last_instances_area) => self.step_instance(1),
+            MouseEventKind::ScrollUp if over(self.last_instances_area) => self.step_instance(-1),
             MouseEventKind::ScrollDown if over(self.last_detail_area) => {
                 self.scroll_detail(i32::from(DETAIL_SCROLL_LINES));
             }
@@ -1021,7 +1729,8 @@ impl PluginsPane {
 
     /// Help for the focused list, so every entry names what its keys do
     /// there: at the filters, Back leaves for the previous sub-tab; in the
-    /// detail, Up/Down scroll and nothing opens.
+    /// detail, Up/Down scroll and Enter reaches the channel instances when
+    /// there are any; in the instance list, Enter toggles.
     pub(crate) fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::keymap::{ConfigTabAction as A, GlobalAction};
         use crate::widgets::{HelpEntry, HelpNode};
@@ -1045,9 +1754,22 @@ impl PluginsPane {
                 entry(&[A::Enter, A::TabRight], "zc-plugins-help-open"),
                 entry(&[A::Back, A::TabLeft], "zc-plugins-help-back-to-filters"),
             ],
-            Focus::Detail => vec![
-                entry(&[A::Up, A::Down], "zc-plugins-help-scroll"),
-                entry(&[A::Back, A::TabLeft], "zc-plugins-help-back-to-packages"),
+            Focus::Detail => [
+                Some(entry(&[A::Up, A::Down], "zc-plugins-help-scroll")),
+                (!self.selected_instances().is_empty())
+                    .then(|| entry(&[A::Enter, A::TabRight], "zc-plugins-help-instances")),
+                Some(entry(
+                    &[A::Back, A::TabLeft],
+                    "zc-plugins-help-back-to-packages",
+                )),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            Focus::Instances => vec![
+                entry(&[A::Up, A::Down], "zc-plugins-help-navigate"),
+                entry(&[A::Enter], "zc-plugins-help-toggle"),
+                entry(&[A::Back, A::TabLeft], "zc-plugins-help-back-to-detail"),
             ],
         };
         entries.extend([
@@ -1081,7 +1803,16 @@ impl PluginsPane {
                 Some("zc-plugins-footer-open"),
                 "zc-plugins-footer-back",
             ),
-            Focus::Detail => ("zc-plugins-footer-scroll", None, "zc-plugins-footer-back"),
+            Focus::Detail => (
+                "zc-plugins-footer-scroll",
+                (!self.selected_instances().is_empty()).then_some("zc-plugins-footer-instances"),
+                "zc-plugins-footer-back",
+            ),
+            Focus::Instances => (
+                "zc-plugins-footer-navigate",
+                Some("zc-plugins-footer-toggle"),
+                "zc-plugins-footer-back",
+            ),
         };
         let mut hint = format!(
             " {}={}  {}={}",
@@ -1121,6 +1852,7 @@ impl PluginsPane {
         self.last_filter_area = None;
         self.last_list_area = None;
         self.last_detail_area = None;
+        self.last_instances_area = None;
 
         self.draw_filters(frame, left[0]);
         self.draw_host(frame, left[1]);
@@ -1244,11 +1976,12 @@ impl PluginsPane {
             self.draw_message(frame, area, vec![body(key)]);
             return;
         }
-        if self.focus == Focus::Detail
+        if self.detail_open()
             && let Some(entry) = self.selected_entry()
         {
             let detail = project_detail(entry, self.unreadable());
-            self.draw_detail(frame, area, &detail);
+            let block = self.instance_block(entry);
+            self.draw_detail(frame, area, &detail, block.as_ref());
             return;
         }
         self.draw_list(frame, area);
@@ -1304,7 +2037,28 @@ impl PluginsPane {
         self.last_list_area = Some(area);
     }
 
-    fn draw_detail(&mut self, frame: &mut Frame, area: Rect, detail: &PackageDetail) {
+    /// The package detail, with its channel instance block in a split below
+    /// it. The detail scrolls on its own above the block, and its scroll is
+    /// clamped against the rows the block leaves it.
+    fn draw_detail(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        detail: &PackageDetail,
+        block: Option<&InstanceBlock>,
+    ) {
+        let area = match block {
+            Some(block) => {
+                let height = instance_block_height(block, area);
+                let parts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(0), Constraint::Length(height)])
+                    .split(area);
+                self.draw_instances(frame, parts[1], block);
+                parts[0]
+            }
+            None => area,
+        };
         let paragraph = Paragraph::new(detail_lines(detail)).wrap(Wrap { trim: false });
         let inner_width = area.width.saturating_sub(2);
         let inner_height = area.height.saturating_sub(2);
@@ -1321,11 +2075,150 @@ impl PluginsPane {
         );
         self.last_detail_area = Some(area);
     }
+
+    /// The instance list first, then the status line, then the footnote, so
+    /// a short block cuts the footnote before the status.
+    fn draw_instances(&mut self, frame: &mut Frame, area: Rect, block: &InstanceBlock) {
+        let title = self.panel_title(&t("zc-plugins-instances-title"), area);
+        let panel = theme::panel_block(&title);
+        let inner = panel.inner(area);
+        frame.render_widget(panel, area);
+        let list_height = instance_list_rows(block).min(inner.height);
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(list_height), Constraint::Min(0)])
+            .split(inner);
+        if list_height > 0 {
+            let width = usize::from(parts[0].width).saturating_sub(HIGHLIGHT_GUTTER);
+            let items: Vec<ListItem> = fit_instance_rows(&block.rows, width)
+                .into_iter()
+                .map(|(alias, state)| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(alias, theme::body_style()),
+                        Span::styled(state, theme::dim_style()),
+                    ]))
+                })
+                .collect();
+            let (style, symbol) = Self::highlight(self.focus == Focus::Instances);
+            frame.render_stateful_widget(
+                List::new(items)
+                    .highlight_style(style)
+                    .highlight_symbol(symbol),
+                parts[0],
+                &mut self.instance_state,
+            );
+            self.last_instances_area = Some(parts[0]);
+        }
+        frame.render_widget(
+            Paragraph::new(instance_text(block)).wrap(Wrap { trim: false }),
+            parts[1],
+        );
+    }
+}
+
+/// Rows the instance list takes, capped so a long list scrolls in place.
+fn instance_list_rows(block: &InstanceBlock) -> u16 {
+    u16::try_from(block.rows.len())
+        .unwrap_or(u16::MAX)
+        .min(MAX_INSTANCE_ROWS)
+}
+
+/// The block's text under the list: the read error or the empty note, the
+/// toggle status, and the footnote on what an enabled instance still needs.
+fn instance_text(block: &InstanceBlock) -> Vec<Line<'static>> {
+    let dim = |text: String| Line::from(Span::styled(text, theme::dim_style()));
+    let mut lines = Vec::new();
+    if let Some(error) = &block.error {
+        lines.push(Line::from(Span::styled(error.clone(), theme::warn_style())));
+        lines.extend(refresh_hint().map(dim));
+    } else if block.rows.is_empty() {
+        lines.push(dim(t("zc-plugins-instances-none")));
+    }
+    if let Some((status, warn)) = &block.status {
+        let style = if *warn {
+            theme::warn_style()
+        } else {
+            theme::accent_style()
+        };
+        lines.push(Line::from(Span::styled(status.clone(), style)));
+    }
+    lines.push(dim(t("zc-plugins-instances-footnote")));
+    lines
+}
+
+/// Height of the instance block in `area`: everything it holds when that
+/// fits, but never more than leaves the detail [`MIN_DETAIL_ROWS`].
+fn instance_block_height(block: &InstanceBlock, area: Rect) -> u16 {
+    let inner_width = area.width.saturating_sub(2);
+    let text_rows = u16::try_from(
+        Paragraph::new(instance_text(block))
+            .wrap(Wrap { trim: false })
+            .line_count(inner_width),
+    )
+    .unwrap_or(u16::MAX);
+    let wanted = instance_list_rows(block)
+        .saturating_add(text_rows)
+        .saturating_add(2);
+    let floor = area.height.min(3);
+    wanted
+        .min(area.height.saturating_sub(MIN_DETAIL_ROWS))
+        .max(floor)
+}
+
+/// The config state words of one instance.
+fn instance_state_text(enabled: Option<bool>) -> String {
+    t(match enabled {
+        Some(true) => "zc-plugins-instance-enabled",
+        Some(false) => "zc-plugins-instance-disabled",
+        None => "zc-plugins-instance-unknown",
+    })
+}
+
+/// Fit instance rows into `width` cells: the aliases padded to one column,
+/// then the state. The state keeps priority like the versions column of a
+/// package row; an alias gives up room down to [`MIN_LEAD`] cells first.
+fn fit_instance_rows(rows: &[(String, Option<bool>)], width: usize) -> Vec<(String, String)> {
+    use crate::display_width::display_width;
+    use crate::widgets::truncate_to_width;
+    let states: Vec<String> = rows
+        .iter()
+        .map(|(_, enabled)| instance_state_text(*enabled))
+        .collect();
+    let widest_state = states.iter().map(|s| display_width(s)).max().unwrap_or(0);
+    let alias_cap = if widest_state + 2 + MIN_LEAD <= width {
+        width - widest_state - 2
+    } else {
+        width / 2
+    };
+    let column = rows
+        .iter()
+        .map(|(alias, _)| display_width(alias))
+        .max()
+        .unwrap_or(0)
+        .min(alias_cap);
+    rows.iter()
+        .zip(states)
+        .map(|((alias, _), state)| {
+            let mut lead = truncate_to_width(alias, column);
+            let pad = column.saturating_sub(display_width(&lead));
+            lead.push_str(&" ".repeat(pad));
+            let room = width.saturating_sub(display_width(&lead));
+            let state = if room > 2 {
+                format!("  {}", truncate_to_width(&state, room - 2))
+            } else {
+                String::new()
+            };
+            (lead, state)
+        })
+        .collect()
 }
 
 impl Drop for PluginsPane {
     fn drop(&mut self) {
         if let Some(task) = self.refresh_task.take() {
+            task.abort();
+        }
+        if let Some((_, task)) = self.toggle_task.take() {
             task.abort();
         }
     }
@@ -1471,6 +2364,21 @@ mod tests {
         assert_eq!(request["method"], crate::client::method::PLUGINS_LIST);
         assert_eq!(request["params"], json!({}));
         request["id"].as_str().unwrap().to_string()
+    }
+
+    /// Receive the instance read that follows a loaded catalog, assert it
+    /// is `config/list` over the whole instance table, and answer it with no
+    /// instances.
+    async fn answer_instance_request(rx: &mut mpsc::Receiver<String>, outbound: &RpcOutbound) {
+        let raw = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a config/list request should follow the catalog")
+            .expect("the RPC writer should remain connected");
+        let request: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], crate::client::method::CONFIG_LIST);
+        assert_eq!(request["params"], json!({ "prefix": "channels.plugin" }));
+        let id = request["id"].as_str().unwrap();
+        outbound.dispatch_response(id, Some(json!({ "entries": [] })), None);
     }
 
     /// Give any spawned fetch time to reach the wire, then assert none did.
@@ -2402,8 +3310,10 @@ mod tests {
         assert!(pane.is_loading());
 
         outbound.dispatch_response(&id, Some(catalog_body()), None);
+        answer_instance_request(&mut rx, &outbound).await;
         settle(&mut pane).await;
         assert_eq!(pane.data, Some(catalog()));
+        assert_eq!(pane.instances, InstanceState::Loaded(Vec::new()));
 
         pane.refresh_if_inactive(&rpc);
         tokio::task::yield_now().await;
@@ -2421,6 +3331,7 @@ mod tests {
         pane.refresh_if_inactive(&rpc);
         let id = receive_catalog_request(&mut rx).await;
         outbound.dispatch_response(&id, Some(catalog_body()), None);
+        answer_instance_request(&mut rx, &outbound).await;
         settle(&mut pane).await;
 
         assert_eq!(
@@ -2461,6 +3372,7 @@ mod tests {
         let mut body = catalog_body();
         body["plugins"].as_array_mut().unwrap().truncate(1);
         outbound.dispatch_response(&id, Some(body), None);
+        answer_instance_request(&mut rx, &outbound).await;
         settle(&mut pane).await;
         assert_eq!(pane.plugins().len(), 1);
         let rows = render_rows(&mut pane, 100, 20);
@@ -2477,6 +3389,7 @@ mod tests {
         pane.refresh_if_inactive(&rpc);
         let id = receive_catalog_request(&mut rx).await;
         outbound.dispatch_response(&id, Some(catalog_body()), None);
+        answer_instance_request(&mut rx, &outbound).await;
         settle(&mut pane).await;
         assert_eq!(
             press(&mut pane, KeyCode::Right),
@@ -2509,6 +3422,12 @@ mod tests {
             pane.data.is_none(),
             "stale rows must not survive a failed refresh"
         );
+        assert_eq!(
+            pane.instances,
+            InstanceState::NotLoaded,
+            "nor do the instances read with them"
+        );
+        assert_no_request(&mut rx, "a failed catalog reads no instances").await;
         assert_eq!(
             pane.error,
             Some(CatalogError::Other(
@@ -2661,47 +3580,1268 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn navigation_and_refresh_only_ever_send_the_catalog_method() {
-        let (rpc, calls) = responding_client(Ok(catalog_body()));
+    // ── Channel instances ────────────────────────────────────────
+
+    use super::fake_daemon::{self, Declaration, Request, State, declaration};
+    use crate::keymap::GlobalAction;
+
+    /// An installed channel package (`chat`) and a registry-only lookalike
+    /// of it (`chat `), a registry-only channel package (`mail`), an
+    /// installed channel package with no instance (`relay`), and an
+    /// installed package that provides no channel (`calendar`).
+    fn channel_catalog_body() -> Value {
+        json!({
+            "plugins_enabled": true,
+            "wasm_plugins_available": true,
+            "plugins_dir": "/tmp/plugins",
+            "plugins": [
+                {
+                    "name": "chat",
+                    "installed": {
+                        "version": "0.1.0",
+                        "description": "Chat bridge",
+                        "capabilities": ["channel"],
+                        "permissions": []
+                    },
+                    "available": null
+                },
+                {
+                    "name": "calendar",
+                    "installed": {
+                        "version": "0.1.0",
+                        "description": null,
+                        "capabilities": ["tool"],
+                        "permissions": []
+                    },
+                    "available": null
+                },
+                {
+                    "name": "mail",
+                    "installed": null,
+                    "available": {
+                        "version": "1.2.3",
+                        "description": null,
+                        "capabilities": ["channel"],
+                        "install_source": "mail@1.2.3"
+                    }
+                },
+                {
+                    "name": "chat ",
+                    "installed": null,
+                    "available": {
+                        "version": "9.9.9",
+                        "description": null,
+                        "capabilities": ["channel"],
+                        "install_source": "chat@9.9.9"
+                    }
+                },
+                {
+                    "name": "relay",
+                    "installed": {
+                        "version": "0.2.0",
+                        "description": null,
+                        "capabilities": ["channel"],
+                        "permissions": []
+                    },
+                    "available": null
+                }
+            ],
+            "issues": []
+        })
+    }
+
+    fn channel_catalog() -> PluginsListResult {
+        serde_json::from_value(channel_catalog_body()).unwrap()
+    }
+
+    /// Listed out of alias order, as the daemon's map order may be. `orphan`
+    /// names a package the catalog does not list.
+    fn channel_declarations() -> Vec<Declaration> {
+        vec![
+            declaration("ops", "chat", "true"),
+            declaration("lookalike", "chat ", "true"),
+            declaration("alerts", "chat", "false"),
+            declaration("inbox", "mail", "true"),
+            declaration("orphan", "gone", "true"),
+        ]
+    }
+
+    fn channel_state() -> State {
+        State::new(Ok(channel_catalog_body())).with(channel_declarations())
+    }
+
+    type Served = (
+        PluginsPane,
+        Arc<RpcClient>,
+        Arc<RpcOutbound>,
+        Arc<Mutex<State>>,
+    );
+
+    /// A pane that has read the catalog and the instances from `state`.
+    async fn served_pane(state: State) -> Served {
+        let (rpc, outbound, daemon) = fake_daemon::serve(state);
         let mut pane = PluginsPane::new();
         pane.refresh_if_inactive(&rpc);
         settle(&mut pane).await;
+        (pane, rpc, outbound, daemon)
+    }
 
-        let keys = [
-            KeyCode::Down,
-            KeyCode::Down,
-            KeyCode::Up,
-            KeyCode::Right,
-            KeyCode::Down,
-            KeyCode::Enter,
-            KeyCode::Down,
-            KeyCode::Char('d'),
-            KeyCode::Char('x'),
-            KeyCode::Char('t'),
-            KeyCode::Esc,
-            KeyCode::Left,
-            KeyCode::Enter,
-            KeyCode::Char('/'),
-        ];
-        for code in keys {
-            if press(&mut pane, code) == PluginsKeyOutcome::RefreshRequested {
-                pane.refresh(&rpc);
-            }
-            settle(&mut pane).await;
+    fn request(method: &str, params: Value) -> Request {
+        Request {
+            method: method.to_string(),
+            params,
         }
+    }
+
+    fn requests(daemon: &Arc<Mutex<State>>) -> Vec<Request> {
+        daemon.lock().unwrap().requests.clone()
+    }
+
+    fn methods(daemon: &Arc<Mutex<State>>) -> Vec<String> {
+        daemon.lock().unwrap().methods()
+    }
+
+    fn rpc_failure(code: i32, message: &str) -> Option<JsonRpcError> {
+        Some(rpc_error(code, message))
+    }
+
+    /// Open `package`'s detail, move into its instance list and select
+    /// `alias`.
+    fn focus_instance(pane: &mut PluginsPane, package: &str, alias: &str) {
+        select_and_open(pane, package);
+        assert_eq!(press(pane, KeyCode::Enter), PluginsKeyOutcome::Consumed);
+        assert_eq!(pane.focus, Focus::Instances, "{package} has instances");
+        let row = pane
+            .selected_instances()
+            .iter()
+            .position(|instance| instance.alias == alias)
+            .unwrap();
+        pane.instance_state.select(Some(row));
+    }
+
+    async fn settle_toggle(pane: &mut PluginsPane) {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            pane.poll_toggle().await;
+            if !pane.is_toggling() {
+                return;
+            }
+        }
+        panic!("the toggle never finished");
+    }
+
+    /// Press Enter on the focused instance and run the toggle it asks for.
+    async fn toggle(pane: &mut PluginsPane, rpc: &Arc<RpcClient>) {
+        assert_eq!(
+            press(pane, KeyCode::Enter),
+            PluginsKeyOutcome::ToggleRequested
+        );
+        pane.start_toggle(rpc);
+        assert!(pane.is_toggling());
+        settle_toggle(pane).await;
+    }
+
+    /// The toggle status as shown, under the default keymap.
+    fn status_text(pane: &PluginsPane) -> String {
+        let _keymap = default_keymap();
+        pane.toggle_status
+            .as_ref()
+            .map(ToggleStatus::text)
+            .unwrap_or_default()
+    }
+
+    fn default_reload_chord() -> String {
+        let _keymap = default_keymap();
+        first_chord(GlobalAction::ReloadDaemon)
+    }
+
+    fn enabled_of(pane: &PluginsPane, alias: &str) -> Option<bool> {
+        match &pane.instances {
+            InstanceState::Loaded(instances) => {
+                instances
+                    .iter()
+                    .find(|instance| instance.alias == alias)
+                    .unwrap_or_else(|| panic!("no instance {alias}"))
+                    .enabled
+            }
+            other => panic!("instances not loaded: {other:?}"),
+        }
+    }
+
+    fn block_of(pane: &PluginsPane, package: &str) -> Option<InstanceBlock> {
+        let entry = pane
+            .plugins()
+            .iter()
+            .find(|entry| entry.name == package)
+            .unwrap();
+        let _keymap = default_keymap();
+        pane.instance_block(entry)
+    }
+
+    fn rows_of(rows: &[(&str, Option<bool>)]) -> Vec<(String, Option<bool>)> {
+        rows.iter()
+            .map(|(alias, enabled)| (alias.to_string(), *enabled))
+            .collect()
+    }
+
+    /// The drawn rows flowed into one line with box-drawing borders and runs
+    /// of whitespace collapsed, so a wrapped sentence can be found whole.
+    fn flowing(rows: &[String]) -> String {
+        rows.iter()
+            .flat_map(|row| row.split(|c: char| ('\u{2500}'..='\u{257f}').contains(&c)))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn field_row(path: &str, value: Option<Value>) -> ConfigFieldEntry {
+        ConfigFieldEntry {
+            path: path.to_string(),
+            category: "channels".to_string(),
+            kind: crate::wire::PropKind::String,
+            type_hint: "String".to_string(),
+            value,
+            populated: true,
+            is_secret: false,
+            is_env_overridden: false,
+            enum_variants: Vec::new(),
+            description: String::new(),
+            section: Some("channels".to_string()),
+            tab: Default::default(),
+            alias_source: None,
+        }
+    }
+
+    #[test]
+    fn instance_rows_parse_into_sorted_instances_with_unknown_values() {
+        let text = |value: &str| Some(json!(value));
+        let rows = vec![
+            field_row("channels.plugin.zed.package", text("chat")),
+            field_row("channels.plugin.zed.enabled", text("true")),
+            field_row("channels.plugin.alpha.enabled", text("false")),
+            field_row("channels.plugin.alpha.package", text("chat")),
+            field_row("channels.plugin.garbage.package", text("chat")),
+            field_row("channels.plugin.garbage.enabled", text("True")),
+            field_row("channels.plugin.missing.package", text("chat")),
+            // The daemon sends every value as a string; anything else is
+            // not a value this pane can read.
+            field_row("channels.plugin.boolean.package", text("chat")),
+            field_row("channels.plugin.boolean.enabled", Some(json!(true))),
+            field_row("channels.plugin.bare.enabled", None),
+            // Other tables, other fields, and paths with no field.
+            field_row("channels.plugins.x.package", text("chat")),
+            field_row("channels.pluginx.y.package", text("chat")),
+            field_row("channels.telegram.z.enabled", text("true")),
+            field_row("channels.plugin.extra.webhook_path", text("/hook")),
+            field_row("channels.plugin.nofield", text("x")),
+            field_row("channels.plugin", text("x")),
+        ];
+        let instance = |alias: &str, package: Option<&str>, enabled| ChannelInstance {
+            alias: alias.to_string(),
+            package: package.map(str::to_string),
+            enabled,
+        };
+        assert_eq!(
+            parse_instances(&rows),
+            vec![
+                instance("alpha", Some("chat"), Some(false)),
+                instance("bare", None, None),
+                instance("boolean", Some("chat"), None),
+                instance("garbage", Some("chat"), None),
+                instance("missing", Some("chat"), None),
+                instance("zed", Some("chat"), Some(true)),
+            ]
+        );
+        assert_eq!(parse_instances(&[]), Vec::new());
+
+        // An alias outside the config grammar is quoted, so it never reads
+        // as a valid one.
+        assert_eq!(display_alias("ops_2"), "ops_2");
+        assert_eq!(display_alias("Ops"), r#""Ops""#);
+        assert_eq!(display_alias("ops "), r#""ops\u{20}""#);
+        assert_eq!(display_alias("a.b"), r#""a.b""#);
+        assert_eq!(display_alias(""), r#""""#);
+        assert_eq!(
+            display_alias(&"a".repeat(64)),
+            format!("\"{}\"", "a".repeat(64))
+        );
+    }
+
+    #[tokio::test]
+    async fn instances_appear_only_under_the_package_they_name() {
+        let (mut pane, ..) = served_pane(channel_state()).await;
+        assert_eq!(
+            block_of(&pane, "chat").unwrap().rows,
+            rows_of(&[("alerts", Some(false)), ("ops", Some(true))]),
+            "sorted by alias; the lookalike package's instance is not here"
+        );
+        assert_eq!(
+            block_of(&pane, "chat ").unwrap().rows,
+            rows_of(&[("lookalike", Some(true))])
+        );
+        // Named by an instance, so shown although it is not installed.
+        assert_eq!(
+            block_of(&pane, "mail").unwrap().rows,
+            rows_of(&[("inbox", Some(true))])
+        );
+        // An installed channel package with no instance gets an empty block.
+        assert_eq!(block_of(&pane, "relay").unwrap().rows, Vec::new());
+        assert_eq!(block_of(&pane, "calendar"), None);
+        // The orphan names no listed package, so it shows nowhere.
+        for entry in pane.plugins() {
+            let rows = block_of(&pane, &entry.name)
+                .map(|b| b.rows)
+                .unwrap_or_default();
+            assert!(rows.iter().all(|(alias, _)| alias != "orphan"), "{rows:?}");
+        }
+
+        let _keymap = default_keymap();
+        select_and_open(&mut pane, "chat");
+        let rows = render_rows(&mut pane, 100, 30);
+        let text = flowing(&rows);
+        assert!(text.contains("Channel instances"), "{rows:#?}");
+        assert!(text.contains("alerts disabled in config"), "{rows:#?}");
+        assert!(text.contains("ops enabled in config"), "{rows:#?}");
+        assert!(!text.contains("lookalike"), "{rows:#?}");
+        assert!(
+            text.contains(
+                "An enabled instance starts after a daemon reload only if [plugins] enabled \
+                 is on and an enabled agent lists plugin.<alias> in its channels."
+            ),
+            "{rows:#?}"
+        );
+
+        select_and_open(&mut pane, "relay");
+        let text = flowing(&render_rows(&mut pane, 100, 30));
+        assert!(
+            text.contains("No channel instance in config names this package."),
+            "{text}"
+        );
+
+        select_and_open(&mut pane, "calendar");
+        let text = flowing(&render_rows(&mut pane, 100, 30));
+        assert!(!text.contains("Channel instances"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn one_refresh_reads_the_catalog_then_the_instances() {
+        let (mut pane, rpc, _outbound, daemon) = served_pane(channel_state()).await;
+        assert_eq!(
+            requests(&daemon),
+            vec![
+                request("plugins/list", json!({})),
+                request("config/list", json!({ "prefix": "channels.plugin" })),
+            ]
+        );
+        let aliases: Vec<&str> = match &pane.instances {
+            InstanceState::Loaded(instances) => instances
+                .iter()
+                .map(|instance| instance.alias.as_str())
+                .collect(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(aliases, ["alerts", "inbox", "lookalike", "ops", "orphan"]);
+
         assert_eq!(
             press(&mut pane, KeyCode::Char('r')),
             PluginsKeyOutcome::RefreshRequested
         );
         pane.refresh(&rpc);
         settle(&mut pane).await;
-        let _ = render_rows(&mut pane, 80, 24);
+        assert_eq!(
+            methods(&daemon),
+            ["plugins/list", "config/list", "plugins/list", "config/list"],
+            "r refreshes both"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_instance_read_failure_leaves_the_catalog_and_shows_in_the_block() {
+        let reason = "Principal is not granted config:read (required by config/list)";
+        let mut state = channel_state();
+        state.list_error = rpc_failure(error_codes::FORBIDDEN, reason);
+        let (mut pane, ..) = served_pane(state).await;
+        assert_eq!(pane.error, None);
+        assert_eq!(pane.data, Some(channel_catalog()));
+        assert_eq!(
+            pane.instances,
+            InstanceState::Failed(CallFailure::Forbidden(reason.to_string()))
+        );
+
+        let _keymap = default_keymap();
+        let text = flowing(&render_rows(&mut pane, 100, 30));
+        assert!(text.contains("\u{25cf} chat"), "{text}");
+
+        select_and_open(&mut pane, "chat");
+        let text = flowing(&render_rows(&mut pane, 100, 30));
+        assert!(
+            text.contains(&format!(
+                "The daemon refused to list channel instances: {reason}"
+            )),
+            "{text}"
+        );
+        assert!(text.contains("Press r to refresh."), "{text}");
+        assert!(
+            text.contains("Name: chat"),
+            "the detail still renders: {text}"
+        );
+        assert!(!text.contains("ops"), "{text}");
+        // Nothing to move into.
+        drop(_keymap);
+        assert_eq!(
+            press(&mut pane, KeyCode::Enter),
+            PluginsKeyOutcome::Consumed
+        );
+        assert_eq!(pane.focus, Focus::Detail);
+
+        // A package that provides no channel shows no block, error or not.
+        assert_eq!(block_of(&pane, "calendar"), None);
 
         assert_eq!(
-            calls.lock().unwrap().as_slice(),
-            ["plugins/list", "plugins/list"],
-            "the pane is read-only: plugins/list is the only method it sends"
+            CallFailure::TimedOut.instances_message(),
+            "Reading the channel instances timed out."
+        );
+        assert_eq!(
+            CallFailure::Other("boom".to_string()).instances_message(),
+            "Could not read channel instances: boom"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_catalog_reads_no_instances() {
+        let state = State::new(Err(rpc_error(error_codes::INTERNAL_ERROR, "scan failed")))
+            .with(channel_declarations());
+        let (pane, _rpc, _outbound, daemon) = served_pane(state).await;
+        assert_eq!(methods(&daemon), ["plugins/list"]);
+        assert_eq!(pane.instances, InstanceState::NotLoaded);
+    }
+
+    #[tokio::test]
+    async fn a_toggle_rereads_writes_a_json_bool_and_reads_back() {
+        let (mut pane, rpc, _outbound, daemon) = served_pane(channel_state()).await;
+        let reload = default_reload_chord();
+        assert!(!reload.is_empty());
+
+        focus_instance(&mut pane, "chat", "ops");
+        let before = requests(&daemon).len();
+        toggle(&mut pane, &rpc).await;
+        let sent = requests(&daemon)[before..].to_vec();
+        assert_eq!(
+            sent,
+            vec![
+                request("config/list", json!({ "prefix": "channels.plugin.ops" })),
+                request(
+                    "config/set",
+                    json!({ "prop": "channels.plugin.ops.enabled", "value": false })
+                ),
+                request("config/list", json!({ "prefix": "channels.plugin.ops" })),
+            ]
+        );
+        assert!(
+            sent[1].params["value"].is_boolean(),
+            "the value is a JSON bool, not a string"
+        );
+        assert_eq!(
+            daemon
+                .lock()
+                .unwrap()
+                .find("ops")
+                .unwrap()
+                .enabled
+                .as_deref(),
+            Some("false")
+        );
+        assert_eq!(enabled_of(&pane, "ops"), Some(false));
+        assert_eq!(
+            pane.toggle_status.as_ref().map(|status| &status.kind),
+            Some(&StatusKind::Done(ToggleOutcome::Saved(Some(false))))
+        );
+        let text = status_text(&pane);
+        assert_eq!(
+            text,
+            format!(
+                "Saved: ops is now disabled in config. Takes effect after a daemon reload \
+                 ({reload})."
+            )
+        );
+        for word in ["start", "stop", "running", "active", "healthy"] {
+            assert!(!text.to_lowercase().contains(word), "{word}: {text}");
+        }
+
+        // The other way round: a disabled instance is written true.
+        assert_eq!(press(&mut pane, KeyCode::Up), PluginsKeyOutcome::Consumed);
+        assert_eq!(
+            pane.selected_instance().map(|i| i.alias.as_str()),
+            Some("alerts")
+        );
+        let before = requests(&daemon).len();
+        toggle(&mut pane, &rpc).await;
+        assert_eq!(
+            requests(&daemon)[before + 1],
+            request(
+                "config/set",
+                json!({ "prop": "channels.plugin.alerts.enabled", "value": true })
+            )
+        );
+        assert_eq!(enabled_of(&pane, "alerts"), Some(true));
+        assert!(
+            status_text(&pane).starts_with("Saved: alerts is now enabled in config."),
+            "{}",
+            status_text(&pane)
+        );
+
+        // The status line is drawn in the block, and only in this package's.
+        let _keymap = default_keymap();
+        let text = flowing(&render_rows(&mut pane, 100, 30));
+        assert!(
+            text.contains("Saved: alerts is now enabled in config."),
+            "{text}"
+        );
+        assert!(text.contains("alerts enabled in config"), "{text}");
+        drop(_keymap);
+        select_and_open(&mut pane, "mail");
+        assert_eq!(block_of(&pane, "mail").unwrap().status, None);
+    }
+
+    #[tokio::test]
+    async fn a_toggle_writes_nothing_when_the_instance_changed_since_it_was_read() {
+        type Change = fn(&mut State);
+        let cases: [(&str, Change); 3] = [
+            ("removed", |state: &mut State| {
+                state.declarations.retain(|decl| decl.alias != "ops");
+            }),
+            ("package changed", |state: &mut State| {
+                if let Some(decl) = state.declarations.iter_mut().find(|d| d.alias == "ops") {
+                    decl.package = Some("chat-v2".to_string());
+                }
+            }),
+            ("value changed", |state: &mut State| {
+                if let Some(decl) = state.declarations.iter_mut().find(|d| d.alias == "ops") {
+                    decl.enabled = Some("false".to_string());
+                }
+            }),
+        ];
+        for (name, change) in cases {
+            let (mut pane, rpc, _outbound, daemon) = served_pane(channel_state()).await;
+            focus_instance(&mut pane, "chat", "ops");
+            change(&mut daemon.lock().unwrap());
+            let declarations = daemon.lock().unwrap().declarations.clone();
+            let before = requests(&daemon).len();
+            toggle(&mut pane, &rpc).await;
+            assert_eq!(
+                requests(&daemon)[before..].to_vec(),
+                vec![request(
+                    "config/list",
+                    json!({ "prefix": "channels.plugin.ops" })
+                )],
+                "{name}: no config/set"
+            );
+            assert_eq!(
+                daemon.lock().unwrap().declarations,
+                declarations,
+                "{name}: nothing written, and a removed alias is not re-created"
+            );
+            assert_eq!(enabled_of(&pane, "ops"), Some(true), "{name}");
+            assert_eq!(
+                status_text(&pane),
+                "ops was not changed: it changed since it was read. Press r to refresh.",
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_or_failed_write_shows_the_reason_and_keeps_the_value() {
+        // Refused: the daemon checks write authority before staging, so
+        // nothing is read back.
+        let reason =
+            "Principal is not granted config write access to \"channels.plugin.ops.enabled\"";
+        let mut state = channel_state();
+        state.set_error = rpc_failure(error_codes::FORBIDDEN, reason);
+        let (mut pane, rpc, _outbound, daemon) = served_pane(state).await;
+        focus_instance(&mut pane, "chat", "ops");
+        let before = methods(&daemon).len();
+        toggle(&mut pane, &rpc).await;
+        assert_eq!(methods(&daemon)[before..], ["config/list", "config/set"]);
+        assert_eq!(
+            status_text(&pane),
+            format!("ops was not changed: not permitted ({reason}).")
+        );
+        assert_eq!(enabled_of(&pane, "ops"), Some(true));
+        assert_eq!(
+            daemon
+                .lock()
+                .unwrap()
+                .find("ops")
+                .unwrap()
+                .enabled
+                .as_deref(),
+            Some("true")
+        );
+
+        // Any other failure: the read-back confirms the value is unchanged,
+        // and the daemon's message is shown sanitized.
+        let mut state = channel_state();
+        state.set_error = rpc_failure(
+            error_codes::INTERNAL_ERROR,
+            "Config save failed: disk\u{1b}[2J full",
+        );
+        let (mut pane, rpc, _outbound, daemon) = served_pane(state).await;
+        focus_instance(&mut pane, "chat", "ops");
+        let before = methods(&daemon).len();
+        toggle(&mut pane, &rpc).await;
+        assert_eq!(
+            methods(&daemon)[before..],
+            ["config/list", "config/set", "config/list"]
+        );
+        assert_eq!(
+            status_text(&pane),
+            "ops was not changed: Config save failed: disk\u{fffd}[2J full"
+        );
+        assert_eq!(enabled_of(&pane, "ops"), Some(true));
+
+        // The re-read before the write fails: nothing is written.
+        let (mut pane, rpc, _outbound, daemon) = served_pane(channel_state()).await;
+        focus_instance(&mut pane, "chat", "ops");
+        daemon.lock().unwrap().list_error =
+            rpc_failure(error_codes::INTERNAL_ERROR, "config is busy");
+        let before = methods(&daemon).len();
+        toggle(&mut pane, &rpc).await;
+        assert_eq!(methods(&daemon)[before..], ["config/list"]);
+        assert_eq!(status_text(&pane), "ops was not changed: config is busy");
+        assert_eq!(enabled_of(&pane, "ops"), Some(true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_with_no_answer_is_reported_as_unconfirmed() {
+        let mut state = channel_state();
+        state.hold_set = true;
+        let (mut pane, rpc, _outbound, daemon) = served_pane(state).await;
+        focus_instance(&mut pane, "chat", "ops");
+        assert_eq!(
+            press(&mut pane, KeyCode::Enter),
+            PluginsKeyOutcome::ToggleRequested
+        );
+        pane.start_toggle(&rpc);
+        assert_eq!(status_text(&pane), "Saving ops\u{2026}");
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            pane.poll_toggle().await;
+        }
+        assert!(pane.is_toggling(), "the write is still waiting at 4 s");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        settle_toggle(&mut pane).await;
+        assert_eq!(
+            methods(&daemon)[2..],
+            ["config/list", "config/set"],
+            "a read now could show the old value of a write that lands later"
+        );
+        assert_eq!(
+            status_text(&pane),
+            "ops may or may not have changed (the daemon did not answer in time). \
+             Press r to refresh."
+        );
+        assert_eq!(enabled_of(&pane, "ops"), None, "the value is now unknown");
+    }
+
+    #[tokio::test]
+    async fn a_write_whose_result_is_unclear_shows_what_was_read_back() {
+        // The write landed but its reply was lost.
+        let mut state = channel_state();
+        state.set_error = rpc_failure(error_codes::INTERNAL_ERROR, "Outbound RPC dropped");
+        state.apply_failed_set = true;
+        let (mut pane, rpc, _outbound, _daemon) = served_pane(state).await;
+        focus_instance(&mut pane, "chat", "ops");
+        toggle(&mut pane, &rpc).await;
+        assert_eq!(
+            status_text(&pane),
+            "ops may or may not have changed (Outbound RPC dropped). Press r to refresh."
+        );
+        assert_eq!(enabled_of(&pane, "ops"), Some(false), "the value read back");
+
+        // The write was saved but could not be read back.
+        let reload = default_reload_chord();
+        let mut state = channel_state();
+        state.list_error_after_set = rpc_failure(error_codes::INTERNAL_ERROR, "busy");
+        let (mut pane, rpc, _outbound, _daemon) = served_pane(state).await;
+        focus_instance(&mut pane, "chat", "ops");
+        toggle(&mut pane, &rpc).await;
+        assert_eq!(
+            status_text(&pane),
+            format!(
+                "Saved ops, but its stored value could not be read back. Press r to refresh. \
+                 Takes effect after a daemon reload ({reload})."
+            )
+        );
+        assert_eq!(enabled_of(&pane, "ops"), None);
+    }
+
+    #[tokio::test]
+    async fn enter_on_an_unknown_value_writes_nothing() {
+        let state = State::new(Ok(channel_catalog_body())).with(vec![
+            declaration("odd", "chat", "yes"),
+            Declaration {
+                alias: "partial".to_string(),
+                package: Some("chat".to_string()),
+                enabled: None,
+            },
+        ]);
+        let (mut pane, rpc, _outbound, daemon) = served_pane(state).await;
+        for alias in ["odd", "partial"] {
+            focus_instance(&mut pane, "chat", alias);
+            assert_eq!(enabled_of(&pane, alias), None);
+            assert_eq!(
+                press(&mut pane, KeyCode::Enter),
+                PluginsKeyOutcome::Consumed
+            );
+            pane.start_toggle(&rpc);
+            assert!(!pane.is_toggling());
+            assert_eq!(
+                status_text(&pane),
+                format!("{alias} has no known value to toggle. Press r to refresh.")
+            );
+        }
+        assert_eq!(methods(&daemon), ["plugins/list", "config/list"]);
+        let _keymap = default_keymap();
+        let text = flowing(&render_rows(&mut pane, 100, 30));
+        assert!(text.contains("odd unknown"), "{text}");
+    }
+
+    #[test]
+    fn the_alias_grammar_matches_the_daemon() {
+        for alias in ["a", "0", "ops", "matrix_room", "a1_b2"] {
+            assert!(is_grammar_alias(alias), "{alias:?}");
+        }
+        assert!(is_grammar_alias(&"a".repeat(63)));
+        for alias in ["", "a.b", "A", "_a", "a_", "a__b", "a-b", "a b", "\u{e9}"] {
+            assert!(!is_grammar_alias(alias), "{alias:?}");
+        }
+        assert!(!is_grammar_alias(&"a".repeat(64)));
+        assert_eq!(display_alias("ops"), "ops");
+        assert_eq!(display_alias("a.b"), "\"a.b\"");
+    }
+
+    /// The daemon resolves `channels.plugin.a.b.enabled` by the first path
+    /// segment, so a write to a hand-edited `a.b` would create a second,
+    /// package-less instance `a`. Neither Enter nor the toggle task writes.
+    #[tokio::test]
+    async fn an_alias_outside_the_grammar_is_never_written() {
+        let state =
+            State::new(Ok(channel_catalog_body())).with(vec![declaration("a.b", "chat", "true")]);
+        let (mut pane, rpc, _outbound, daemon) = served_pane(state).await;
+        focus_instance(&mut pane, "chat", "a.b");
+        assert_eq!(
+            press(&mut pane, KeyCode::Enter),
+            PluginsKeyOutcome::Consumed
+        );
+        pane.start_toggle(&rpc);
+        assert!(!pane.is_toggling());
+        assert_eq!(
+            status_text(&pane),
+            "\"a.b\" was not changed: its name is outside the alias grammar, \
+             so it can only be fixed in the config file."
+        );
+
+        let target = ToggleTarget {
+            alias: "a.b".to_string(),
+            package: "chat".to_string(),
+            shown: true,
+        };
+        assert_eq!(
+            run_toggle(Arc::clone(&rpc), target).await,
+            ToggleOutcome::NotChanged(NotChanged::InvalidAlias)
+        );
+        assert_eq!(methods(&daemon), ["plugins/list", "config/list"]);
+    }
+
+    #[tokio::test]
+    async fn one_toggle_at_a_time_and_dropping_the_pane_aborts_it() {
+        let mut state = channel_state();
+        state.hold_set = true;
+        let (mut pane, rpc, outbound, daemon) = served_pane(state).await;
+        focus_instance(&mut pane, "chat", "ops");
+        assert_eq!(
+            press(&mut pane, KeyCode::Enter),
+            PluginsKeyOutcome::ToggleRequested
+        );
+        pane.start_toggle(&rpc);
+        for _ in 0..200 {
+            if methods(&daemon).iter().any(|m| m == "config/set") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(outbound.pending_count(), 1, "the write is in flight");
+
+        // Further toggles, on either instance, ask for nothing.
+        assert_eq!(
+            press(&mut pane, KeyCode::Enter),
+            PluginsKeyOutcome::Consumed
+        );
+        assert_eq!(press(&mut pane, KeyCode::Up), PluginsKeyOutcome::Consumed);
+        assert_eq!(
+            press(&mut pane, KeyCode::Enter),
+            PluginsKeyOutcome::Consumed
+        );
+        pane.start_toggle(&rpc);
+        // Even a target held from before is dropped while one runs.
+        pane.pending_toggle = Some(ToggleTarget {
+            alias: "alerts".to_string(),
+            package: "chat".to_string(),
+            shown: false,
+        });
+        pane.start_toggle(&rpc);
+        assert_eq!(pane.pending_toggle, None);
+        // A refresh waits too, so its read cannot land after the write.
+        assert_eq!(
+            press(&mut pane, KeyCode::Char('r')),
+            PluginsKeyOutcome::RefreshRequested
+        );
+        pane.refresh(&rpc);
+        assert!(!pane.is_loading());
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            pane.poll_toggle().await;
+        }
+        assert_eq!(
+            methods(&daemon),
+            ["plugins/list", "config/list", "config/list", "config/set"]
+        );
+        assert!(pane.is_toggling());
+
+        drop(pane);
+        for _ in 0..100 {
+            if outbound.pending_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            outbound.pending_count(),
+            0,
+            "dropping the pane must cancel its pending config/set"
+        );
+    }
+
+    #[tokio::test]
+    async fn focus_reaches_the_instances_only_when_there_are_some() {
+        let (mut pane, _rpc, _outbound, daemon) = served_pane(channel_state()).await;
+
+        // No block, and an empty block: Enter and the inward chord stay put.
+        for package in ["calendar", "relay"] {
+            select_and_open(&mut pane, package);
+            for code in [KeyCode::Enter, KeyCode::Right] {
+                assert_eq!(press(&mut pane, code), PluginsKeyOutcome::Consumed);
+                assert_eq!(pane.focus, Focus::Detail, "{package}");
+            }
+            assert_eq!(pane.pending_toggle, None);
+        }
+
+        select_and_open(&mut pane, "chat");
+        assert_eq!(
+            press(&mut pane, KeyCode::Right),
+            PluginsKeyOutcome::Consumed
+        );
+        assert_eq!(pane.focus, Focus::Instances);
+        let selected = |pane: &PluginsPane| pane.selected_instance().map(|i| i.alias.clone());
+        assert_eq!(selected(&pane).as_deref(), Some("alerts"));
+        press(&mut pane, KeyCode::Down);
+        assert_eq!(selected(&pane).as_deref(), Some("ops"));
+        press(&mut pane, KeyCode::Down);
+        assert_eq!(selected(&pane).as_deref(), Some("ops"), "Down clamps");
+        // The inward chord never toggles.
+        assert_eq!(
+            press(&mut pane, KeyCode::Right),
+            PluginsKeyOutcome::Consumed
+        );
+        assert_eq!(pane.pending_toggle, None);
+        assert_eq!(press(&mut pane, KeyCode::Esc), PluginsKeyOutcome::Consumed);
+        assert_eq!(pane.focus, Focus::Detail);
+        assert_eq!(
+            press(&mut pane, KeyCode::Enter),
+            PluginsKeyOutcome::Consumed
+        );
+        assert_eq!(pane.focus, Focus::Instances);
+        assert_eq!(
+            selected(&pane).as_deref(),
+            Some("ops"),
+            "the cursor is kept"
+        );
+        assert_eq!(press(&mut pane, KeyCode::Left), PluginsKeyOutcome::Consumed);
+        assert_eq!(pane.focus, Focus::Detail);
+        assert_eq!(press(&mut pane, KeyCode::Esc), PluginsKeyOutcome::Consumed);
+        assert_eq!(pane.focus, Focus::Packages);
+
+        // Opening another package starts its list at the top.
+        select_and_open(&mut pane, "mail");
+        assert_eq!(selected(&pane).as_deref(), Some("inbox"));
+        assert_eq!(methods(&daemon), ["plugins/list", "config/list"]);
+    }
+
+    #[test]
+    fn instance_focus_falls_back_when_a_refresh_removes_what_it_rests_on() {
+        let instance = |alias: &str, package: &str| ChannelInstance {
+            alias: alias.to_string(),
+            package: Some(package.to_string()),
+            enabled: Some(true),
+        };
+        let fetch =
+            |catalog: Result<PluginsListResult, CatalogError>,
+             instances: Option<Result<Vec<ChannelInstance>, CallFailure>>| {
+                FetchResult { catalog, instances }
+            };
+        let loaded =
+            |instances: Vec<ChannelInstance>| fetch(Ok(channel_catalog()), Some(Ok(instances)));
+        let enter = |pane: &mut PluginsPane, alias: &str| {
+            focus_instance(pane, "chat", alias);
+        };
+
+        let mut pane = PluginsPane::new();
+        pane.apply_fetch(loaded(vec![
+            instance("alerts", "chat"),
+            instance("ops", "chat"),
+        ]));
+        enter(&mut pane, "ops");
+
+        // A new alias that sorts first: the cursor follows ops.
+        pane.apply_fetch(loaded(vec![
+            instance("aaa", "chat"),
+            instance("alerts", "chat"),
+            instance("ops", "chat"),
+        ]));
+        assert_eq!(pane.focus, Focus::Instances);
+        assert_eq!(
+            pane.selected_instance().map(|i| i.alias.as_str()),
+            Some("ops")
+        );
+
+        // ops is gone: the cursor clamps onto a remaining row.
+        pane.apply_fetch(loaded(vec![
+            instance("aaa", "chat"),
+            instance("alerts", "chat"),
+        ]));
+        assert_eq!(pane.focus, Focus::Instances);
+        assert_eq!(
+            pane.selected_instance().map(|i| i.alias.as_str()),
+            Some("alerts")
+        );
+
+        // No instance left for chat: back to the detail.
+        pane.apply_fetch(loaded(vec![instance("ops", "mail")]));
+        assert_eq!(pane.focus, Focus::Detail);
+        assert_eq!(pane.selected_instance(), None);
+
+        // The instance read fails: back to the detail.
+        pane.apply_fetch(loaded(vec![instance("ops", "chat")]));
+        enter(&mut pane, "ops");
+        pane.apply_fetch(fetch(
+            Ok(channel_catalog()),
+            Some(Err(CallFailure::TimedOut)),
+        ));
+        assert_eq!(pane.focus, Focus::Detail);
+
+        // The package is gone: back to the packages.
+        pane.apply_fetch(loaded(vec![instance("ops", "chat")]));
+        enter(&mut pane, "ops");
+        let mut without_chat = channel_catalog();
+        without_chat.plugins.retain(|entry| entry.name != "chat");
+        pane.apply_fetch(fetch(
+            Ok(without_chat),
+            Some(Ok(vec![instance("ops", "chat")])),
+        ));
+        assert_eq!(pane.focus, Focus::Packages);
+
+        // The catalog fails: back to the filters.
+        pane.apply_fetch(loaded(vec![instance("ops", "chat")]));
+        enter(&mut pane, "ops");
+        pane.apply_fetch(fetch(Err(CatalogError::TimedOut), None));
+        assert_eq!(pane.focus, Focus::Filters);
+        assert_eq!(pane.instances, InstanceState::NotLoaded);
+    }
+
+    /// The pane's only write is `config/set` on one instance's `enabled`,
+    /// with a JSON bool, and only after Enter in the instance list; every
+    /// read is the catalog or the instance table.
+    #[tokio::test]
+    async fn the_only_write_is_an_instance_toggle_after_the_toggle_key() {
+        let (mut pane, rpc, _outbound, daemon) = served_pane(channel_state()).await;
+        let allowed = |request: &Request| {
+            let alias_only = |alias: &str| !alias.is_empty() && !alias.contains('.');
+            match request.method.as_str() {
+                "plugins/list" => request.params == json!({}),
+                "config/list" => request.params["prefix"].as_str().is_some_and(|prefix| {
+                    prefix == "channels.plugin"
+                        || prefix
+                            .strip_prefix("channels.plugin.")
+                            .is_some_and(alias_only)
+                }),
+                "config/set" => {
+                    request.params["value"].is_boolean()
+                        && request.params["prop"].as_str().is_some_and(|prop| {
+                            prop.strip_prefix("channels.plugin.")
+                                .and_then(|rest| rest.strip_suffix(".enabled"))
+                                .is_some_and(alias_only)
+                        })
+                }
+                _ => false,
+            }
+        };
+
+        // Every focus, every key that edits in other panes, and a refresh.
+        let keys = [
+            KeyCode::Right,
+            KeyCode::Enter,
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Right,
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Right,
+            KeyCode::Char('d'),
+            KeyCode::Char('x'),
+            KeyCode::Char('t'),
+            KeyCode::Char('/'),
+            KeyCode::Left,
+            KeyCode::Esc,
+            KeyCode::Down,
+            KeyCode::Enter,
+            KeyCode::Right,
+            KeyCode::Enter,
+            KeyCode::Char('d'),
+            KeyCode::Esc,
+            KeyCode::Esc,
+            KeyCode::Down,
+            KeyCode::Char('r'),
+            KeyCode::Up,
+        ];
+        let mut saw_instances = false;
+        for code in keys {
+            match press(&mut pane, code) {
+                PluginsKeyOutcome::RefreshRequested => pane.refresh(&rpc),
+                PluginsKeyOutcome::ToggleRequested => panic!("{code:?} asked for a toggle"),
+                PluginsKeyOutcome::Consumed | PluginsKeyOutcome::NotConsumed => {}
+            }
+            saw_instances |= pane.focus == Focus::Instances;
+            settle(&mut pane).await;
+        }
+        assert!(saw_instances, "the sweep reached the instance list");
+        {
+            let _keymap = default_keymap();
+            let _ = render_rows(&mut pane, 80, 24);
+        }
+        let reads = requests(&daemon);
+        assert!(reads.iter().all(|r| r.method != "config/set"), "{reads:#?}");
+        assert!(reads.iter().all(allowed), "{reads:#?}");
+
+        focus_instance(&mut pane, "chat", "ops");
+        let before_toggle = requests(&daemon).len();
+        toggle(&mut pane, &rpc).await;
+        let all = requests(&daemon);
+        assert!(all.iter().all(allowed), "{all:#?}");
+        let writes: Vec<usize> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.method == "config/set")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(writes.len(), 1, "{all:#?}");
+        assert!(
+            writes[0] > before_toggle,
+            "the write follows the toggle key"
+        );
+        assert_eq!(
+            all[writes[0]].params["prop"],
+            json!("channels.plugin.ops.enabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_click_selects_an_instance_and_never_toggles() {
+        use crossterm::event::KeyModifiers as M;
+        let (mut pane, _rpc, _outbound, daemon) = served_pane(channel_state()).await;
+        select_and_open(&mut pane, "chat");
+        {
+            let _keymap = default_keymap();
+            let _ = render_rows(&mut pane, 100, 30);
+        }
+        let area = pane
+            .last_instances_area
+            .expect("the instance list is drawn");
+        let mouse = |kind, row: u16| MouseEvent {
+            kind,
+            column: area.x + 3,
+            row,
+            modifiers: M::NONE,
+        };
+        let click = MouseEventKind::Down(MouseButton::Left);
+        pane.handle_mouse(mouse(click, area.y + 1));
+        pane.handle_mouse(mouse(click, area.y + 1));
+        assert_eq!(pane.focus, Focus::Instances);
+        assert_eq!(
+            pane.selected_instance().map(|i| i.alias.as_str()),
+            Some("ops")
+        );
+        assert_eq!(pane.pending_toggle, None, "a double click does not toggle");
+        pane.handle_mouse(mouse(MouseEventKind::ScrollUp, area.y));
+        assert_eq!(
+            pane.selected_instance().map(|i| i.alias.as_str()),
+            Some("alerts")
+        );
+        // A click past the last row selects nothing new.
+        pane.handle_mouse(mouse(click, area.y + 5));
+        assert_eq!(
+            pane.selected_instance().map(|i| i.alias.as_str()),
+            Some("alerts")
+        );
+        assert_eq!(methods(&daemon), ["plugins/list", "config/list"]);
+    }
+
+    #[tokio::test]
+    async fn help_and_footer_name_the_instance_keys() {
+        let (mut pane, ..) = served_pane(channel_state()).await;
+        select_and_open(&mut pane, "chat");
+        let _keymap = default_keymap();
+        let actions = |pane: &PluginsPane| -> Vec<String> {
+            pane.help_context()
+                .entries
+                .iter()
+                .map(|e| e.action.clone())
+                .collect()
+        };
+        let mouse = t("zc-config-help-mouse-open");
+        let tail = [
+            "Refresh the catalog and channel instances",
+            "This help",
+            "",
+            mouse.as_str(),
+        ];
+
+        let expected: Vec<&str> = [
+            "Scroll",
+            "Go to the channel instances",
+            "Back to the packages",
+        ]
+        .into_iter()
+        .chain(tail)
+        .collect();
+        assert_eq!(actions(&pane), expected);
+        let footer = pane.footer_hint();
+        assert!(footer.contains("Enter=instances"), "{footer}");
+
+        pane.focus = Focus::Instances;
+        let expected: Vec<&str> = [
+            "Navigate",
+            "Toggle enabled in config",
+            "Back to the package detail",
+        ]
+        .into_iter()
+        .chain(tail)
+        .collect();
+        assert_eq!(actions(&pane), expected);
+        let node = pane.help_context();
+        let toggle = node
+            .entries
+            .iter()
+            .find(|e| e.action == "Toggle enabled in config")
+            .unwrap();
+        assert_eq!(toggle.keys, vec!["Enter".to_string()]);
+        let footer = pane.footer_hint();
+        assert!(footer.starts_with(" ?=help"), "{footer}");
+        assert!(footer.contains("=navigate"), "{footer}");
+        assert!(footer.contains("Enter=toggle"), "{footer}");
+        assert!(footer.contains("=back"), "{footer}");
+        assert!(footer.contains("r=refresh"), "{footer}");
+    }
+
+    #[test]
+    fn instance_rows_keep_their_state_whole_and_fit_the_width() {
+        let rows = rows_of(&[
+            ("a", Some(true)),
+            ("a_much_longer_alias_name", Some(false)),
+            ("mid", None),
+        ]);
+        let fitted = fit_instance_rows(&rows, 40);
+        assert_eq!(fitted[0].1, "  enabled in config");
+        assert_eq!(fitted[1].1, "  disabled in config");
+        assert_eq!(fitted[2].1, "  unknown");
+        // One column for every state.
+        let lead_width: Vec<usize> = fitted
+            .iter()
+            .map(|(lead, _)| crate::display_width::display_width(lead))
+            .collect();
+        assert!(lead_width.iter().all(|w| *w == lead_width[0]), "{fitted:?}");
+        for width in 0..50 {
+            for (lead, state) in fit_instance_rows(&rows, width) {
+                let used = crate::display_width::display_width(&lead)
+                    + crate::display_width::display_width(&state);
+                assert!(used <= width, "{width}: {lead:?} {state:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_detail_scrolls_above_the_block_and_clamps_to_its_own_rows() {
+        let (mut pane, ..) = served_pane(channel_state()).await;
+        select_and_open(&mut pane, "chat");
+        pane.detail_scroll = u16::MAX;
+        let _keymap = default_keymap();
+        let rows = render_rows(&mut pane, 80, 20);
+        let detail = pane.last_detail_area.expect("the detail is drawn");
+        let list = pane
+            .last_instances_area
+            .expect("the instance list is drawn");
+        assert!(
+            detail.bottom() <= list.top(),
+            "the block sits below the detail"
+        );
+        let entry = pane.selected_entry().unwrap();
+        let lines = Paragraph::new(detail_lines(&project_detail(entry, Unreadable::default())))
+            .wrap(Wrap { trim: false })
+            .line_count(detail.width - 2);
+        let expected = u16::try_from(lines).unwrap() - (detail.height - 2);
+        assert!(expected > 0, "the detail overflows its rows at this size");
+        assert_eq!(
+            pane.detail_scroll, expected,
+            "clamped against the rows the block leaves, not the whole pane"
+        );
+        let text = flowing(&rows);
+        assert!(text.contains("loaded or running."), "{rows:#?}");
+        assert!(text.contains("alerts disabled in config"), "{rows:#?}");
+    }
+
+    #[test]
+    fn the_saved_status_names_the_live_reload_chord() {
+        use crate::keymap::{Chord, overrides};
+        let _keymap = default_keymap();
+        let _reset = ResetOverrides;
+        let status = ToggleStatus {
+            package: "chat".to_string(),
+            alias: "ops".to_string(),
+            kind: StatusKind::Done(ToggleOutcome::Saved(Some(false))),
+        };
+        overrides::set_row(
+            GlobalAction::TAG,
+            "reload_daemon",
+            vec![Chord::key(KeyCode::F(9))],
+        );
+        let label = crate::keymap::action_key_labels(GlobalAction::ReloadDaemon);
+        assert_eq!(label.len(), 1, "{label:?}");
+        assert_eq!(
+            status.text(),
+            format!(
+                "Saved: ops is now disabled in config. Takes effect after a daemon reload \
+                 ({}).",
+                label[0]
+            )
+        );
+        overrides::set_row(GlobalAction::TAG, "reload_daemon", Vec::new());
+        assert_eq!(
+            status.text(),
+            "Saved: ops is now disabled in config. Takes effect after a daemon reload or \
+             restart."
         );
     }
 
@@ -2953,7 +5093,12 @@ mod tests {
                 .collect()
         };
         let mouse = t("zc-config-help-mouse-open");
-        let tail = ["Refresh the catalog", "This help", "", mouse.as_str()];
+        let tail = [
+            "Refresh the catalog and channel instances",
+            "This help",
+            "",
+            mouse.as_str(),
+        ];
 
         assert_eq!(pane.focus, Focus::Filters);
         let expected: Vec<&str> = ["Choose a filter", "Show the packages", "Previous sub-tab"]
@@ -2993,7 +5138,7 @@ mod tests {
             let refresh = node
                 .entries
                 .iter()
-                .find(|e| e.action == "Refresh the catalog")
+                .find(|e| e.action == "Refresh the catalog and channel instances")
                 .unwrap();
             assert_eq!(refresh.keys, vec!["r".to_string()], "{focus:?}");
             assert!(
@@ -3038,7 +5183,7 @@ mod tests {
         let refresh = node
             .entries
             .iter()
-            .find(|e| e.action == "Refresh the catalog")
+            .find(|e| e.action == "Refresh the catalog and channel instances")
             .unwrap();
         assert_eq!(refresh.keys, label);
         let footer = pane.footer_hint();
@@ -3271,6 +5416,7 @@ mod tests {
                     ("list", "x"),
                     ("identity", "x"),
                     ("name", "x"),
+                    ("alias", "x"),
                 ],
             );
             assert!(
@@ -3282,5 +5428,239 @@ mod tests {
             t("zc-plugins-host-enabled-label"),
             "[plugins] enabled in config"
         );
+    }
+}
+
+/// A scripted daemon for the plugins sub-tab tests here and in the Config
+/// manager: it answers `plugins/list` from a fixed reply, and `config/list`
+/// and `config/set` from an in-memory `[channels.plugin.<alias>]` table the
+/// way the daemon does, recording every request.
+#[cfg(test)]
+pub(crate) mod fake_daemon {
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{Value, json};
+    use tokio::sync::mpsc;
+
+    use crate::client::RpcClient;
+    use crate::jsonrpc::{JsonRpcError, RpcOutbound};
+    use zeroclaw_api::jsonrpc::error_codes;
+
+    /// One request the daemon received.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) struct Request {
+        pub(crate) method: String,
+        pub(crate) params: Value,
+    }
+
+    /// One `[channels.plugin.<alias>]` table with the raw values the daemon
+    /// lists; `None` leaves that field's row out.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Declaration {
+        pub(crate) alias: String,
+        pub(crate) package: Option<String>,
+        pub(crate) enabled: Option<String>,
+    }
+
+    pub(crate) fn declaration(alias: &str, package: &str, enabled: &str) -> Declaration {
+        Declaration {
+            alias: alias.to_string(),
+            package: Some(package.to_string()),
+            enabled: Some(enabled.to_string()),
+        }
+    }
+
+    pub(crate) struct State {
+        /// The reply to `plugins/list`, and to any method not modeled here.
+        pub(crate) catalog: Result<Value, JsonRpcError>,
+        /// Listed in this order, which is deliberately not sorted.
+        pub(crate) declarations: Vec<Declaration>,
+        /// Every `config/list` fails with this.
+        pub(crate) list_error: Option<JsonRpcError>,
+        /// Every `config/list` after a `config/set` fails with this.
+        pub(crate) list_error_after_set: Option<JsonRpcError>,
+        /// Every `config/set` fails with this.
+        pub(crate) set_error: Option<JsonRpcError>,
+        /// Store the write before answering with `set_error`, the way a
+        /// dropped connection loses a reply to a write that landed.
+        pub(crate) apply_failed_set: bool,
+        /// Leave every `config/set` unanswered.
+        pub(crate) hold_set: bool,
+        pub(crate) requests: Vec<Request>,
+        set_seen: bool,
+    }
+
+    impl State {
+        pub(crate) fn new(catalog: Result<Value, JsonRpcError>) -> Self {
+            Self {
+                catalog,
+                declarations: Vec::new(),
+                list_error: None,
+                list_error_after_set: None,
+                set_error: None,
+                apply_failed_set: false,
+                hold_set: false,
+                requests: Vec::new(),
+                set_seen: false,
+            }
+        }
+
+        pub(crate) fn with(mut self, declarations: Vec<Declaration>) -> Self {
+            self.declarations = declarations;
+            self
+        }
+
+        pub(crate) fn methods(&self) -> Vec<String> {
+            self.requests
+                .iter()
+                .map(|request| request.method.clone())
+                .collect()
+        }
+
+        pub(crate) fn find(&self, alias: &str) -> Option<&Declaration> {
+            self.declarations.iter().find(|decl| decl.alias == alias)
+        }
+
+        fn rows(&self, prefix: Option<&str>) -> Value {
+            let matches = |path: &str| match prefix {
+                None => true,
+                Some(prefix) => {
+                    path == prefix
+                        || path
+                            .strip_prefix(prefix)
+                            .is_some_and(|rest| rest.starts_with('.'))
+                }
+            };
+            let mut entries = Vec::new();
+            for decl in &self.declarations {
+                let fields = [
+                    ("package", "string", "String", &decl.package),
+                    ("enabled", "bool", "bool", &decl.enabled),
+                ];
+                for (field, kind, type_hint, value) in fields {
+                    let path = format!("channels.plugin.{}.{field}", decl.alias);
+                    if let Some(value) = value
+                        && matches(&path)
+                    {
+                        entries.push(json!({
+                            "path": path,
+                            "category": "channels",
+                            "kind": kind,
+                            "type_hint": type_hint,
+                            "value": value,
+                            "populated": true,
+                            "is_secret": false,
+                            "description": "",
+                            "section": "channels",
+                        }));
+                    }
+                }
+            }
+            json!({ "entries": entries })
+        }
+
+        /// `config/set` as the daemon does it on this table: a JSON bool is
+        /// coerced, a string passes through, and a missing alias is created
+        /// with an empty package.
+        fn set(&mut self, params: &Value) -> Result<Value, JsonRpcError> {
+            let prop = params["prop"].as_str().unwrap_or_default().to_string();
+            let invalid = |message: String| JsonRpcError {
+                code: error_codes::INVALID_PARAMS,
+                message,
+                data: None,
+            };
+            let alias = prop
+                .strip_prefix("channels.plugin.")
+                .and_then(|rest| rest.strip_suffix(".enabled"))
+                .ok_or_else(|| invalid(format!("Unknown property '{prop}'")))?;
+            let value = match &params["value"] {
+                Value::Bool(value) => value.to_string(),
+                Value::String(value) if value == "true" || value == "false" => value.clone(),
+                other => return Err(invalid(format!("not a bool: {other}"))),
+            };
+            if let Some(error) = &self.set_error
+                && !self.apply_failed_set
+            {
+                return Err(error.clone());
+            }
+            match self
+                .declarations
+                .iter_mut()
+                .find(|decl| decl.alias == alias)
+            {
+                Some(decl) => decl.enabled = Some(value),
+                None => self.declarations.push(Declaration {
+                    alias: alias.to_string(),
+                    package: Some(String::new()),
+                    enabled: Some(value),
+                }),
+            }
+            match &self.set_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(json!({ "prop": prop, "set": true })),
+            }
+        }
+
+        /// The reply to one request, or `None` to leave it unanswered.
+        fn answer(&mut self, method: &str, params: &Value) -> Option<Result<Value, JsonRpcError>> {
+            match method {
+                crate::client::method::CONFIG_LIST => {
+                    let error = if self.set_seen {
+                        self.list_error_after_set
+                            .as_ref()
+                            .or(self.list_error.as_ref())
+                    } else {
+                        self.list_error.as_ref()
+                    };
+                    Some(match error {
+                        Some(error) => Err(error.clone()),
+                        None => Ok(self.rows(params["prefix"].as_str())),
+                    })
+                }
+                crate::client::method::CONFIG_SET => {
+                    self.set_seen = true;
+                    if self.hold_set {
+                        return None;
+                    }
+                    Some(self.set(params))
+                }
+                _ => Some(self.catalog.clone()),
+            }
+        }
+    }
+
+    /// A client served by `state`, the outbound side for counting pending
+    /// requests, and the shared state for scripting and inspection.
+    pub(crate) fn serve(state: State) -> (Arc<RpcClient>, Arc<RpcOutbound>, Arc<Mutex<State>>) {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let state = Arc::new(Mutex::new(state));
+        let shared = Arc::clone(&state);
+        let replies = Arc::clone(&outbound);
+        tokio::spawn(async move {
+            while let Some(raw) = rx.recv().await {
+                let Ok(request) = serde_json::from_str::<Value>(&raw) else {
+                    continue;
+                };
+                let method = request["method"].as_str().unwrap_or_default().to_string();
+                let id = request["id"].as_str().unwrap_or_default().to_string();
+                let params = request["params"].clone();
+                let reply = {
+                    let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    state.requests.push(Request {
+                        method: method.clone(),
+                        params: params.clone(),
+                    });
+                    state.answer(&method, &params)
+                };
+                match reply {
+                    Some(Ok(body)) => replies.dispatch_response(&id, Some(body), None),
+                    Some(Err(error)) => replies.dispatch_response(&id, None, Some(error)),
+                    None => {}
+                }
+            }
+        });
+        (rpc, outbound, state)
     }
 }
