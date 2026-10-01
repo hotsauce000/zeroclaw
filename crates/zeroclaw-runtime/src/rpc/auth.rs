@@ -91,6 +91,7 @@ pub enum LocalCredentialEvidence {
 /// the reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(test, derive(strum_macros::EnumIter))]
+#[non_exhaustive]
 pub enum RpcDenialReason {
     /// No credential was presented.
     NoCredential,
