@@ -194,11 +194,68 @@ impl Transaction {
     }
 }
 
-/// Atomic no-clobber directory move. Only single entry names reach this helper.
+/// Move a directory without replacing an existing destination where the
+/// filesystem can, and with [`rename_directory`] where it cannot. Only single
+/// entry names reach this helper.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn rename_new(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Result<()> {
-    rustix::fs::renameat_with(from, name, to, dest, rustix::fs::RenameFlags::NOREPLACE)?;
+    use rustix::io::Errno;
+
+    #[cfg(test)]
+    if FORCE_PLAIN_RENAME.with(std::cell::Cell::get) {
+        return rename_directory(from, name, to, dest);
+    }
+    match rustix::fs::renameat_with(from, name, to, dest, rustix::fs::RenameFlags::NOREPLACE) {
+        // The filesystem or kernel has no no-replace rename: an NFS client
+        // refuses any rename flag with EINVAL, and Linux before 3.15 or a FUSE
+        // server without rename2 answers ENOSYS or EOPNOTSUPP.
+        Err(errno)
+            if [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP].contains(&errno) =>
+        {
+            rename_directory(from, name, to, dest)
+        }
+        result => result.map_err(std::io::Error::from),
+    }
+}
+
+/// Other Unix platforms have no no-replace rename.
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn rename_new(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Result<()> {
+    rename_directory(from, name, to, dest)
+}
+
+/// Move a directory with a plain rename where no no-replace rename exists.
+/// Renamed over an existing entry, a directory replaces at most an empty
+/// directory, because rename refuses a non-empty one and a non-directory, so no
+/// bytes are lost. Nothing but a directory moves this way: a renamed file would
+/// replace a file at the destination.
+#[cfg(unix)]
+fn rename_directory(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Result<()> {
+    use rustix::fs::{AtFlags, FileType};
+
+    let source = rustix::fs::statat(from, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if FileType::from_raw_mode(source.st_mode) != FileType::Directory {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "only a directory moves without a no-replace rename",
+        ));
+    }
+    rustix::fs::renameat(from, name, to, dest)?;
     Ok(())
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+thread_local! {
+    /// Set by a test to move packages the way a platform without a no-replace
+    /// rename does.
+    pub(super) static FORCE_PLAIN_RENAME: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(windows)]
@@ -238,12 +295,7 @@ fn rename_new(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Result<(
         .map_err(std::io::Error::other)
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_vendor = "apple",
-    windows
-)))]
+#[cfg(not(any(unix, windows)))]
 fn rename_new(_: &Dir, _: &str, _: &Dir, _: &str) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -310,6 +362,40 @@ fn pin_ancestors(path: &Path) -> Result<Vec<Dir>, PluginError> {
         return Err(PluginError::NamespaceChanged(path.display().to_string()));
     }
     Ok(held)
+}
+
+#[cfg(all(test, unix))]
+mod plain_rename_tests {
+    use super::*;
+
+    /// The move used without a no-replace rename puts a directory at a free
+    /// name or in place of an empty directory, and refuses everything else.
+    #[test]
+    fn plain_rename_moves_only_a_directory_and_never_replaces_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Root::open(temp.path()).unwrap();
+        let dir = &root.dir;
+        dir.create_dir("source").unwrap();
+        dir.write("source/keep", b"source bytes").unwrap();
+        dir.create_dir("full").unwrap();
+        dir.write("full/keep", b"full bytes").unwrap();
+        dir.write("file", b"file bytes").unwrap();
+
+        assert!(rename_directory(dir, "source", dir, "full").is_err());
+        assert!(rename_directory(dir, "source", dir, "file").is_err());
+        assert!(rename_directory(dir, "file", dir, "free").is_err());
+        assert!(rename_directory(dir, "file", dir, "full").is_err());
+        assert_eq!(dir.read("source/keep").unwrap(), b"source bytes");
+        assert_eq!(dir.read("full/keep").unwrap(), b"full bytes");
+        assert_eq!(dir.read("file").unwrap(), b"file bytes");
+        assert!(!dir.exists("free"));
+
+        dir.create_dir("empty").unwrap();
+        rename_directory(dir, "source", dir, "empty").unwrap();
+        rename_directory(dir, "empty", dir, "moved").unwrap();
+        assert_eq!(dir.read("moved/keep").unwrap(), b"source bytes");
+        assert!(!dir.exists("source") && !dir.exists("empty"));
+    }
 }
 
 #[cfg(all(test, windows))]

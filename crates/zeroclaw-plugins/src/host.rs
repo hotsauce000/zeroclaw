@@ -476,7 +476,8 @@ impl PluginHost {
             return Err(error);
         }
         drop(package);
-        // Atomic no-clobber publication, even against an unrelated writer.
+        // Publication never replaces an entry that holds files, even one an
+        // unrelated writer put there; see `recovery::rename_new`.
         if let Err(error) = tx.publish(&self.recovery_root, &manifest.name) {
             return Err(PluginError::RecoveryRetained {
                 path: self.recovery_root.retained_path(&tx),
@@ -513,9 +514,9 @@ impl PluginHost {
     /// directory holding files but no manifest, one that cannot be identified,
     /// inspected, or listed, a loaded package's directory, a package admission
     /// accepts, and one this host rejects for its signature policy. A refusal
-    /// restores the claimed package without overwriting a concurrent occupant;
-    /// if restoration cannot complete, `RecoveryRetained` names the retained
-    /// transaction and a later remove retries it.
+    /// restores the claimed package without replacing a concurrent occupant
+    /// that holds files; if restoration cannot complete, `RecoveryRetained`
+    /// names the retained transaction and a later remove retries it.
     pub fn remove(&mut self, name: &str) -> Result<(), PluginError> {
         self.remove_with_report(name).map(|_| ())
     }
@@ -3989,6 +3990,43 @@ capabilities = ["tool"]
             resolve_confined_wasm_path(&package, "plugin.wasm"),
             Err(PluginError::InvalidManifest(_))
         ));
+    }
+
+    /// Without a no-replace rename (FreeBSD, an NFS mount, Linux before 3.15),
+    /// install publishes, and recovery claims, deletes and restores, through a
+    /// plain directory rename.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn install_and_recovery_work_without_a_no_replace_rename() {
+        recovery::FORCE_PLAIN_RENAME.with(|force| force.set(true));
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let source = tempdir().unwrap();
+        write_tool_source(source.path(), "plain", b"\0asm plain");
+        assert_eq!(
+            host.install(source.path().to_str().unwrap()).unwrap(),
+            "plain"
+        );
+
+        let broken = plugins.path().join("broken");
+        std::fs::create_dir(&broken).unwrap();
+        std::fs::write(broken.join("manifest.toml"), "name =").unwrap();
+        host.remove("broken").unwrap();
+        assert!(!broken.exists());
+
+        let late = plugins.path().join("late");
+        std::fs::create_dir(&late).unwrap();
+        write_tool_source(&late, "late", b"\0asm late");
+        let before = package_bytes(&late);
+        assert!(matches!(
+            host.remove("late"),
+            Err(PluginError::UnadmittedPackage { .. })
+        ));
+        assert_eq!(package_bytes(&late), before);
+        assert_eq!(
+            dir_entries(plugins.path()),
+            [".zeroclaw-package-lock-v1", "late", "plain"]
+        );
     }
 
     /// Run `admit` on its own thread, and fail rather than hang if it blocks.

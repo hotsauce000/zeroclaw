@@ -1018,4 +1018,7 @@ transaction location. Preserve that directory, resolve the reported conflict,
 and retry `plugin remove`: retry restores the package before applying normal
 admission policy. A hidden transaction is never, by its name alone, evidence
 that a healthy package can be deleted. Filesystem namespace changes and
-unsupported locking or atomic-move operations refuse recovery safely.
+unsupported locking refuse recovery safely. Where the platform or filesystem
+has no rename that refuses an existing destination (FreeBSD, an NFS mount,
+Linux before 3.15), a package directory moves with a plain rename, which can
+replace only an empty directory, and nothing but a directory moves that way.
