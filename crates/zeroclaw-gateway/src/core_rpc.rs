@@ -621,10 +621,17 @@ mod tests {
         /// A connector bound to a live dispatcher for a config under `tmp`,
         /// with `paired_token` as its only pairing token when given. The
         /// generation ends when the returned guard drops.
+        ///
+        /// The duplex is served under the non-local session policy, whose
+        /// `initialize` refuses every caller while TUI identity signing is
+        /// off, so the config dir gets a `.secret_key`, as a daemon's has.
+        /// A refusal then comes from the credential layer under test.
         fn bound_connector(
             tmp: &tempfile::TempDir,
             paired_token: Option<&str>,
         ) -> (InprocConnector, tokio_util::sync::DropGuard) {
+            std::fs::write(tmp.path().join(".secret_key"), "42".repeat(32))
+                .expect("write the TUI signing key");
             let mut config = zeroclaw_config::schema::Config {
                 data_dir: tmp.path().join("data"),
                 config_path: tmp.path().join("config.toml"),
