@@ -147,7 +147,8 @@ pub enum RpcDenialReason {
     /// The session's environment differs from the one this connection would
     /// give it.
     SessionEnvironmentMismatch,
-    /// A scoped principal requested a daemon-wide log or event stream.
+    /// A scoped principal requested a daemon-wide log or event stream, the
+    /// event history, or persisted log records.
     GlobalStreamScoped,
     /// A principal whose tool selector names a subset of the tools requested
     /// a procedure.
@@ -2625,9 +2626,10 @@ mod tests {
             (
                 "rpc-auth-global-stream-scoped",
                 &[],
-                "Scoped principals cannot read the daemon-wide log and event streams: their \
-                 frames are not attributed to an owning principal, so these streams and the \
-                 event history are limited to administrators and the shared operator",
+                "Scoped principals cannot read the daemon-wide logs and events: their records \
+                 are not attributed to an owning principal, so the log and event streams, the \
+                 event history, and the persisted log are limited to administrators and the \
+                 shared operator",
             ),
             (
                 "rpc-auth-sop-tool-selector-constrained",

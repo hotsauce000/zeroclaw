@@ -559,9 +559,9 @@ Some cases read differently:
   confirm that the job exists. The record's `denial_message` names the owning
   agent and the job, and its `code` is the `-32602` the client received.
 - Records are operator data. `logs/query` and `logs/get` return persisted
-  records, these included, to any principal granted `Logs:Read`; unlike the
-  log and event streams, they are not limited to administrators and the
-  shared operator.
+  records, these included, only to administrators and the shared operator,
+  the same principals the log and event streams serve. A scoped principal
+  is refused with `global_stream_scoped`, even with `Logs:Read`.
 - When a policy change leaves an established connection unable to re-resolve,
   as when its credential no longer verifies, it loses its binding and must
   initialize again. That record still carries the principal and provider the
@@ -598,7 +598,7 @@ The identifiers `reason` can hold:
 | `attachment_source_not_granted` | `-32012` | An attachment sent by local path names a file the destination agent may not read. |
 | `session_environment_retained` | `-32012` | The session holds a local operator environment this connection may not use. |
 | `session_environment_mismatch` | `-32012` | The session's environment differs from the one this connection would give it. |
-| `global_stream_scoped` | `-32012` | A scoped principal (neither an administrator nor the shared operator) asked for a daemon-wide log or event stream or the event history, or held such a stream open when it lost administrator rights. |
+| `global_stream_scoped` | `-32012` | A scoped principal (neither an administrator nor the shared operator) asked for a daemon-wide log or event stream, the event history, or persisted log records (`logs/query`, `logs/get`), or held such a stream open when it lost administrator rights. |
 | `sop_tool_selector_constrained` | `-32012` | `sops/run` or `sops/decide` came from a principal that is not an administrator and whose tool selector is not `"*"`. |
 | `sop_definition_unreadable` | `-32012` | The procedure to replace or delete cannot be loaded to check which agents it runs as. |
 | `session_not_owned` | `-32012` | A chunked upload names a session the principal does not own. The client is told the session was not found or is not owned. |
