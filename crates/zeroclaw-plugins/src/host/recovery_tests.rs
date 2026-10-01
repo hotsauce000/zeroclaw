@@ -22,6 +22,12 @@ fn recovery_process_child() {
         // Dropping the process/lease without cleanup simulates abandonment.
         return;
     }
+    if std::env::var("ZC_RECOVERY_ACTION").as_deref() == Ok("install") {
+        let source = std::env::var("ZC_RECOVERY_SOURCE").unwrap();
+        let result = host.install(&source);
+        println!("RESULT:{result:?}");
+        return;
+    }
     if std::env::var("ZC_RECOVERY_ACTION").as_deref() == Ok("healthy-late") {
         tests::write_tool_source(
             &Path::new(&root).join("race"),
@@ -40,7 +46,17 @@ struct Paused {
 }
 impl Paused {
     fn start(root: &Path, step: &str, action: &str) -> Self {
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        Self::spawn(root, step, action, None)
+    }
+    fn start_install(root: &Path, step: &str, source: &Path) -> Self {
+        Self::spawn(root, step, "install", Some(source))
+    }
+    fn spawn(root: &Path, step: &str, action: &str, source: Option<&Path>) -> Self {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        if let Some(source) = source {
+            command.env("ZC_RECOVERY_SOURCE", source);
+        }
+        let mut child = command
             .args([
                 "--exact",
                 "host::recovery_tests::recovery_process_child",
@@ -90,6 +106,20 @@ impl Paused {
                 break;
             }
         }
+    }
+    /// Let the child past its barrier without waiting for it.
+    fn release(&mut self) {
+        writeln!(self.child.stdin.as_mut().unwrap(), "continue").unwrap();
+    }
+    fn running(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+    /// Wait for a released child and return everything it printed.
+    fn finish(mut self) -> String {
+        drop(self.child.stdin.take());
+        self.output.read_to_string(&mut self.lines).unwrap();
+        assert!(self.child.wait().unwrap().success(), "{}", self.lines);
+        self.lines.clone()
     }
     fn resume(mut self) -> String {
         writeln!(self.child.stdin.take().unwrap(), "continue").unwrap();
@@ -144,6 +174,48 @@ fn separate_remover_deletes_only_claimed_generation_after_final_replacement() {
     let expected = healthy(root.path());
     assert!(paused.resume().contains("RESULT:Ok"));
     assert_eq!(tests::package_bytes(&root.path().join("race")), expected);
+}
+
+/// A remover paused just before its delete holds the package lock, so a second
+/// remover and an installer that reached the lock wait instead of finishing
+/// under it. The paused
+/// remover then deletes only the generation it claimed, and the healthy
+/// package the installer publishes afterwards survives byte for byte.
+#[test]
+fn a_second_remover_and_an_installer_wait_for_a_remover_paused_before_its_delete() {
+    let root = tempfile::tempdir().unwrap();
+    broken(root.path());
+    let source = tempfile::tempdir().unwrap();
+    tests::write_tool_source(source.path(), "race", b"\0asm healthy replacement");
+    let expected = tests::package_bytes(source.path());
+
+    let first = Paused::start(root.path(), "before-delete", "remove");
+    let mut second = Paused::start(root.path(), "remove-before-lock", "remove");
+    let mut installer = Paused::start_install(root.path(), "install-before-lock", source.path());
+    second.release();
+    installer.release();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        second.running(),
+        "a second remover finished under the first"
+    );
+    assert!(installer.running(), "an installer finished under a remover");
+
+    assert!(first.resume().contains("RESULT:Ok"));
+    let second = second.finish();
+    let installer = installer.finish();
+    assert!(installer.contains("RESULT:Ok(\"race\")"), "{installer}");
+    // Whichever took the lock first, the second remover never deletes the
+    // healthy package: it finds nothing, or admission accepts what it claims.
+    assert!(
+        second.contains("RESULT:Err(NotFound") || second.contains("admission accepts this package"),
+        "{second}"
+    );
+    assert_eq!(tests::package_bytes(&root.path().join("race")), expected);
+    assert_eq!(
+        tests::dir_entries(root.path()),
+        [".zeroclaw-package-lock-v1", "race"]
+    );
 }
 
 #[test]

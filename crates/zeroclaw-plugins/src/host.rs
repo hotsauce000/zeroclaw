@@ -433,6 +433,8 @@ impl PluginHost {
             return Err(PluginError::AlreadyLoaded(manifest.name));
         }
 
+        #[cfg(test)]
+        recovery::pause("install-before-lock");
         let _guard = self.recovery_root.lock()?;
         let dest_dir = self.plugins_dir.join(&manifest.name);
         match self.recovery_root.dir.symlink_metadata(&manifest.name) {
@@ -521,6 +523,8 @@ impl PluginHost {
     /// Removal result includes ambiguous staging paths that were deliberately
     /// retained. Callers displaying a recovery result must surface these paths.
     pub fn remove_with_report(&mut self, name: &str) -> Result<Vec<PathBuf>, PluginError> {
+        #[cfg(test)]
+        recovery::pause("remove-before-lock");
         let _guard = self.recovery_root.lock()?;
         if self.loaded.remove(name).is_some() {
             // Existing loaded-package semantics are not the recovery classifier.
