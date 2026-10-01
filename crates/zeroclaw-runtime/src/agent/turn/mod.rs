@@ -1382,6 +1382,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         served_route_sink,
         sop_reassembly,
     } = p;
+    let image_recovery_has_owner = image_cache.is_some();
     let mut loop_local_image_cache = None;
     let mut loop_local_provider_image_state = ProviderImageState::default();
     let mut image_cache = Some(match image_cache {
@@ -2209,15 +2210,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .as_mut()
             .map(|state| state.provider_state.accepted(&image_route))
             .unwrap_or_default();
-        let (image_recovery_messages, recovery_replaced_image_ids) =
-            match prepare_provider_image_recovery_view(
+        let image_recovery_view = if image_recovery_has_owner {
+            prepare_provider_image_recovery_view(
                 &provider_request_messages,
                 &submitted_image_ids,
                 &accepted_image_ids,
-            ) {
-                Some((messages, replaced)) => (Some(messages), replaced),
-                None => (None, Vec::new()),
-            };
+            )
+        } else {
+            None
+        };
+        let (image_recovery_messages, recovery_replaced_image_ids) = match image_recovery_view {
+            Some((messages, replaced)) => (Some(messages), replaced),
+            None => (None, Vec::new()),
+        };
         let recovery_submitted_image_ids = image_recovery_messages
             .as_deref()
             .map(zeroclaw_providers::multimodal::provider_image_ids)
@@ -3044,7 +3049,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 collected_receipts,
                 event_tx.clone(),
                 turn_state.canonical.as_deref_mut(),
-                image_cache.as_mut(),
+                if image_recovery_has_owner {
+                    image_cache.as_mut()
+                } else {
+                    None
+                },
                 agent_alias,
                 parent_agent_alias,
                 sop_reassembly.clone(),
@@ -8520,6 +8529,7 @@ mod tool_lifecycle_abandonment_tests {
             cancellation_token,
             history,
             0,
+            None,
         )
         .await
     }
@@ -8536,6 +8546,7 @@ mod tool_lifecycle_abandonment_tests {
         cancellation_token: Option<CancellationToken>,
         history: &mut Vec<ChatMessage>,
         context_token_budget: usize,
+        image_cache: Option<ToolLoopImageState<'_>>,
     ) -> anyhow::Result<String> {
         let mut crumb_present = false;
         let mut injected_preamble = None;
@@ -8588,7 +8599,7 @@ mod tool_lifecycle_abandonment_tests {
             event_tx: None,
             steering: None,
             new_messages_out: None,
-            image_cache: None,
+            image_cache,
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8604,71 +8615,73 @@ mod tool_lifecycle_abandonment_tests {
         crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools)
     }
 
+    struct ImageRecoveryProvider {
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
+        error_message: &'static str,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ImageRecoveryProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "trim-image-recovery"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ImageRecoveryProvider {
+        fn supports_vision(&self) -> bool {
+            true
+        }
+
+        fn supports_exact_request_replay(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+        ) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("structured chat is used")
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let mut requests = self.requests.lock().expect("request lock");
+            requests.push(request.messages.to_vec());
+            if requests.len() == 1 {
+                return Err(zeroclaw_api::model_provider::StreamError::HttpStatus {
+                    status: 400,
+                    message: self.error_message.into(),
+                }
+                .into());
+            }
+            Ok(text_response())
+        }
+    }
+
     #[tokio::test]
     async fn image_recovery_does_not_restore_pre_dispatch_trimmed_history() {
-        struct ImageRecoveryProvider {
-            requests: Mutex<Vec<Vec<ChatMessage>>>,
-        }
-
-        impl zeroclaw_api::attribution::Attributable for ImageRecoveryProvider {
-            fn role(&self) -> zeroclaw_api::attribution::Role {
-                zeroclaw_api::attribution::Role::Provider(
-                    zeroclaw_api::attribution::ProviderKind::Model(
-                        zeroclaw_api::attribution::ModelProviderKind::Custom,
-                    ),
-                )
-            }
-
-            fn alias(&self) -> &str {
-                "trim-image-recovery"
-            }
-        }
-
-        #[async_trait::async_trait]
-        impl ModelProvider for ImageRecoveryProvider {
-            fn supports_vision(&self) -> bool {
-                true
-            }
-
-            fn supports_exact_request_replay(
-                &self,
-                _request: zeroclaw_api::model_provider::ChatRequest<'_>,
-                _model: &str,
-            ) -> bool {
-                true
-            }
-
-            async fn chat_with_system(
-                &self,
-                _system_prompt: Option<&str>,
-                _message: &str,
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<String> {
-                unreachable!("structured chat is used")
-            }
-
-            async fn chat(
-                &self,
-                request: zeroclaw_api::model_provider::ChatRequest<'_>,
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<ChatResponse> {
-                let mut requests = self.requests.lock().expect("request lock");
-                requests.push(request.messages.to_vec());
-                if requests.len() == 1 {
-                    return Err(zeroclaw_api::model_provider::StreamError::HttpStatus {
-                        status: 400,
-                        message: "rejected request".into(),
-                    }
-                    .into());
-                }
-                Ok(text_response())
-            }
-        }
-
         let provider = ImageRecoveryProvider {
             requests: Mutex::new(Vec::new()),
+            error_message: "rejected request",
         };
         let retained_user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
         let mut history = vec![
@@ -8677,6 +8690,8 @@ mod tool_lifecycle_abandonment_tests {
             ChatMessage::assistant("old answer"),
             ChatMessage::user(retained_user),
         ];
+        let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+        let mut provider_state = ProviderImageState::default();
         let result = run_scripted_loop_with_budget(
             &provider,
             &registry_with(Vec::new()),
@@ -8689,6 +8704,10 @@ mod tool_lifecycle_abandonment_tests {
             &mut history,
             // Fit the retained image, prompt framing and trim breadcrumb.
             crate::agent::history::IMAGE_TOKEN_ESTIMATE + 1_000,
+            Some(ToolLoopImageState {
+                cache: &mut cache,
+                provider_state: &mut provider_state,
+            }),
         )
         .await
         .expect("trimmed request recovers without the image");
@@ -8721,6 +8740,136 @@ mod tool_lifecycle_abandonment_tests {
             history
                 .iter()
                 .any(|m| m.role == "user" && m.content == retained_user)
+        );
+    }
+
+    #[tokio::test]
+    async fn image_recovery_requires_caller_owned_state() {
+        for owned in [false, true] {
+            let provider = ImageRecoveryProvider {
+                requests: Mutex::new(Vec::new()),
+                error_message: "rejected request",
+            };
+            let user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+            let mut history = vec![
+                ChatMessage::system("You are helpful."),
+                ChatMessage::user(user),
+            ];
+            let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+            let mut provider_state = ProviderImageState::default();
+            let registry = registry_with(Vec::new());
+            let result = run_scripted_loop_with_budget(
+                &provider,
+                &registry,
+                &NoopObserver,
+                None,
+                &zeroclaw_config::schema::PacingConfig::default(),
+                "image-state-owner",
+                false,
+                None,
+                &mut history,
+                0,
+                owned.then_some(ToolLoopImageState {
+                    cache: &mut cache,
+                    provider_state: &mut provider_state,
+                }),
+            )
+            .await;
+            let requests = provider.requests.lock().expect("request lock");
+            assert_eq!(requests.len(), if owned { 2 } else { 1 });
+            assert_eq!(
+                zeroclaw_providers::multimodal::provider_image_ids(&requests[0]).len(),
+                1
+            );
+            if owned {
+                assert!(
+                    zeroclaw_providers::multimodal::provider_image_ids(&requests[1]).is_empty()
+                );
+                let notice = crate::i18n::get_required_cli_string_with_args(
+                    "turn-provider-images-quarantined",
+                    &[("count", "1"), ("count_plural", "one")],
+                );
+                assert_eq!(
+                    result.expect("owned recovery succeeds"),
+                    format!("{notice}\n\ndone")
+                );
+            } else {
+                let error = result.expect_err("stateless callers keep the original error");
+                assert!(error.to_string().contains("rejected request"));
+            }
+            assert!(
+                history
+                    .iter()
+                    .any(|message| message.role == "user" && message.content == user)
+            );
+            assert!(
+                history
+                    .iter()
+                    .filter(|message| message.role == "assistant")
+                    .all(|message| message.content == "done")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn image_recovery_leaves_context_overflow_to_history_trimming() {
+        let provider = ImageRecoveryProvider {
+            requests: Mutex::new(Vec::new()),
+            error_message: "prompt is too long",
+        };
+        let user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+        let mut history = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user(format!("old-context {}", "old ".repeat(10_000))),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user(user),
+        ];
+        let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+        let mut provider_state = ProviderImageState::default();
+        let registry = registry_with(Vec::new());
+        let result = run_scripted_loop_with_budget(
+            &provider,
+            &registry,
+            &NoopObserver,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            "image-context-overflow",
+            false,
+            None,
+            &mut history,
+            0,
+            Some(ToolLoopImageState {
+                cache: &mut cache,
+                provider_state: &mut provider_state,
+            }),
+        )
+        .await
+        .expect("trimmed request succeeds with its image");
+        assert_eq!(result, "done");
+        let requests = provider.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .iter()
+                .any(|message| message.content.contains("old-context"))
+        );
+        assert!(
+            requests[1]
+                .iter()
+                .all(|message| !message.content.contains("old-context"))
+        );
+        let image_ids = zeroclaw_providers::multimodal::provider_image_ids(&requests[0]);
+        assert_eq!(image_ids.len(), 1);
+        assert_eq!(
+            zeroclaw_providers::multimodal::provider_image_ids(&requests[1]),
+            image_ids
+        );
+        let route = ProviderImageState::route("scripted", "scripted-model");
+        assert!(provider_state.quarantined(&route).is_empty());
+        assert!(
+            history
+                .iter()
+                .any(|message| message.role == "user" && message.content == user)
         );
     }
 
@@ -8795,6 +8944,7 @@ mod tool_lifecycle_abandonment_tests {
             None,
             &mut history,
             budget,
+            None,
         )
         .await;
 

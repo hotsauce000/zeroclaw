@@ -6473,6 +6473,8 @@ mod tests {
             let mut history_has_trim_breadcrumb = false;
             let mut injected_memory_preamble = None;
             let observer = NoopObserver;
+            let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+            let mut provider_image_state = crate::agent::turn::ProviderImageState::default();
 
             let result = run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
@@ -6523,7 +6525,10 @@ mod tests {
                 event_tx: None,
                 steering: Some(&mut steering_rx),
                 new_messages_out: None,
-                image_cache: None,
+                image_cache: Some(crate::agent::turn::ToolLoopImageState {
+                    cache: &mut image_cache,
+                    provider_state: &mut provider_image_state,
+                }),
                 memory: None,
                 ingress: IngressContext::sub_turn(),
                 agent_alias: None,

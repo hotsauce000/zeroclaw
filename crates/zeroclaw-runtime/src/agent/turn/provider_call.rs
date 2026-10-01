@@ -33,16 +33,17 @@ pub(crate) struct ProviderCallOutcome {
     pub(crate) image_recovery_succeeded: bool,
 }
 
-fn is_http_bad_request(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<zeroclaw_providers::reliable::ProviderHttpError>()
-            .is_some_and(|error| error.status() == 400)
-            || matches!(
-                cause.downcast_ref::<zeroclaw_api::model_provider::StreamError>(),
-                Some(zeroclaw_api::model_provider::StreamError::HttpStatus { status: 400, .. })
-            )
-    })
+fn is_image_recovery_candidate_error(error: &anyhow::Error) -> bool {
+    !zeroclaw_providers::reliable::is_context_window_exceeded(error)
+        && error.chain().any(|cause| {
+            cause
+                .downcast_ref::<zeroclaw_providers::reliable::ProviderHttpError>()
+                .is_some_and(|error| error.status() == 400)
+                || matches!(
+                    cause.downcast_ref::<zeroclaw_api::model_provider::StreamError>(),
+                    Some(zeroclaw_api::model_provider::StreamError::HttpStatus { status: 400, .. })
+                )
+        })
 }
 
 /// Fingerprints of a request's cacheable prompt prefix: the contiguous
@@ -310,9 +311,7 @@ pub(crate) async fn call_provider(
                                 || stream_err
                                     .downcast_ref::<StreamInterruptedAfterOutput>()
                                     .is_some()
-                                || stream_err
-                                    .downcast_ref::<StreamProviderFailure>()
-                                    .is_some_and(|error| !error.fallback_safe()) =>
+                                =>
                         {
                             if let Some(usage) = stream_err
                                 .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
@@ -439,7 +438,7 @@ pub(crate) async fn call_provider(
                                     "llm_stream_fallback: provider stream failed, falling back to non-streaming chat"
                                 );
                                 scope.clear_provisional_provider_route();
-                                let image_recovery_candidate = is_http_bad_request(&stream_err)
+                                let image_recovery_candidate = is_image_recovery_candidate_error(&stream_err)
                                     && image_recovery_messages.is_some()
                                     && stream_err
                                         .downcast_ref::<StreamProviderFailure>()
@@ -567,7 +566,7 @@ pub(crate) async fn call_provider(
 
             match result {
                 Err(original_error)
-                    if is_http_bad_request(&original_error)
+                    if is_image_recovery_candidate_error(&original_error)
                         && image_recovery_messages.is_some() =>
                 {
                     let exact_replay_supported = active_model_provider
@@ -2676,8 +2675,8 @@ mod streaming_fallback_tests {
             self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
             assert_eq!(
                 zeroclaw_providers::multimodal::count_image_markers(request.messages),
-                usize::from(self.draft_before_error),
-                "draft-only fallback must retain the original image; no-output recovery omits it"
+                usize::from(self.draft_before_error || self.thinking_before_error),
+                "activity permits original-request fallback, not image-free recovery"
             );
             if !self.recovery_succeeds {
                 anyhow::bail!("recovery failed");
@@ -2920,12 +2919,132 @@ mod streaming_fallback_tests {
             .await
             .expect("provider call completes");
             let error = outcome.chat_result.expect_err("request remains failed");
-            assert!(is_http_bad_request(&error));
+            if thinking_before_error {
+                assert_eq!(error.root_cause().to_string(), "recovery failed");
+            } else {
+                assert!(is_image_recovery_candidate_error(&error));
+            }
             assert!(!outcome.image_recovery_succeeded);
-            assert_eq!(
-                non_stream_calls.load(Ordering::Relaxed),
-                usize::from(!thinking_before_error)
-            );
+            assert_eq!(non_stream_calls.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn context_overflow_bad_request_does_not_omit_images_in_either_transport() {
+        struct OverflowProvider {
+            requests: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
+        }
+
+        impl Attributable for OverflowProvider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+
+            fn alias(&self) -> &str {
+                "context-overflow"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for OverflowProvider {
+            fn supports_exact_request_replay(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+            ) -> bool {
+                true
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                unreachable!("structured chat is used")
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<ChatResponse> {
+                self.requests
+                    .lock()
+                    .expect("request lock")
+                    .push(request.messages.to_vec());
+                Err(zeroclaw_api::model_provider::StreamError::HttpStatus {
+                    status: 400,
+                    message: "prompt is too long".into(),
+                }
+                .into())
+            }
+
+            fn stream_chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+                self.requests
+                    .lock()
+                    .expect("request lock")
+                    .push(request.messages.to_vec());
+                Box::pin(futures_util::stream::iter(vec![Err(
+                    zeroclaw_api::model_provider::StreamError::HttpStatus {
+                        status: 400,
+                        message: "prompt is too long".into(),
+                    },
+                )]))
+            }
+        }
+
+        for streaming in [false, true] {
+            let provider = OverflowProvider {
+                requests: std::sync::Mutex::new(Vec::new()),
+            };
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let ctx = recovery_test_ctx(&observer, &pacing);
+            let original = [ChatMessage::user(
+                "inspect [IMAGE:data:image/png;base64,AAAA]",
+            )];
+            let recovery = [ChatMessage::user("inspect")];
+            let outcome = call_provider(
+                &ctx,
+                &provider,
+                "context-overflow",
+                "test-model",
+                "test-model",
+                &original,
+                Some(&recovery),
+                None,
+                streaming,
+                0,
+            )
+            .await
+            .expect("provider call completes");
+            let error = outcome
+                .chat_result
+                .expect_err("context recovery must receive the overflow");
+            assert!(zeroclaw_providers::reliable::is_context_window_exceeded(
+                &error
+            ));
+            assert!(!outcome.image_recovery_succeeded);
+            let requests = provider.requests.lock().expect("request lock");
+            assert_eq!(requests.len(), if streaming { 2 } else { 1 });
+            for messages in requests.iter() {
+                assert_eq!(messages.len(), original.len());
+                assert_eq!(messages[0].role, original[0].role);
+                assert_eq!(messages[0].content, original[0].content);
+            }
         }
     }
 
@@ -3366,11 +3485,14 @@ mod streaming_fallback_tests {
 
         async fn chat(
             &self,
-            _request: ChatRequest<'_>,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: Option<f64>,
         ) -> Result<ChatResponse> {
             self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(request.messages.len(), 1);
+            assert_eq!(request.messages[0].role, "user");
+            assert_eq!(request.messages[0].content, "go");
             Ok(ChatResponse {
                 text: Some("recovered via non-streaming fallback".to_string()),
                 tool_calls: Vec::new(),
@@ -3392,6 +3514,7 @@ mod streaming_fallback_tests {
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
             self.physical_requests.fetch_add(1, Ordering::Relaxed);
             Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::ThinkingDelta("working".into())),
                 Ok(StreamEvent::Usage(TokenUsage {
                     input_tokens: Some(1),
                     output_tokens: Some(1),
@@ -3498,8 +3621,8 @@ mod streaming_fallback_tests {
     #[tokio::test]
     async fn genuine_streaming_leaf_mid_stream_failure_still_falls_back() {
         // R4 scoping control: a GENUINE streaming leg keeps today's fallback.
-        // The leaf fails after a usage event, before visible output; the
-        // stream error is not terminal, so the runtime recovers with one
+        // Hidden thinking and usage are not committed output here. The
+        // non-terminal stream error must recover with one
         // non-streaming call: 2 physical requests total. (A bare leaf under
         // the router isolates this from Reliable's stream-resume ledger,
         // which deliberately skips the failed entry on recovery; that shape
