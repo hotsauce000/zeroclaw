@@ -14,7 +14,10 @@ pub enum PluginError {
     #[error("plugin namespace changed: {0}")]
     NamespaceChanged(String),
 
-    /// A refused claim could not be restored without overwriting another occupant.
+    /// A package operation could not finish and kept the files it held at
+    /// `path`: for example a claimed package it could not restore without
+    /// replacing another occupant, or a staged package it could not publish.
+    /// `reason` says why.
     #[error("plugin recovery retained bytes at {path}: {reason}")]
     RecoveryRetained { path: String, reason: String },
 
