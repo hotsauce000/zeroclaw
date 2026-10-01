@@ -48,6 +48,11 @@ def materialize(workflow):
         match = re.match(r"  ([a-z][a-z0-9-]*):\n", block)
         if not match or match[1] == "acceptance-cost":
             continue
+        if match[1] == "crates-preflight":
+            # The guarded detector is its required success() prerequisite.
+            # Keep the release contract's exact publish/preflight condition.
+            blocks[index] = re.sub(r"(?m)^    if: .+$", "    if: needs.crates-preflight-changes.outputs.run == 'true'", block, count=1)
+            continue
         if match[1] == "master-debounce":
             # Its existing push-only predicate already excludes all label and
             # measurement events; preserve the architecture gate's exact rule.

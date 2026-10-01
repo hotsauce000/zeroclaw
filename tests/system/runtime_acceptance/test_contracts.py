@@ -94,6 +94,10 @@ class WorkflowPolicyTests(unittest.TestCase):
                 continue
             condition = re.search(r"(?m)^    if: (.+)$", block)
             self.assertIsNotNone(condition, name[1])
+            if name[1] == "crates-preflight":
+                self.assertEqual(condition[1], "needs.crates-preflight-changes.outputs.run == 'true'")
+                self.assertIn("    needs: [crates-preflight-changes]", block)
+                continue
             if name[1] == "master-debounce":
                 self.assertEqual(condition[1], "github.event_name == 'push'")
                 continue
