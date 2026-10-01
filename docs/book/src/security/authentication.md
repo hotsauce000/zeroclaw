@@ -550,7 +550,9 @@ denied` and these attributes:
 Group and alert on `reason`, not `denial_message`. The identifier does not
 change with wording or locale, while a message names the path, agent, or grant
 involved, so one cause yields many texts and two causes can share one
-(`policy_generation_moved` carries the `revalidation_due` text).
+(`policy_generation_moved` carries the `revalidation_due` text). Identifiers
+are only ever added, never renamed or reused, so treat one you do not
+recognize as a generic refusal.
 
 Some cases read differently:
 
@@ -577,7 +579,10 @@ Some cases read differently:
   approval policy does not authorize, a failed TUI signature check, and the
   `sops/run-detail` and `sops/rename` refusals over remote WSS.
 
-The identifiers `reason` can hold:
+The table below lists the identifiers records carry today. The code also defines
+`no_credential`, `mfa_required`, `unknown_provider`, `local_roster_required`,
+and `remote_token_required` for refused handshakes, which are not recorded
+yet, and `alias_not_entitled`, which nothing produces today.
 
 | `reason` | `code` | Meaning |
 |---|---|---|
