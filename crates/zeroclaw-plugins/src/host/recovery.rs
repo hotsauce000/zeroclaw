@@ -287,7 +287,13 @@ pub(super) fn pause(step: &str) {
         println!("BARRIER:{step}");
         std::io::stdout().flush().unwrap();
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).unwrap();
+        // Only an explicit "continue" moves on. A closed pipe means the test is
+        // killing this process: wait for the kill rather than run past the
+        // barrier, and fail instead of hanging the test if no kill comes.
+        if std::io::stdin().read_line(&mut line).is_err() || line.trim() != "continue" {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            std::process::exit(101);
+        }
     }
 }
 
