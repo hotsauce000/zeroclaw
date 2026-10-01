@@ -252,14 +252,48 @@ impl InprocConnector {
     }
 
     /// Attach the generation's RPC context. Waiters in
-    /// [`InprocConnector::connect`] proceed once this is called.
+    /// [`InprocConnector::connect`] proceed once this is called. A sealed
+    /// connector ignores it: a retired generation never takes a context back.
     pub fn bind(&self, ctx: Arc<RpcContext>) {
-        let _previous = self.inner.ctx.send_replace(Some(ctx));
+        let registry = self
+            .inner
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !registry.open {
+            return;
+        }
+        let previous = self.inner.ctx.send_replace(Some(ctx));
+        drop(registry);
+        drop(previous);
     }
 
-    /// Whether [`InprocConnector::bind`] has happened.
+    /// Whether a context is bound: from [`InprocConnector::bind`] until
+    /// admission is sealed.
     pub fn is_bound(&self) -> bool {
         self.inner.ctx.borrow().is_some()
+    }
+
+    fn admission_open(&self) -> bool {
+        self.inner
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open
+    }
+
+    /// Seal admission and let go of the generation's context in one critical
+    /// section, so a concurrent [`InprocConnector::bind`] cannot put it back.
+    /// Clones of this connector outlive the generation (the gateway's reload
+    /// controls hold one), so holding the context until the last clone drops
+    /// would keep the retiring generation's RPC state alive past its drain.
+    /// The context is dropped after the lock is released.
+    fn seal(
+        registry: &mut Registry,
+        ctx: &watch::Sender<Option<Arc<RpcContext>>>,
+    ) -> Option<Arc<RpcContext>> {
+        registry.open = false;
+        ctx.send_replace(None)
     }
 
     /// Live in-process activity: accepted connections plus the tasks they
@@ -270,16 +304,20 @@ impl InprocConnector {
         self.inner.connections.load(Ordering::Relaxed)
     }
 
-    /// Seal admission: from this call on, every `connect` returns `None`.
-    /// Idempotent; [`InprocConnector::drain`] seals as well. The daemon calls
-    /// this before it starts counting the generation's remaining activity, so
-    /// a zero it observes cannot be followed by a late admission.
+    /// Seal admission: from this call on, every `connect` returns `None` and
+    /// the connector no longer holds the generation's context. Idempotent;
+    /// [`InprocConnector::drain`] seals as well. The daemon calls this before
+    /// it starts counting the generation's remaining activity, so a zero it
+    /// observes cannot be followed by a late admission.
     pub fn close_admission(&self) {
-        self.inner
+        let mut registry = self
+            .inner
             .registry
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .open = false;
+            .unwrap_or_else(|e| e.into_inner());
+        let released = Self::seal(&mut registry, &self.inner.ctx);
+        drop(registry);
+        drop(released);
     }
 
     /// Retire the accepted connections of this generation.
@@ -299,8 +337,11 @@ impl InprocConnector {
                 .registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            registry.open = false;
-            std::mem::take(&mut registry.tasks)
+            let released = Self::seal(&mut registry, &self.inner.ctx);
+            let tasks = std::mem::take(&mut registry.tasks);
+            drop(registry);
+            drop(released);
+            tasks
         };
         tokio::select! {
             () = async {
@@ -323,6 +364,11 @@ impl InprocConnector {
                 let bound: Option<Arc<RpcContext>> = (*rx.borrow_and_update()).clone();
                 if let Some(ctx) = bound {
                     break ctx;
+                }
+                // Sealing clears the context; a waiter it wakes must give up
+                // rather than wait for a bind that will not come.
+                if !self.admission_open() {
+                    return None;
                 }
                 tokio::select! {
                     () = self.inner.cancel.cancelled() => return None,
@@ -755,5 +801,63 @@ mod tests {
             .expect("waiter ends on cancel")
             .expect("waiter task did not panic");
         assert!(!connected, "a cancelled generation hands out no connection");
+    }
+
+    /// Clones of the connector outlive the generation (the gateway's reload
+    /// controls hold one), so sealing must let go of the bound context:
+    /// otherwise the retiring generation's RPC state (sessions, lifecycle
+    /// leases) stays alive past the drain the daemon's reload waits on.
+    #[tokio::test]
+    async fn sealing_admission_releases_the_bound_context() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ctx_for(base_config(tmp.path()));
+        let weak = Arc::downgrade(&ctx);
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        let surviving_clone = connector.clone();
+        connector.bind(ctx);
+        assert!(connector.is_bound());
+        assert!(weak.upgrade().is_some(), "the connector holds the context");
+
+        connector.close_admission();
+        assert!(!surviving_clone.is_bound(), "sealing unbinds every clone");
+        assert!(
+            weak.upgrade().is_none(),
+            "a sealed connector must not keep the generation's context alive"
+        );
+        let late = tokio::time::timeout(Duration::from_secs(2), surviving_clone.connect())
+            .await
+            .expect("a sealed connector answers without waiting for cancel");
+        assert!(late.is_none(), "a sealed connector hands out no connection");
+
+        let rebound = ctx_for(base_config(tmp.path()));
+        let rebound_weak = Arc::downgrade(&rebound);
+        surviving_clone.bind(rebound);
+        assert!(
+            !surviving_clone.is_bound(),
+            "a sealed connector stays unbound"
+        );
+        assert!(rebound_weak.upgrade().is_none());
+        assert!(
+            !cancel.is_cancelled(),
+            "none of this relied on cancellation"
+        );
+    }
+
+    /// A connect waiting for a bind that never comes gives up when the
+    /// generation is sealed, even before its token is cancelled.
+    #[tokio::test]
+    async fn connect_waiting_for_bind_gives_up_when_sealed() {
+        let connector = InprocConnector::new(CancellationToken::new());
+        let waiter = connector.clone();
+        let pending = zeroclaw_spawn::spawn!(async move { waiter.connect().await.is_some() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!pending.is_finished(), "connect waits for a bound context");
+        connector.close_admission();
+        let connected = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("waiter ends on seal")
+            .expect("waiter task did not panic");
+        assert!(!connected);
     }
 }
