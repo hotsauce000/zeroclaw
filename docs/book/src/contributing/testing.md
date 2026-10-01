@@ -60,6 +60,62 @@ pushes to `master` and merge queue runs retain the full regression backstop.
 Override repetitions with `ZEROCLAW_PARALLEL_TEST_RUNS` and harness threads
 with `ZEROCLAW_PARALLEL_TEST_THREADS`.
 
+## Application acceptance on Linux
+
+`scripts/ci/runtime_acceptance.sh` builds and runs the actual `zeroclaw` and
+`zerocode` binaries with locked dependencies, default features, and the `ci`
+profile. Install Python 3.9+, tmux, and OpenSSL alongside the normal Rust build
+prerequisites, then run:
+
+```sh
+scripts/ci/runtime_acceptance.sh --suite core --artifacts-dir /tmp/acceptance-core
+scripts/ci/runtime_acceptance.sh --suite full --bin-dir target/x86_64-unknown-linux-gnu/ci --artifacts-dir /tmp/acceptance-full
+python3 tests/system/runtime_acceptance/test_contracts.py
+python3 tests/system/runtime_acceptance/test_faults.py --bin-dir target/x86_64-unknown-linux-gnu/ci --artifacts-dir /tmp/acceptance-faults
+```
+
+`--bin-dir` reuses existing binaries. Each scenario creates its own config,
+storage, workspace, socket, and loopback services. Child environments exclude
+inherited application settings and credentials. The only fake services are the
+external OpenAI-compatible API and OIDC issuer; no local model, API keys, or
+production test mode is needed. ZeroCode runs in tmux with actual keyboard
+input, rendered-cell assertions, and terminal lifecycle assertions.
+
+The scenario registry in `tests/system/runtime_acceptance/scenarios.py` owns
+suite membership:
+
+| Suite | Required application outcomes |
+| --- | --- |
+| Core | Warm local connection, automatic daemon startup, saved config compatibility, streamed conversation, approved and denied file writes, SOP checkpoint/completion, persisted SOP record and memory after restart, native HTTP pairing and credential rejection. |
+| Full | All core scenarios plus verified WSS with client certificates and native/OIDC credentials, invalid OIDC token rejection, live permission changes across RPC and HTTP, and trusted local startup with OIDC configured. |
+
+The saved V3 config fixture represents an installation with no OIDC or user
+roster. It is synthetic: the exact historical startup failure revision is not
+known, so passing this test does not establish that it reproduces that incident.
+
+The Linux build leg of Quality Gate builds both applications from the same
+checked-out revision and immediately runs acceptance with those binaries.
+`scope.py` is the sole selection policy: documentation/metadata-only PRs skip,
+ordinary code runs core, and sensitive paths or `risk:high`, `domain:security`,
+`priority:p0`, and `priority:p1` labels select full. Unknown or unusable inputs
+select full. Merge queue, master pushes, and manual dispatches always run full.
+PR updates and label changes reevaluate selection; label events rerun Quality
+Gate. Acceptance failures fail the existing build dependency, and `CI Required
+Gate` rejects skipped builds.
+
+Core has a five-minute execution budget and full has ten minutes, excluding
+compilation. Individual waits are bounded. The full job also proves failure
+detection using failed initialization, an incorrect model response, and an
+unapproved SOP checkpoint. JSON/JUnit results, commit and binary hashes,
+timings, selection reason, sanitized daemon logs, and terminal captures are
+uploaded for seven days. Tokens, private keys, configs, and databases are not
+uploaded. A selected scenario that never executes fails the run.
+
+Coverage initially targets Linux and default features. Browser UI, other
+operating systems, external vendor availability/model quality, and release
+package installation need separate coverage. To roll back acceptance, revert
+its workflow integration while retaining the general required quality gate.
+
 ## Picking a level for a new test
 
 1. Testing one subsystem in isolation? → `tests/component/`
@@ -67,7 +123,9 @@ with `ZEROCLAW_PARALLEL_TEST_THREADS`.
 3. Testing full message flow end to end? → `tests/system/`
 4. Requires real API keys? → `tests/live/` with `#[ignore]`
 
-After creating the file, add it to the level's `mod.rs` and use shared infrastructure from `tests/support/`.
+For Rust tests, add the file to the level's `mod.rs` and use shared infrastructure
+from `tests/support/`. Application acceptance uses its Python scenario registry
+and runs through the shell entrypoint above, separately from `cargo test`.
 
 ## Shared infrastructure
 
