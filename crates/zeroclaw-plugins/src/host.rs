@@ -915,6 +915,12 @@ fn admit_component(
         .transpose()
 }
 
+/// Admit the component of the package `dir` holds, reading it through that
+/// handle: the source directory install opened, or the generation recovery
+/// claimed. On Unix the payload is opened as a confined read opens one: a
+/// symlink on the way is refused, a FIFO fails at once instead of blocking, and
+/// the regular-file check refuses any other special file. Elsewhere a symlink on
+/// the way is refused before the open.
 fn admit_component_in(
     dir: &Dir,
     manifest: &PluginManifest,
@@ -924,35 +930,72 @@ fn admit_component_in(
         .as_deref()
         .map(|relative| {
             validate_manifest_subpath("wasm_path", &manifest.name, relative)?;
-            let mut prefix = PathBuf::new();
-            for component in Path::new(relative).components() {
-                prefix.push(component);
-                let metadata = dir.symlink_metadata(&prefix).map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        PluginError::NotFound(relative.into())
-                    } else {
-                        error.into()
-                    }
-                })?;
-                if metadata.is_symlink() {
-                    return Err(PluginError::InvalidManifest(
-                        "wasm_path contains a symlink".into(),
-                    ));
-                }
-            }
-            let file = dir.open(relative)?;
-            if !file.metadata()?.is_file() {
+            let file = open_payload_in(dir, relative)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
                 return Err(PluginError::InvalidManifest(
                     "WASM payload is not a regular file".into(),
                 ));
             }
-            let bytes = read_component_bytes(file.try_clone()?, file.metadata()?.len())?;
+            let bytes = read_component_bytes(file, metadata.len())?;
             if let Some(expected) = manifest.wasm_sha256.as_deref() {
                 signature::verify_payload_digest(&bytes, expected)?;
             }
             Ok(AdmittedComponent::new(bytes))
         })
         .transpose()
+}
+
+/// Open the payload at `relative` below `dir`: each directory without
+/// following a symlink, then the payload itself without following one and
+/// without blocking.
+#[cfg(unix)]
+fn open_payload_in(dir: &Dir, relative: &str) -> Result<std::fs::File, PluginError> {
+    use rustix::io::Errno;
+    use std::os::fd::AsFd;
+
+    // Normal components only; `validate_manifest_subpath` refused the rest.
+    let relative: PathBuf = Path::new(relative)
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .collect();
+    let refused = |errno: Errno, _walked: &Path| match errno {
+        Errno::NOENT => PluginError::NotFound(relative.display().to_string()),
+        // A symlink or non-directory where a directory is expected fails the
+        // no-follow directory open with ENOTDIR (ELOOP on older Linux kernels);
+        // a symlink in place of the payload fails its no-follow open with ELOOP.
+        Errno::LOOP | Errno::NOTDIR => PluginError::InvalidManifest(format!(
+            "wasm_path contains a symlink or non-directory component: {}",
+            relative.display()
+        )),
+        other => PluginError::Io(other.into()),
+    };
+    let (parent, leaf) = open_parent_below(dir.as_fd(), &relative, refused)?;
+    let payload = open_payload_leaf(&parent, leaf).map_err(|errno| refused(errno, &relative))?;
+    Ok(std::fs::File::from(payload))
+}
+
+/// Elsewhere `dir` resolves the path, after a check that no component on the
+/// way is a symlink.
+#[cfg(not(unix))]
+fn open_payload_in(dir: &Dir, relative: &str) -> Result<std::fs::File, PluginError> {
+    let mut prefix = PathBuf::new();
+    for component in Path::new(relative).components() {
+        prefix.push(component);
+        let metadata = dir.symlink_metadata(&prefix).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                PluginError::NotFound(relative.into())
+            } else {
+                error.into()
+            }
+        })?;
+        if metadata.is_symlink() {
+            return Err(PluginError::InvalidManifest(
+                "wasm_path contains a symlink".into(),
+            ));
+        }
+    }
+    Ok(dir.open(relative)?.into_std())
 }
 
 /// A payload that passed package confinement: the canonical package root, the
@@ -1121,38 +1164,69 @@ fn confine_payload(root: PathBuf, relative: PathBuf) -> Result<ConfinedPayload, 
 
 #[cfg(unix)]
 impl ConfinedPayload {
-    /// Walk the directories of `relative` down from the retained root, opening
-    /// each relative to the one before without following a symlink, and return
-    /// the payload's parent directory and file name. `on_error` maps a failed
-    /// open, given the part of `relative` walked so far.
+    /// Walk the directories of `relative` down from the retained root; see
+    /// [`open_parent_below`].
     fn open_payload_parent(
         &self,
         on_error: impl Fn(rustix::io::Errno, &Path) -> PluginError,
     ) -> Result<(std::os::fd::OwnedFd, &std::ffi::OsStr), PluginError> {
-        use rustix::fs::{Mode, OFlags};
+        use std::os::fd::AsFd;
 
-        let leaf = self.relative.file_name().ok_or_else(|| {
-            PluginError::InvalidManifest(format!(
-                "wasm_path must name a file (got {})",
-                self.relative.display()
-            ))
-        })?;
-        let mut dir = self.root_dir.try_clone()?;
-        let mut walked = PathBuf::new();
-        for segment in self.relative.parent().into_iter().flat_map(Path::iter) {
-            walked.push(segment);
-            dir = rustix::fs::openat(
-                &dir,
-                segment,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|errno| on_error(errno, &walked))?;
-            #[cfg(test)]
-            payload_step(PayloadStep::AfterDir(walked.components().count()));
-        }
-        Ok((dir, leaf))
+        open_parent_below(self.root_dir.as_fd(), &self.relative, on_error)
     }
+}
+
+/// Walk the directories of `relative` down from `root`, opening each relative
+/// to the one before without following a symlink, and return the payload's
+/// parent directory and file name. `on_error` maps a failed open, given the
+/// part of `relative` walked so far.
+#[cfg(unix)]
+fn open_parent_below<'a>(
+    root: std::os::fd::BorrowedFd<'_>,
+    relative: &'a Path,
+    on_error: impl Fn(rustix::io::Errno, &Path) -> PluginError,
+) -> Result<(std::os::fd::OwnedFd, &'a std::ffi::OsStr), PluginError> {
+    use rustix::fs::{Mode, OFlags};
+
+    let leaf = relative.file_name().ok_or_else(|| {
+        PluginError::InvalidManifest(format!(
+            "wasm_path must name a file (got {})",
+            relative.display()
+        ))
+    })?;
+    let mut dir = root.try_clone_to_owned()?;
+    let mut walked = PathBuf::new();
+    for segment in relative.parent().into_iter().flat_map(Path::iter) {
+        walked.push(segment);
+        dir = rustix::fs::openat(
+            &dir,
+            segment,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|errno| on_error(errno, &walked))?;
+        #[cfg(test)]
+        payload_step(PayloadStep::AfterDir(walked.components().count()));
+    }
+    Ok((dir, leaf))
+}
+
+/// Open the payload `leaf` in `parent` without following a symlink.
+/// Non-blocking, so a FIFO or device fails the regular-file check instead of
+/// blocking here; `NOCTTY` keeps a terminal from becoming the controlling one.
+#[cfg(unix)]
+fn open_payload_leaf(
+    parent: &std::os::fd::OwnedFd,
+    leaf: &std::ffi::OsStr,
+) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+
+    rustix::fs::openat(
+        parent,
+        leaf,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
 }
 
 /// Largest executable payload admission will read into memory.
@@ -1235,7 +1309,7 @@ fn open_confined_payload(
     confined: &ConfinedPayload,
     path: &Path,
 ) -> Result<std::fs::File, PluginError> {
-    use rustix::fs::{AtFlags, Mode, OFlags};
+    use rustix::fs::AtFlags;
     use rustix::io::Errno;
 
     // A symlink or non-directory where confinement found a directory fails the
@@ -1252,15 +1326,7 @@ fn open_confined_payload(
     let (parent, leaf) = confined.open_payload_parent(|errno, _walked| substituted(errno))?;
     #[cfg(test)]
     payload_step(PayloadStep::BeforeLeafOpen);
-    // Non-blocking, so a FIFO or device fails the regular-file check instead of
-    // blocking here; `NOCTTY` keeps a terminal from becoming the controlling one.
-    let payload = rustix::fs::openat(
-        &parent,
-        leaf,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(substituted)?;
+    let payload = open_payload_leaf(&parent, leaf).map_err(substituted)?;
     #[cfg(test)]
     payload_step(PayloadStep::AfterLeafOpen);
 
@@ -3919,6 +3985,98 @@ capabilities = ["tool"]
             resolve_confined_wasm_path(&package, "plugin.wasm"),
             Err(PluginError::InvalidManifest(_))
         ));
+    }
+
+    /// Run `admit` on its own thread, and fail rather than hang if it blocks.
+    #[cfg(unix)]
+    fn without_blocking<T: Send + 'static>(admit: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || sender.send(admit()).unwrap());
+        match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("a FIFO in place of the payload blocked admission")
+            }
+            // The worker panicked before sending: report that failure rather
+            // than a blocked admission.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => std::panic::resume_unwind(
+                worker
+                    .join()
+                    .expect_err("the worker sends before it returns"),
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// Install reads the component through its handle on the source
+    /// directory, as a confined read does, so a FIFO in its place fails at once
+    /// instead of blocking the open.
+    #[cfg(unix)]
+    #[test]
+    fn admit_source_refuses_a_fifo_payload_without_blocking() {
+        let source = tempdir().unwrap();
+        write_tool_source(source.path(), "piped", b"unused");
+        std::fs::remove_file(source.path().join("plugin.wasm")).unwrap();
+        make_fifo(&source.path().join("plugin.wasm"));
+        let plugins = tempdir().unwrap();
+        let plugins_dir = plugins.path().to_path_buf();
+        let source_dir = source.path().to_str().unwrap().to_owned();
+
+        let admitted = without_blocking(move || {
+            PluginHost::from_plugins_dir(&plugins_dir)
+                .unwrap()
+                .admit_source(&source_dir)
+                .map(|_| ())
+        });
+        assert!(
+            matches!(&admitted, Err(PluginError::InvalidManifest(message)) if message.contains("not a regular file")),
+            "{admitted:?}"
+        );
+    }
+
+    /// Recovery judges a claimed package through the same walk. A FIFO payload
+    /// is contents admission rejects, so `remove` deletes the package instead
+    /// of blocking while it holds the package lock, and the next install takes
+    /// the lock at once.
+    #[cfg(unix)]
+    #[test]
+    fn remove_recovers_a_package_whose_payload_is_a_fifo_without_blocking() {
+        let plugins = tempdir().unwrap();
+        let package = plugins.path().join("piped");
+        std::fs::create_dir(&package).unwrap();
+        write_tool_source(&package, "piped", b"unused");
+        std::fs::remove_file(package.join("plugin.wasm")).unwrap();
+        make_fifo(&package.join("plugin.wasm"));
+        let plugins_dir = plugins.path().to_path_buf();
+
+        let removed = without_blocking(move || {
+            PluginHost::from_plugins_dir(&plugins_dir)
+                .unwrap()
+                .remove("piped")
+        });
+        assert!(removed.is_ok(), "{removed:?}");
+        assert!(!package.exists());
+
+        let source = tempdir().unwrap();
+        write_tool_source(source.path(), "piped", b"\0asm reinstall");
+        let plugins_dir = plugins.path().to_path_buf();
+        let source_dir = source.path().to_str().unwrap().to_owned();
+        let installed = without_blocking(move || {
+            PluginHost::from_plugins_dir(&plugins_dir)
+                .unwrap()
+                .install(&source_dir)
+        });
+        assert_eq!(installed.unwrap(), "piped");
     }
 
     #[test]
