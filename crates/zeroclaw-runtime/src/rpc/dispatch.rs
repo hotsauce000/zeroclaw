@@ -35871,6 +35871,10 @@ mod tests {
             .ensure("openai", "test-provider")
             .expect("test provider exists")
             .uri = Some(server.uri());
+        // The mock always fails, and one request is enough to check the
+        // dispatched model. Retries would only add backoff to the prompt.
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
         let dispatcher = Arc::new(make_config_set_test_dispatcher(config));
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
 
@@ -41956,6 +41960,10 @@ mod tests {
                 .ensure("openai", "test-provider")
                 .unwrap()
                 .uri = Some(server.uri());
+            // The mock always fails, and one request is enough to check the
+            // dispatched model. Retries would only add backoff to the prompt.
+            config.reliability.provider_retries = 0;
+            config.reliability.provider_backoff_ms = 1;
             let data_dir = config.data_dir.clone();
             let commit_pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
             let (dispatcher, sessions, acp_store) =
