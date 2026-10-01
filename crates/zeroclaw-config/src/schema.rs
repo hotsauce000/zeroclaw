@@ -18618,7 +18618,12 @@ pub struct FilesystemConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
-    /// Root paths to watch. At least one is required.
+    /// Absolute root paths to watch. At least one is required. A relative
+    /// path is refused unless `allow_broad_roots` is set, because the watcher
+    /// resolves it against the daemon's working directory, which depends on
+    /// how the daemon was started. On Windows an absolute path starts with a
+    /// drive root such as `C:\` or a share such as `\\server\share`, so
+    /// `\inbox` and `C:inbox` are relative too.
     #[tab(Connection)]
     #[serde(default)]
     pub paths: Vec<String>,
@@ -18680,7 +18685,9 @@ pub struct FilesystemConfig {
     /// profile in `Users`, `Program Files`, `Program Files (x86)`, and
     /// `ProgramData`. The pseudo-filesystems `/proc` and `/sys` would surface
     /// kernel object paths in SOP payloads and flood the watcher with events.
-    /// Off unless explicitly enabled.
+    /// It also admits relative paths, which are refused otherwise because
+    /// they resolve against the daemon's working directory, so the check
+    /// cannot tell what they name. Off unless explicitly enabled.
     #[tab(Advanced)]
     #[serde(default)]
     pub allow_broad_roots: bool,
@@ -18771,10 +18778,10 @@ const FILESYSTEM_WINDOWS_BROAD_ROOTS: [&str; 8] = [
     "ProgramData",
 ];
 
-/// Whether the filesystem listener refuses to watch `path` unless
-/// `allow_broad_roots` is set. The Unix roots are checked on every platform
-/// exactly as they always were; Linux and the other Unix systems, macOS, and
-/// Windows refuse their own roots as well.
+/// Whether `path` names a broad root, which the filesystem listener refuses
+/// to watch unless `allow_broad_roots` is set. The Unix roots are checked on
+/// every platform exactly as they always were; Linux and the other Unix
+/// systems, macOS, and Windows refuse their own roots as well.
 fn is_filesystem_broad_root(path: &str) -> bool {
     let trimmed = path.trim_end_matches('/');
     let normalized = if trimmed.is_empty() { "/" } else { trimmed };
@@ -18901,6 +18908,15 @@ impl FilesystemConfig {
             if !self.allow_broad_roots && is_filesystem_broad_root(path) {
                 anyhow::bail!(
                     "path '{path}' is a broad system root; set allow_broad_roots = true to watch it"
+                );
+            }
+            // The watcher resolves a relative path against the daemon's
+            // working directory, which differs with how the daemon was
+            // started, so the check above cannot tell what it names.
+            if !self.allow_broad_roots && !Path::new(path).is_absolute() {
+                anyhow::bail!(
+                    "path '{path}' is relative and resolves against the daemon's working \
+                     directory; use an absolute path, or set allow_broad_roots = true to watch it"
                 );
             }
         }
@@ -29973,6 +29989,80 @@ zeroclaw-operators = "operator"
         }
     }
 
+    /// Paths that are relative on every platform. The watcher resolves each
+    /// one against the daemon's working directory, so each needs
+    /// `allow_broad_roots`. No broad-root matcher refuses them, so `validate`
+    /// reports each one as relative.
+    const RELATIVE_PATHS: &[&str] = &[
+        "inbox",
+        "./inbox",
+        "../inbox",
+        // The working directory itself and its parent: the home directory
+        // and `/home` under the systemd user service, `/` under OpenRC.
+        ".",
+        "./",
+        "..",
+        // Broad roots when the working directory is `/`, as it is under
+        // OpenRC or a launchd agent without a `WorkingDirectory`.
+        "root",
+        "etc",
+        "home/tester",
+        "Users",
+        "Users/tester",
+        // `~` is not expanded, so this names a folder called `~`.
+        "~/Inbox",
+        // On Windows these start at the current drive's root or at drive
+        // `C:`'s current folder; elsewhere they are ordinary names.
+        r"\inbox",
+        "C:inbox",
+    ];
+
+    /// A path below the broad roots that is absolute on the platform
+    /// running the tests.
+    const SCOPED_ABSOLUTE_PATH: &str = if cfg!(windows) {
+        r"C:\srv\inbox"
+    } else {
+        "/srv/inbox"
+    };
+
+    #[test]
+    async fn filesystem_validate_rejects_relative_paths_by_default() {
+        for path in RELATIVE_PATHS.iter().copied() {
+            let mut cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("is relative"),
+                "path {path} must be rejected by default"
+            );
+            cfg.allow_broad_roots = true;
+            assert!(
+                cfg.validate().is_ok(),
+                "path {path} must be allowed with allow_broad_roots"
+            );
+        }
+        // Each path is checked, not only the first.
+        let cfg = FilesystemConfig {
+            enabled: true,
+            paths: vec![SCOPED_ABSOLUTE_PATH.into(), "inbox".into()],
+            ..FilesystemConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("'inbox' is relative"));
+        // The empty path names the working directory too. The broad-root
+        // check reads it as `/` and rejects it first, as before.
+        let cfg = FilesystemConfig {
+            enabled: true,
+            paths: vec![String::new()],
+            ..FilesystemConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("broad system root"));
+    }
+
     /// Spellings of Windows broad roots. Each one needs `allow_broad_roots`
     /// on Windows.
     const WINDOWS_BROAD_ROOT_SPELLINGS: &[&str] = &[
@@ -30020,11 +30110,9 @@ zeroclaw-operators = "operator"
         r"C:\ProgramData\ZeroClaw\inbox",
         r"C:\Windows\Temp\inbox",
         r"D:\inbox",
-        r"\inbox",
         r"\\?\C:\Users\tester\Inbox",
         r"\\server\share\inbox",
         r"\\?\UNC\server\share\inbox",
-        "inbox",
     ];
 
     #[test]
@@ -30037,7 +30125,7 @@ zeroclaw-operators = "operator"
                 "{root} must be a Windows broad root"
             );
         }
-        for path in WINDOWS_SCOPED_PATHS.iter().copied() {
+        for path in WINDOWS_SCOPED_PATHS.iter().chain(RELATIVE_PATHS).copied() {
             assert!(
                 !is_windows_filesystem_broad_root(path),
                 "{path} must not be a Windows broad root"
@@ -30047,28 +30135,44 @@ zeroclaw-operators = "operator"
 
     #[cfg(not(windows))]
     #[test]
-    async fn filesystem_validate_off_windows_accepts_windows_spellings() {
-        // Off Windows a backslash is an ordinary file name character, so these
-        // are ordinary paths, accepted as before.
+    async fn filesystem_validate_off_windows_reads_windows_spellings_as_unix_paths() {
+        // Off Windows a backslash is an ordinary file name character and a
+        // drive letter an ordinary name, so these spellings are not broad
+        // roots. Only a leading `/` makes a path absolute, so they are
+        // relative paths, while `//server/share` is an absolute one.
         for path in [
             r"C:\",
             "C:/",
             r"C:\Windows",
             r"\\?\C:\",
             r"\\server\share",
-            "//server/share",
             r"\etc",
         ] {
-            let cfg = FilesystemConfig {
+            let mut cfg = FilesystemConfig {
                 enabled: true,
                 paths: vec![path.into()],
                 ..FilesystemConfig::default()
             };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("is relative"),
+                "path {path} must be rejected as relative off Windows"
+            );
+            cfg.allow_broad_roots = true;
             assert!(
                 cfg.validate().is_ok(),
-                "path {path} must stay accepted off Windows"
+                "path {path} must be allowed with allow_broad_roots"
             );
         }
+        let cfg = FilesystemConfig {
+            enabled: true,
+            paths: vec!["//server/share".into()],
+            ..FilesystemConfig::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "//server/share must stay accepted off Windows"
+        );
     }
 
     #[cfg(windows)]
@@ -30143,9 +30247,6 @@ zeroclaw-operators = "operator"
         "/Volumes/Backup/inbox",
         "/private/tmp/inbox",
         "/private/var/folders",
-        "Users",
-        "Users/tester",
-        "inbox",
     ];
 
     #[test]
@@ -30158,7 +30259,7 @@ zeroclaw-operators = "operator"
                 "{root} must be a macOS broad root"
             );
         }
-        for path in MACOS_SCOPED_PATHS.iter().copied() {
+        for path in MACOS_SCOPED_PATHS.iter().chain(RELATIVE_PATHS).copied() {
             assert!(
                 !is_macos_filesystem_broad_root(path),
                 "{path} must not be a macOS broad root"
@@ -30294,10 +30395,6 @@ zeroclaw-operators = "operator"
         "/HOME/tester",
         "/Root",
         "/MNT",
-        // Relative paths, which the check does not read: they resolve
-        // against the daemon's working directory.
-        "home/tester",
-        "root",
     ];
 
     #[test]
@@ -30311,7 +30408,7 @@ zeroclaw-operators = "operator"
                 "{root} must be a Linux broad root"
             );
         }
-        for path in LINUX_SCOPED_PATHS.iter().copied() {
+        for path in LINUX_SCOPED_PATHS.iter().chain(RELATIVE_PATHS).copied() {
             assert!(
                 !is_linux_filesystem_broad_root(path),
                 "{path} must not be a Linux broad root"
@@ -30335,11 +30432,11 @@ zeroclaw-operators = "operator"
         }
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(target_os = "macos")]
     #[test]
     async fn filesystem_validate_off_linux_accepts_linux_roots() {
-        // macOS and Windows keep homes and mounted volumes elsewhere, so the
-        // Linux roots are ordinary paths there, accepted as before.
+        // macOS keeps homes and mounted volumes elsewhere, so the Linux roots
+        // are ordinary paths there, accepted as before.
         for root in FILESYSTEM_LINUX_BROAD_ROOTS {
             let path = root.replace('*', "tester");
             let cfg = FilesystemConfig {
@@ -30349,7 +30446,35 @@ zeroclaw-operators = "operator"
             };
             assert!(
                 cfg.validate().is_ok(),
-                "path {path} must stay accepted on macOS and Windows"
+                "path {path} must stay accepted on macOS"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    async fn filesystem_validate_rejects_driveless_paths_on_windows() {
+        // On Windows a path without a drive or share starts at the root of
+        // the daemon's current drive, so the Linux roots and other Unix
+        // spellings are relative paths there rather than broad roots.
+        let linux_roots = FILESYSTEM_LINUX_BROAD_ROOTS
+            .iter()
+            .map(|root| root.replace('*', "tester"));
+        for path in std::iter::once("/srv/inbox".to_string()).chain(linux_roots) {
+            let mut cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.clone()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("is relative"),
+                "path {path} must be rejected as relative on Windows"
+            );
+            cfg.allow_broad_roots = true;
+            assert!(
+                cfg.validate().is_ok(),
+                "path {path} must be allowed with allow_broad_roots"
             );
         }
     }
@@ -30404,7 +30529,7 @@ zeroclaw-operators = "operator"
     async fn filesystem_validate_rejects_unknown_event() {
         let cfg = FilesystemConfig {
             enabled: true,
-            paths: vec!["/srv/inbox".into()],
+            paths: vec![SCOPED_ABSOLUTE_PATH.into()],
             events: vec!["created".into(), "exploded".into()],
             ..FilesystemConfig::default()
         };
@@ -30416,7 +30541,7 @@ zeroclaw-operators = "operator"
     async fn filesystem_validate_accepts_scoped_path() {
         let cfg = FilesystemConfig {
             enabled: true,
-            paths: vec!["/srv/inbox".into()],
+            paths: vec![SCOPED_ABSOLUTE_PATH.into()],
             ..FilesystemConfig::default()
         };
         assert!(cfg.validate().is_ok());

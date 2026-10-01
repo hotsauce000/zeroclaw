@@ -43,7 +43,16 @@ Windows paths match case-insensitively with either separator and with or without
 
 The check never reads `$HOME`, so its result does not depend on the account the daemon runs as. Each platform instead rejects home directories by their location: `/home/<name>` and `/root` on Linux and other Unix systems, `/Users/<name>` on macOS, and `C:\Users\<name>` on Windows. A home directory holds private files such as SSH keys and shell history, and the daemon account's home also holds the `.zeroclaw` directory where the daemon writes its own state, so point `paths` at the folder your SOPs need, such as `/home/<name>/Inbox`, rather than a whole home directory. A home directory elsewhere, such as a service account's home under `/var/lib`, is not recognized.
 
-A relative path such as `inbox` or `.` is not checked: the watcher resolves it against the daemon's working directory, which for the systemd user service that `zeroclaw service install` writes on Linux is the home directory, so `.` there watches the whole home directory. Use absolute paths.
+Every path in `paths` must be absolute. A relative path such as `inbox`, `.`, or `~/Inbox` (`paths` does not expand `~`) is rejected unless `allow_broad_roots` is set, because the watcher resolves it against the daemon's working directory, so the check cannot tell what it names. Write the full path of the folder you mean instead, such as `/home/<name>/Inbox`. The working directory depends on how the daemon was started:
+
+- `zeroclaw daemon` started by hand: the shell's current directory
+- the systemd user service that `zeroclaw service install` writes on Linux: your home directory, so `.` would watch all of it
+- the OpenRC service it writes, or a systemd system service without `WorkingDirectory=`: `/`, so `.` names the whole file system and `root` names `/root`
+- the launchd agent it writes on macOS: `/` as well, except that a Homebrew install runs in Homebrew's `var/zeroclaw` directory, which holds the daemon's own configuration and logs
+- the scheduled task it writes on Windows: `%windir%\System32`
+- the container images: `/zeroclaw-data`, which holds the daemon's configuration and data
+
+On Windows an absolute path starts with a drive root such as `C:\` or a share such as `\\server\share`. A path such as `\inbox` or `/inbox` starts at the current drive's root, and `C:inbox` at the current folder of drive `C:`, so these are rejected as relative too.
 
 Symlink event paths are rejected before any metadata, hash, or content read by default; `follow_symlinks` opts in but still requires the canonical target to resolve inside a watched root.
 
@@ -51,7 +60,7 @@ Symlink event paths are rejected before any metadata, hash, or content read by d
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Listener does not start | a broad root was rejected at validation | Narrow `paths` away from the broad roots, or set `allow_broad_roots` |
+| Listener does not start | a broad root or a relative path was rejected at validation | Narrow `paths` away from the broad roots and write each one as an absolute path, or set `allow_broad_roots` |
 | Change ignored | excluded by glob, or outside `events` kinds | Check `include`, `exclude`, and `events` against the changed file |
 | SOP not starting | trigger `path` glob does not match | Verify the [trigger](../sop/fan-in/filesystem.md) `path` matches and the file is in watch scope |
 
