@@ -1011,7 +1011,8 @@ names the lock file. Any account that can read that file can hold the lock,
 and where the operating system or filesystem offers no file locking, install
 and remove refuse. New staging directories use unique generations and an OS-held
 lease, rather than a PID as ownership evidence. Recovery cleans an abandoned
-protocol stage only while recovering an actual final package. Legacy PID-only
+protocol stage only while recovering an actual final package, or while finishing
+the delete of one an earlier remove had judged. Legacy PID-only
 stages without proof of abandonment are retained and their paths are printed;
 they do not prevent a new install from using fresh staging.
 
@@ -1019,7 +1020,8 @@ A refused claimed package is restored without overwriting a concurrent
 occupant. If restoration cannot complete, the error names its retained hidden
 transaction location. Preserve that directory, resolve the reported conflict,
 and retry `plugin remove`: retry restores the package before applying normal
-admission policy. A hidden transaction is never, by its name alone, evidence
+admission policy. A claim whose delete had begun is marked, and a retry
+finishes that delete instead of restoring it. A hidden transaction is never, by its name alone, evidence
 that a healthy package can be deleted. Filesystem namespace changes and
 unsupported locking refuse recovery safely. Where the platform or filesystem
 has no rename that refuses an existing destination (FreeBSD, an NFS mount,

@@ -537,9 +537,15 @@ impl PluginHost {
         }
         crate::instance::validate_package_name(name)
             .map_err(|_| PluginError::NotFound(name.into()))?;
-        self.retry_claims(name)?;
+        let finished = self.retry_claims(name)?;
         let metadata = match std::fs::symlink_metadata(self.plugins_dir.join(name)) {
             Ok(metadata) => metadata,
+            // What an earlier remove had begun deleting is gone now. That remove
+            // had claimed and judged a final generation, so the staging sweep's
+            // precondition holds.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && finished => {
+                return self.remove_stale_staging(name);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(PluginError::NotFound(name.into()));
             }
@@ -615,15 +621,31 @@ impl PluginHost {
                 return self.restore_refused(name, tx, error);
             }
         };
+        #[cfg(test)]
+        recovery::pause("after-verdict");
         if !empty {
+            // From here the delete is committed: a process that takes this
+            // claim over after a stop finishes it instead of putting back what
+            // is left. An empty claim needs no mark, because its removal below
+            // is a single step.
+            tx.mark_deleting()
+                .map_err(|error| PluginError::RecoveryRetained {
+                    path: self.recovery_root.retained_path(&tx),
+                    reason: error.to_string(),
+                })?;
+            #[cfg(test)]
+            recovery::pause("delete-marked");
             recovery::clear_owned(&claimed).map_err(|error| PluginError::RecoveryRetained {
                 path: self.recovery_root.retained_path(&tx),
                 reason: error.to_string(),
             })?;
         }
         drop(claimed);
+        // Empty-only, so an empty claim that gained an entry since its verdict
+        // is kept.
         tx.dir
             .remove_dir(recovery::PACKAGE)
+            .and_then(|()| tx.remove_mark().map_err(std::io::Error::other))
             .map_err(|error| PluginError::RecoveryRetained {
                 path: self.recovery_root.retained_path(&tx),
                 reason: error.to_string(),
@@ -698,7 +720,11 @@ impl PluginHost {
         })
     }
 
-    fn retry_claims(&self, name: &str) -> Result<(), PluginError> {
+    /// Settle the claims an earlier remove of `name` left behind: finish a
+    /// delete it had begun, or put back a package it had not. Returns whether
+    /// it finished a delete.
+    fn retry_claims(&self, name: &str) -> Result<bool, PluginError> {
+        let mut finished = false;
         for entry in self.recovery_root.dir.entries()? {
             let entry = entry?;
             let Some(entry_name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -716,6 +742,24 @@ impl PluginHost {
                     reason: "recovery transaction ownership is unavailable".into(),
                 });
             };
+            // A delete the earlier remove had begun is finished through the
+            // claim, never put back for a second verdict on what it left.
+            let deleting = tx
+                .is_deleting()
+                .map_err(|error| PluginError::RecoveryRetained {
+                    path: self.recovery_root.retained_path(&tx),
+                    reason: error.to_string(),
+                })?;
+            if deleting {
+                tx.finish_delete()
+                    .map_err(|error| PluginError::RecoveryRetained {
+                        path: self.recovery_root.retained_path(&tx),
+                        reason: error.to_string(),
+                    })?;
+                tx.finish(&self.recovery_root)?;
+                finished = true;
+                continue;
+            }
             match tx.dir.symlink_metadata(recovery::PACKAGE) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     tx.finish(&self.recovery_root)?;
@@ -734,7 +778,7 @@ impl PluginHost {
                 }
             }
         }
-        Ok(())
+        Ok(finished)
     }
 
     /// Why whatever is at `path` (described by its `symlink_metadata`) is not

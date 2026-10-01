@@ -170,7 +170,8 @@ Active stages and ambiguous legacy `.<name>.installing-<pid>` directories are
 retained, and the command reports their paths. A PID in a filename does not
 prove abandonment. These retained stages do not prevent a fresh install after
 the incomplete final package is recovered. If no final package exists,
-`plugin remove` does not sweep staging directories.
+`plugin remove` does not sweep staging directories, unless it finishes a
+delete that an earlier `plugin remove` had begun.
 
 Other occupants are refused, and the command prints why: a symlink or a
 file at the name, a directory that holds files but no `manifest.toml`, a
@@ -188,7 +189,9 @@ occupant that holds files. On a filesystem without a no-replace rename, an
 empty directory at the name can be replaced. If restoration cannot finish, its bytes remain at the reported
 hidden location; the original name is not necessarily untouched. Retrying
 `plugin remove` restores a retained recovery transaction before checking
-admission again. Resolve the reported destination conflict or filesystem
+admission again. A delete that `plugin remove` had begun is finished instead:
+once it starts deleting a package it judged incomplete, a retry completes that
+delete. Resolve the reported destination conflict or filesystem
 error before retrying; do not delete hidden transactions merely because they
 look like leftovers.
 

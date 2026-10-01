@@ -255,6 +255,63 @@ fn an_entry_stopped_before_its_lease_is_removed_and_one_holding_a_package_is_kep
     );
 }
 
+/// A remover stopped once it has begun deleting leaves the claim marked, so the
+/// retry finishes that delete rather than putting back what is left. That holds
+/// even when the remainder would pass admission, as a skill bundle stopped
+/// between its skills can, which the test stands in for by making the claim a
+/// healthy package.
+#[test]
+fn a_delete_stopped_part_way_is_finished_by_the_retry() {
+    for step in ["delete-marked", "entry-deleted"] {
+        let root = tempfile::tempdir().unwrap();
+        broken(root.path());
+        let legacy = root.path().join(".race.installing-4242");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(root.path().join("race/plugin.wasm"), b"\0asm partial").unwrap();
+        std::fs::create_dir(root.path().join("race/skills")).unwrap();
+        std::fs::write(root.path().join("race/skills/notes.md"), b"notes").unwrap();
+        Paused::start(root.path(), step, "remove").crash();
+        let claim = tests::dir_entries(root.path())
+            .into_iter()
+            .find(|p| p.contains("recovering-v1"))
+            .unwrap();
+        let package = root.path().join(&claim).join("package");
+        std::fs::remove_dir_all(&package).unwrap();
+        std::fs::create_dir(&package).unwrap();
+        tests::write_tool_source(&package, "race", b"\0asm what is left");
+
+        let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+        assert_eq!(
+            host.remove_with_report("race").unwrap().as_slice(),
+            std::slice::from_ref(&legacy),
+            "{step}"
+        );
+        assert_eq!(
+            tests::dir_entries(root.path()),
+            [".race.installing-4242", ".zeroclaw-package-lock-v1"],
+            "{step}"
+        );
+    }
+}
+
+/// An empty claim is removed by an empty-only unlink, so one that gains an
+/// entry after its verdict is kept, not emptied.
+#[test]
+fn an_empty_claim_that_gains_an_entry_after_its_verdict_is_kept() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("race")).unwrap();
+    let paused = Paused::start(root.path(), "after-verdict", "remove");
+    let claim = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|p| p.contains("recovering-v1"))
+        .unwrap();
+    let late = root.path().join(&claim).join("package/keep");
+    std::fs::write(&late, b"late bytes").unwrap();
+    let output = paused.resume();
+    assert!(output.contains("RecoveryRetained"), "{output}");
+    assert_eq!(std::fs::read(&late).unwrap(), b"late bytes");
+}
+
 #[test]
 fn crash_after_claim_restores_then_recovers_on_retry() {
     let root = tempfile::tempdir().unwrap();

@@ -14,6 +14,7 @@ const LOCK: &str = ".zeroclaw-package-lock-v1";
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 const LEASE: &str = "lease";
 pub(super) const PACKAGE: &str = "package";
+const DELETING: &str = "deleting";
 
 pub(super) struct Root {
     pub dir: Dir,
@@ -242,6 +243,49 @@ impl Transaction {
         Ok(())
     }
 
+    /// Commit to deleting the claimed package. A process that takes this
+    /// transaction over after a stop finds the mark and finishes the delete
+    /// rather than putting the package back.
+    pub fn mark_deleting(&self) -> Result<(), PluginError> {
+        self.dir
+            .open_with(DELETING, OpenOptions::new().write(true).create_new(true))?;
+        Ok(())
+    }
+
+    /// Whether an earlier remove committed to deleting this claim. The mark is
+    /// a regular file this protocol created; anything else by that name is an
+    /// error rather than a commitment.
+    pub fn is_deleting(&self) -> Result<bool, PluginError> {
+        match self.dir.symlink_metadata(DELETING) {
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => Err(std::io::Error::other("the delete mark is not a regular file").into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Finish a delete an earlier remove committed to: whatever is left of
+    /// the claimed package, through a handle on it, then the mark.
+    pub fn finish_delete(&self) -> Result<(), PluginError> {
+        match self.dir.open_dir(PACKAGE) {
+            Ok(package) => {
+                clear_owned(&package)?;
+                drop(package);
+                self.dir.remove_dir(PACKAGE)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.remove_mark()
+    }
+
+    pub fn remove_mark(&self) -> Result<(), PluginError> {
+        match self.dir.remove_file(DELETING) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
     pub fn finish(self, root: &Root) -> Result<(), PluginError> {
         // Never recursively remove the transaction name: only empty-directory
         // removal is allowed after its owned payload has gone.
@@ -378,6 +422,8 @@ pub(super) fn clear_owned(dir: &Dir) -> Result<(), PluginError> {
         } else {
             dir.remove_file(&name)?;
         }
+        #[cfg(test)]
+        pause("entry-deleted");
     }
     Ok(())
 }
