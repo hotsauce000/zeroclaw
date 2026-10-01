@@ -219,9 +219,12 @@ matches senders exactly, so list user IDs, not usernames. Restart ZeroClaw
   host, prints the instance key, and lists anything the instance still needs
   before it can start.
 - At startup, the daemon's channel list includes `plugin.main`, and the
-  gateway's `/health` snapshot lists a `channel:plugin.main` component. That
-  component shows the listener is running; it does not show whether the bot is
-  connected to Discord.
+  gateway's `/health` snapshot lists a `channel:plugin.main` component. The
+  component reads `error` when the plugin's poll fails, and otherwise follows
+  the plugin's own health check, which ZeroClaw asks for about every 30
+  seconds. What that check covers is up to the plugin, so the proof that the
+  bot is connected to Discord is a message from an admitted user reaching the
+  agent and the agent's reply appearing in Discord.
 - A message from an admitted user is logged as `channel inbound message` with
   `zeroclaw.channel = plugin.main`. A message from anyone else is dropped and
   logged with `error_key = plugin_channel_sender_denied`.
