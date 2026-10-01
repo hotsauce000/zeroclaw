@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import http.client
 import io
 import json
 import sys
@@ -12,8 +13,6 @@ import tempfile
 import threading
 import time
 import unittest
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -41,6 +40,15 @@ def asked_for(tool: str) -> dict:
 
 def answered(content: object) -> dict:
     return {"role": "tool", "tool_call_id": provider.CALL_ID, "content": content}
+
+
+class ProviderRefused(Exception):
+    """The provider answered with a non-200 status."""
+
+    def __init__(self, status: int, payload: object) -> None:
+        super().__init__(f"provider answered {status}: {payload}")
+        self.status = status
+        self.payload = payload
 
 
 class RunningProvider:
@@ -95,15 +103,24 @@ class RunningProvider:
         )
 
     def post(self, body: dict, path: str = "/chat/completions") -> dict:
-        port = self.port_file.read_text().strip()
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{port}{path}",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"content-type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return json.loads(response.read())
+        # A plain loopback connection with an explicit path: the test never
+        # builds a URL, so nothing here can be steered at another scheme.
+        port = int(self.port_file.read_text().strip())
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            connection.request(
+                "POST",
+                path,
+                body=json.dumps(body).encode("utf-8"),
+                headers={"content-type": "application/json"},
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+        finally:
+            connection.close()
+        if response.status != 200:
+            raise ProviderRefused(response.status, payload)
+        return payload
 
     def summary(self, tool_match: str) -> dict[str, str]:
         output = io.StringIO()
@@ -222,10 +239,10 @@ class PluginSmokeProviderTest(unittest.TestCase):
     def test_other_routes_are_refused_and_not_logged(self) -> None:
         self.provider.set_script("config-echo")
 
-        with self.assertRaises(urllib.error.HTTPError) as refused:
+        with self.assertRaises(ProviderRefused) as refused:
             self.provider.post({"messages": [USER]}, path="/v1/embeddings")
 
-        self.assertEqual(refused.exception.code, 404)
+        self.assertEqual(refused.exception.status, 404)
         summary = self.provider.summary("config-echo")
         self.assertEqual(summary["requests"], "0")
         self.assertEqual(summary["tools_offered"], "0")
