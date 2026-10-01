@@ -14,7 +14,11 @@ const LOCK: &str = ".zeroclaw-package-lock-v1";
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 const LEASE: &str = "lease";
 pub(super) const PACKAGE: &str = "package";
-const DELETING: &str = "deleting";
+/// The mark a transaction holds once it is committed to deleting the
+/// generation it claimed: a remove that judged the package incomplete, or an
+/// update that published the replacement in its place. Recovery finishes the
+/// delete of a marked claim and never puts it back.
+pub(super) const DELETING: &str = "deleting";
 
 pub(super) struct Root {
     pub dir: Dir,
@@ -264,18 +268,18 @@ impl Transaction {
         Ok(())
     }
 
-    /// Commit to deleting the claimed package. A process that takes this
+    /// Commit to deleting the claimed generation. A process that takes this
     /// transaction over after a stop finds the mark and finishes the delete
-    /// rather than putting the package back.
+    /// rather than putting the generation back.
     pub fn mark_deleting(&self) -> Result<(), PluginError> {
         self.dir
             .open_with(DELETING, OpenOptions::new().write(true).create_new(true))?;
         Ok(())
     }
 
-    /// Whether an earlier remove committed to deleting this claim. The mark is
-    /// a regular file this protocol created; anything else by that name is an
-    /// error rather than a commitment.
+    /// Whether an earlier remove or update committed to deleting this claim.
+    /// The mark is a regular file this protocol created; anything else by that
+    /// name is an error rather than a commitment.
     pub fn is_deleting(&self) -> Result<bool, PluginError> {
         match self.dir.symlink_metadata(DELETING) {
             Ok(metadata) if metadata.is_file() => Ok(true),
@@ -285,8 +289,8 @@ impl Transaction {
         }
     }
 
-    /// Finish a delete an earlier remove committed to: whatever is left of
-    /// the claimed package, through a handle on it, then the mark.
+    /// Finish a delete an earlier remove or update committed to: whatever is
+    /// left of the claimed generation, through a handle on it, then the mark.
     pub fn finish_delete(&self) -> Result<(), PluginError> {
         match self.dir.open_dir(PACKAGE) {
             Ok(package) => {
@@ -455,6 +459,16 @@ pub(super) fn is_transaction(entry: &str, name: &str, kind: &str) -> bool {
         .is_some_and(|suffix| {
             suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
+}
+
+/// The package a `kind` transaction entry belongs to, when `entry` is one.
+pub(super) fn transaction_package<'a>(entry: &'a str, kind: &str) -> Option<&'a str> {
+    let (package, _) = entry
+        .strip_prefix('.')?
+        .rsplit_once(&format!(".{kind}-v1-"))?;
+    (crate::instance::validate_package_name(package).is_ok()
+        && is_transaction(entry, package, kind))
+    .then_some(package)
 }
 
 #[cfg(test)]
