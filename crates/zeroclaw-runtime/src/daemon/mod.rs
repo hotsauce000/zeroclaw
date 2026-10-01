@@ -830,8 +830,8 @@ pub async fn run_with_authority(
         let gateway_reload_controls = GatewayReloadControls {
             shutdown_tx: gateway_shutdown_tx.clone(),
             reload_tx: reload_tx.clone(),
-            channel_generation_control: Some(channel_generation_control.clone()),
             inproc: Some(inproc_connector.clone()),
+            channel_generation_control: Some(channel_generation_control.clone()),
         };
         let gateway_tui_registry = tui_registry.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
@@ -3139,6 +3139,34 @@ mod tests {
 
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
 
+    /// The reload drain must report the connections that were still unwinding
+    /// when its budget expired, not silently declare the generation retired.
+    #[tokio::test(start_paused = true)]
+    async fn rpc_drain_reports_connections_left_unwinding_when_the_budget_expires() {
+        let count = std::sync::atomic::AtomicUsize::new(2);
+        assert_eq!(
+            await_rpc_connection_drain_with(|| count.load(std::sync::atomic::Ordering::Relaxed))
+                .await,
+            RpcDrain::Outstanding(2)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rpc_drain_completes_once_the_last_connection_task_ends() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let releaser = std::sync::Arc::clone(&count);
+        let release = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            releaser.store(0, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(
+            await_rpc_connection_drain_with(|| count.load(std::sync::atomic::Ordering::Relaxed))
+                .await,
+            RpcDrain::Complete
+        );
+        release.await.unwrap();
+    }
+
     #[tokio::test]
     async fn retiring_channel_generation_clears_admission_and_joins_active_attempt() {
         let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3188,6 +3216,10 @@ mod tests {
         let mut config = test_config(&tmp);
         config.gateway.require_pairing = true;
         config.gateway.paired_tokens = vec!["zc_daemon_inproc_token".to_string()];
+        // The in-process seam is served under the non-local session policy,
+        // whose `initialize` refuses every caller while TUI identity signing is
+        // off, so this daemon gets a signing key, as one with a `.secret_key` has.
+        std::fs::write(config.data_dir.join(".secret_key"), "42".repeat(32)).unwrap();
 
         let released = Arc::new(AtomicBool::new(false));
         let released_for_gateway = released.clone();
@@ -7273,34 +7305,6 @@ mod tests {
 
         // `_hook_guard` drops here, releasing the serialising lock
         // and clearing the global hook for the next test.
-    }
-
-    /// The reload drain must report the connections that were still unwinding
-    /// when its budget expired, not silently declare the generation retired.
-    #[tokio::test(start_paused = true)]
-    async fn rpc_drain_reports_connections_left_unwinding_when_the_budget_expires() {
-        let count = std::sync::atomic::AtomicUsize::new(2);
-        assert_eq!(
-            await_rpc_connection_drain_with(|| count.load(std::sync::atomic::Ordering::Relaxed))
-                .await,
-            RpcDrain::Outstanding(2)
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn rpc_drain_completes_once_the_last_connection_task_ends() {
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
-        let releaser = std::sync::Arc::clone(&count);
-        let release = zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            releaser.store(0, std::sync::atomic::Ordering::Relaxed);
-        });
-        assert_eq!(
-            await_rpc_connection_drain_with(|| count.load(std::sync::atomic::Ordering::Relaxed))
-                .await,
-            RpcDrain::Complete
-        );
-        release.await.unwrap();
     }
 
     /// A reload hands the same durable sessions to a replacement generation, so
