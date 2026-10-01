@@ -94,6 +94,9 @@ class WorkflowPolicyTests(unittest.TestCase):
                 continue
             condition = re.search(r"(?m)^    if: (.+)$", block)
             self.assertIsNotNone(condition, name[1])
+            if name[1] == "master-debounce":
+                self.assertEqual(condition[1], "github.event_name == 'push'")
+                continue
             self.assertIn(workflow_policy.expression(), condition[1], name[1])
             checked += 1
         self.assertGreater(checked, 30)
