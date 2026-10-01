@@ -117,6 +117,7 @@ When the daemon cannot answer, the standalone gateway fails fast instead of queu
 | The daemon is not running, or the connection dropped | `503` | `webhook unavailable` |
 | The daemon's socket is served by another user | `503` | `webhook unavailable` |
 | The daemon refused the gateway's connection or call | `503` | `webhook unavailable` |
+| The path's channel instance, or an agent that handles it, refuses injected webhooks (`accept_injected_webhooks = false`) | `503` | `webhook unavailable` |
 | The daemon does not support plugin webhook dispatch | `503` | `webhook unavailable` |
 | The daemon returned a result the gateway cannot use | `503` | `webhook unavailable` |
 | The daemon did not answer within eleven seconds | `504` | `webhook processing timed out` |
