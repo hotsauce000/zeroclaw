@@ -93,15 +93,50 @@ The saved V3 config fixture represents an installation with no OIDC or user
 roster. It is synthetic: the exact historical startup failure revision is not
 known, so passing this test does not establish that it reproduces that incident.
 
-The Linux build leg of Quality Gate builds both applications from the same
-checked-out revision and immediately runs acceptance with those binaries.
+When acceptance is selected, the Linux build leg of Quality Gate builds both
+applications from the same checked-out revision and immediately runs acceptance
+with those binaries. A skipped acceptance suite keeps the existing Cargo build
+and does not add ZeroCode compilation.
 `scope.py` is the sole selection policy: documentation/metadata-only PRs skip,
 ordinary code runs core, and sensitive paths or `risk:high`, `domain:security`,
 `priority:p0`, and `priority:p1` labels select full. Unknown or unusable inputs
-select full. Merge queue, master pushes, and manual dispatches always run full.
-PR updates and label changes reevaluate selection; label events rerun Quality
-Gate. Acceptance failures fail the existing build dependency, and `CI Required
-Gate` rejects skipped builds.
+select full. Merge queue, master pushes, and ordinary manual dispatches run full.
+PR updates and changes to the four selection labels reevaluate Quality Gate.
+Other label events allocate no runners, use a separate concurrency group, and
+cannot cancel active CI or publish a skipped check named `CI Required Gate`.
+Missing label-event data fails closed and runs Quality Gate. Acceptance failures
+fail the existing build dependency, and `CI Required Gate` rejects skipped builds.
+
+GitHub must filter events before checkout. The job and concurrency expressions
+are generated from the canonical labels in `scope.py`; after changing that
+policy, run `python3 tests/system/runtime_acceptance/workflow_policy.py --write`.
+The selector contract checks their materialized form and actual build arguments.
+
+### Measuring CI cost
+
+Quality Gate has an explicit `acceptance_cost` manual-dispatch input, defaulting
+to false. Setting it to true runs only a disposable cost-measurement job. It
+cannot satisfy or replace `CI Required Gate`, does not change normal PR coverage,
+and never writes shared caches:
+
+```sh
+gh workflow run ci.yml --ref <branch> -f acceptance_cost=true
+```
+
+The measurement uses the same source revision, Linux x86_64 runner, toolchain,
+linker, target path, and initial restored cache for the existing root build and
+the proposed two-binary build. It fetches dependencies before timing and restores
+the original target snapshot before each build in baseline/candidate/candidate/
+baseline order. It then runs core, full, and negative controls using the measured
+candidate binaries. Logs, individual timings, means, cache state, revision, and
+application results are retained in the `acceptance-cost` artifact for seven days.
+The job is bounded to 60 minutes and costs runner time only when requested.
+
+Report elapsed time and summed runner-minutes separately. Include the added
+ZeroCode compilation, test execution, artifact overhead, and any extra workflow
+runs from risk-label edits. Convert measured usage to money using the project's
+confirmed Blacksmith rate and allowances; public pricing cannot establish an
+organization's OSS sponsorship or invoice terms.
 
 Core has a five-minute execution budget and full has ten minutes, excluding
 compilation. Individual waits are bounded. The full job also proves failure
