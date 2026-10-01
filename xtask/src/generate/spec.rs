@@ -1745,6 +1745,85 @@ mod tests {
         }
     }
 
+    /// One job's YAML block: from its header line to the next line at the
+    /// same or a shallower indent.
+    fn job_block<'a>(document: &'a str, header: &str) -> &'a str {
+        let header_indent = header.len() - header.trim_start().len();
+        let start = document
+            .match_indices(header)
+            .find_map(|(offset, _)| {
+                (offset == 0 || document.as_bytes().get(offset - 1) == Some(&b'\n'))
+                    .then_some(offset)
+            })
+            .unwrap_or_else(|| panic!("workflow is missing YAML block: {header}"));
+        let remainder = &document[start + header.len()..];
+        let mut offset = 0;
+        for line in remainder.split_inclusive('\n') {
+            let trimmed = line.trim();
+            let indent = line.len() - line.trim_start().len();
+            if !trimmed.is_empty() && indent <= header_indent {
+                return &remainder[..offset];
+            }
+            offset += line.len();
+        }
+        remainder
+    }
+
+    /// The `target:` entries of one job's matrix, whether an entry starts
+    /// with the target or lists it after another field.
+    fn matrix_targets(job: &str) -> Vec<String> {
+        job.lines()
+            .map(|line| line.trim())
+            .map(|line| line.strip_prefix("- ").unwrap_or(line))
+            .filter_map(|line| line.strip_prefix("target: "))
+            .map(|target| target.trim().to_owned())
+            .collect()
+    }
+
+    /// A release target carries a plugin backend exactly when the stable
+    /// release executes a plugin from that target's archive. A target cannot
+    /// claim plugin support without that proof, and a smoke leg cannot be
+    /// dropped while the artifact still carries the host. The manual
+    /// cross-platform workflow rehearses the same legs.
+    #[test]
+    fn release_targets_carry_a_plugin_backend_only_with_a_smoke_leg() {
+        let release =
+            std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
+                .unwrap();
+        let manual = std::fs::read_to_string(
+            root().join(".github/workflows/cross-platform-build-manual.yml"),
+        )
+        .unwrap();
+        let build_targets = matrix_targets(job_block(&release, "  build:\n"));
+        let smoke_targets = matrix_targets(job_block(&release, "  plugin-smoke:\n"));
+        assert!(!build_targets.is_empty(), "no release build legs parsed");
+        assert!(!smoke_targets.is_empty(), "no plugin smoke legs parsed");
+        assert_eq!(
+            matrix_targets(job_block(&manual, "  plugin-smoke:\n")),
+            smoke_targets,
+            "the manual workflow must rehearse exactly the release smoke legs"
+        );
+        for target in &smoke_targets {
+            assert!(
+                build_targets.contains(target),
+                "plugin smoke leg {target} has no release build leg"
+            );
+        }
+        for target in &build_targets {
+            let features =
+                resolve_feature_list_for_target(&root(), &Selection::Dist, Some(target)).unwrap();
+            let carries_backend = features
+                .iter()
+                .any(|feature| feature.starts_with("plugins-wasm"));
+            assert_eq!(
+                carries_backend,
+                smoke_targets.contains(target),
+                "{target}: a plugin backend in the distribution set ({carries_backend}) must \
+                 come with a release smoke leg, and only then"
+            );
+        }
+    }
+
     #[test]
     fn plan_diverges_and_converges() {
         let p = Plan::build(&root(), Platform::Unix, &Selection::Full).unwrap();
