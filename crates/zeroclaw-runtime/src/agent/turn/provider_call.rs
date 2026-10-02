@@ -252,8 +252,14 @@ pub(crate) async fn call_provider(
             .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
                     match consume_provider_streaming_response_with_policy(
                         active_model_provider,
-                        prepared_messages,
-                        request_tools,
+                        ChatRequest {
+                            messages: prepared_messages,
+                            tools: request_tools,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
                         active_dispatch_model,
                         ctx.temperature,
                         ctx.cancellation_token,

@@ -14,7 +14,9 @@ use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_config::schema::StreamReasoningMode;
-use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
+#[cfg(test)]
+use zeroclaw_providers::ChatMessage;
+use zeroclaw_providers::{ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamedChatOutcome {
@@ -61,8 +63,14 @@ pub(crate) async fn consume_provider_streaming_response(
 ) -> Result<StreamedChatOutcome> {
     consume_provider_streaming_response_with_policy(
         model_provider,
-        messages,
-        request_tools,
+        ChatRequest {
+            messages,
+            tools: request_tools,
+            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
+        },
         model,
         temperature,
         cancellation_token,
@@ -77,8 +85,7 @@ pub(crate) async fn consume_provider_streaming_response(
 
 pub(crate) async fn consume_provider_streaming_response_with_policy(
     model_provider: &dyn ModelProvider,
-    messages: &[ChatMessage],
-    request_tools: Option<&[crate::tools::ToolSpec]>,
+    request: ChatRequest<'_>,
     model: &str,
     temperature: Option<f64>,
     cancellation_token: Option<&CancellationToken>,
@@ -88,16 +95,10 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     draft_reasoning: StreamReasoningMode,
     policy: zeroclaw_api::model_provider::ToolRoundPolicy,
 ) -> Result<StreamedChatOutcome> {
+    let request_tools = request.tools;
     let mut provider_stream = ProviderDispatch::from_ref(model_provider)
         .stream_chat_with_tool_round_policy(
-            ChatRequest {
-                messages,
-                tools: request_tools,
-                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                    .try_with(Clone::clone)
-                    .ok()
-                    .flatten(),
-            },
+            request,
             model,
             temperature,
             zeroclaw_providers::traits::StreamOptions::new(true),
