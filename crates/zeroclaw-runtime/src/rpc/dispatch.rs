@@ -20741,8 +20741,8 @@ mod tests {
         let operation = alice.handle_session_configure(&params);
         let replace = async {
             // Replace only once configure is parked on the update lock, after
-            // its generation capture. A fixed delay cannot promise that: the
-            // config write lock configure takes first is process-wide.
+            // its generation capture; a fixed delay cannot promise that under
+            // parallel test load.
             tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
                 .await
                 .expect("configure must reach the provider update lock");
