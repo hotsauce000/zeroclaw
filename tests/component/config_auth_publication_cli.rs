@@ -1,5 +1,5 @@
-//! `zeroclaw config set`, `config patch` and `config init` against a running
-//! daemon.
+//! `zeroclaw config set`, `config patch` and `config init`, and the roster
+//! edits of `zeroclaw user`, against a running daemon.
 //!
 //! An edit to the authorization inputs (`[users]`, `[permission_profiles]`,
 //! `[oidc]`, `security.trust_daemon_uid`) is committed through the daemon's
@@ -1649,4 +1649,404 @@ fn config_patch_testing_an_authorization_input_is_unchanged_without_a_daemon() {
         before,
         "a patch whose `test` op fails must leave config.toml untouched"
     );
+}
+
+// `zeroclaw user` commits its roster edits through the same path: `add` and
+// `passwd` as `config/set-many`, `disable-password` as `config/delete`, which
+// is how the daemon takes the clearing of a secret, and `remove` as
+// `config/map-key-delete`.
+
+/// Whether the daemon's live roster entry `name` holds a password hash. A
+/// single-property read masks a secret whether or not it is set, so this
+/// reads the whole masked configuration, where an unset one is absent.
+fn live_password_hash_is_set(probe: &mut RpcProbe, name: &str) -> bool {
+    let config = probe
+        .call("config/get", json!({}))
+        .unwrap_or_else(|error| panic!("an admin principal can read the config: {error}"));
+    config["users"][name]["password_hash"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty())
+}
+
+#[test]
+fn user_add_with_a_uid_is_applied_live() {
+    let fixture = Fixture::new("admin");
+    let daemon = Daemon::start(&fixture);
+    let uid = fixture.other_uid();
+
+    let output = run_cli(
+        &fixture,
+        &[
+            "user",
+            "add",
+            "bob",
+            "--profile",
+            "reader",
+            "--uid",
+            &uid.to_string(),
+        ],
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "an addition the daemon accepts must succeed\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("applied to the running daemon"),
+        "the command must say the daemon applied the edit\n{}",
+        describe(&output)
+    );
+
+    let mut probe = daemon.probe();
+    let live = probe
+        .config_get("users.bob.uid")
+        .unwrap_or_else(|error| panic!("the daemon's live roster must carry users.bob: {error}"));
+    assert!(
+        live["value"]
+            .as_str()
+            .is_some_and(|value| value.contains(&uid.to_string())),
+        "the daemon's live users.bob.uid must be {uid}: {live}"
+    );
+    let saved = fixture.config_toml();
+    assert_eq!(
+        toml_at(&saved, "users.bob.uid").and_then(toml::Value::as_integer),
+        Some(i64::from(uid)),
+        "the daemon must have saved users.bob:\n{}",
+        fixture.config_text()
+    );
+    assert_eq!(
+        toml_at(&saved, "users.bob.permission_profiles"),
+        Some(&string_array(&["reader"])),
+        "the daemon must have saved users.bob:\n{}",
+        fixture.config_text()
+    );
+}
+
+/// Removing an entry while the daemon runs ends its uid binding at once: the
+/// connection that entry authenticated is refused at its next operation, and
+/// a new one at the handshake, with no restart.
+#[test]
+fn user_remove_ends_the_entry_binding_live() {
+    let fixture = Fixture::new("admin");
+    let daemon = Daemon::start(&fixture);
+    let mut established = daemon.probe();
+    established
+        .config_get("gateway.host")
+        .unwrap_or_else(|error| panic!("users.me starts out able to read config: {error}"));
+
+    let output = run_cli(&fixture, &["user", "remove", "me"], None);
+    assert!(
+        output.status.success(),
+        "a removal the daemon accepts must succeed\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("applied to the running daemon"),
+        "the command must say the daemon applied the edit\n{}",
+        describe(&output)
+    );
+
+    match established.config_get("gateway.host") {
+        Err(error) => assert_eq!(
+            error.get("code").and_then(Value::as_i64),
+            Some(i64::from(AUTH_REQUIRED)),
+            "the removed entry's established connection must be refused: {error}"
+        ),
+        Ok(result) => panic!(
+            "the removed entry's established connection still reads config: {result}\n{}",
+            daemon.output()
+        ),
+    }
+    let mut fresh = RpcProbe::connect(&fixture.socket())
+        .unwrap_or_else(|error| panic!("connect {}: {error}", fixture.socket().display()));
+    daemon.assert_refused(fresh.initialize(), AUTH_REQUIRED);
+    assert!(
+        toml_at(&fixture.config_toml(), "users.me").is_none(),
+        "the daemon must have saved the removal:\n{}",
+        fixture.config_text()
+    );
+}
+
+#[test]
+fn user_passwd_and_disable_password_are_applied_live() {
+    let fixture = Fixture::new("admin");
+    let daemon = Daemon::start(&fixture);
+    let mut probe = daemon.probe();
+    assert!(!live_password_hash_is_set(&mut probe, "me"));
+
+    let output = run_cli(
+        &fixture,
+        &["user", "passwd", "me", "--password-stdin"],
+        Some(b"zeroclaw-live-passphrase\n"),
+    );
+    assert!(
+        output.status.success(),
+        "a password the daemon accepts must succeed\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("applied to the running daemon"),
+        "the command must say the daemon applied the edit\n{}",
+        describe(&output)
+    );
+    assert!(
+        live_password_hash_is_set(&mut probe, "me"),
+        "the daemon's live roster must hold the new hash\n{}",
+        daemon.output()
+    );
+    let stored = toml_at(&fixture.config_toml(), "users.me.password_hash")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+    assert!(
+        stored
+            .as_deref()
+            .is_some_and(|value| value.starts_with("enc2:")),
+        "the daemon must have saved the hash encrypted: {stored:?}"
+    );
+
+    let output = run_cli(&fixture, &["user", "disable-password", "me"], None);
+    assert!(
+        output.status.success(),
+        "clearing a password the daemon accepts must succeed\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("applied to the running daemon"),
+        "clearing the secret goes through the daemon too\n{}",
+        describe(&output)
+    );
+    assert!(
+        !live_password_hash_is_set(&mut probe, "me"),
+        "the daemon's live roster must have dropped the hash\n{}",
+        daemon.output()
+    );
+    assert!(
+        toml_at(&fixture.config_toml(), "users.me.password_hash").is_none(),
+        "the daemon must have saved the cleared hash:\n{}",
+        fixture.config_text()
+    );
+}
+
+/// An entry the file carries but the running daemon never loaded, such as
+/// one added by hand since it started, leaves the daemon nothing to delete.
+/// The command removes it from the file itself, so a later reload cannot
+/// bring it back, and does not claim the daemon applied anything.
+#[test]
+fn user_remove_of_an_entry_the_daemon_never_loaded_is_saved_to_the_file() {
+    let fixture = Fixture::new("admin");
+    let daemon = Daemon::start(&fixture);
+    let uid = fixture.other_uid();
+    let hand_edited = format!(
+        "{}\n[users.bob]\nuid = {uid}\npermission_profiles = [\"reader\"]\n",
+        fixture.config_text()
+    );
+    fixture.write_config_text(&hand_edited);
+
+    let output = run_cli(&fixture, &["user", "remove", "bob"], None);
+    assert!(
+        output.status.success(),
+        "removing a hand-added entry must succeed\n{}",
+        describe(&output)
+    );
+    // The daemon was asked and answered that it deleted nothing: neither
+    // applied nor pending.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("applied to the running daemon")
+            && !stderr.contains("still enforces the previous authorization policy"),
+        "the daemon deleted nothing, so there is nothing to report\n{}",
+        describe(&output)
+    );
+    let saved = fixture.config_toml();
+    assert!(
+        toml_at(&saved, "users.bob").is_none(),
+        "the hand-added entry must be gone from the file:\n{}",
+        fixture.config_text()
+    );
+    assert!(
+        toml_at(&saved, "users.me").is_some(),
+        "the rest of the roster stays:\n{}",
+        fixture.config_text()
+    );
+    // The daemon still serves the roster it holds.
+    daemon.probe();
+}
+
+/// The command decides from config.toml that the name is free, but the
+/// daemon still holds an entry by that name, removed by hand since it
+/// started. Committing would merge into that entry and keep its other
+/// credentials live, so the command refuses before asking for anything.
+#[test]
+fn user_add_of_a_name_the_daemon_still_holds_is_refused() {
+    let fixture = Fixture::new("admin");
+    let unedited = fixture.config_text();
+    let uid = fixture.other_uid();
+    fixture.write_config_text(&format!(
+        "{unedited}\n[users.bob]\nuid = {uid}\npermission_profiles = [\"reader\"]\n"
+    ));
+    let daemon = Daemon::start(&fixture);
+    fixture.write_config_text(&unedited);
+
+    let output = run_cli(
+        &fixture,
+        &[
+            "user",
+            "add",
+            "bob",
+            "--profile",
+            "admin",
+            "--uid",
+            &uid.to_string(),
+        ],
+        None,
+    );
+    assert!(
+        !output.status.success(),
+        "an addition the daemon would merge into a stale entry must fail\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("still holds it"),
+        "stderr must say the daemon still holds the entry\n{}",
+        describe(&output)
+    );
+    assert_eq!(
+        fixture.config_text(),
+        unedited,
+        "a refused edit must leave config.toml byte-identical"
+    );
+    let mut probe = daemon.probe();
+    let live = probe
+        .config_get("users.bob.permission_profiles")
+        .unwrap_or_else(|error| panic!("the daemon still holds users.bob: {error}"));
+    assert!(
+        live["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("reader") && !value.contains("admin")),
+        "the daemon's entry must be untouched: {live}"
+    );
+}
+
+/// An entry the file carries but the daemon never loaded cannot take a
+/// password through the daemon, which would create it with nothing but the
+/// hash; the command refuses before asking for the password.
+#[test]
+fn user_passwd_of_an_entry_the_daemon_never_loaded_is_refused() {
+    let fixture = Fixture::new("admin");
+    let daemon = Daemon::start(&fixture);
+    let hand_edited = format!(
+        "{}\n[users.bob]\nuid = {}\npermission_profiles = [\"reader\"]\n",
+        fixture.config_text(),
+        fixture.other_uid()
+    );
+    fixture.write_config_text(&hand_edited);
+
+    let output = run_cli(
+        &fixture,
+        &["user", "passwd", "bob", "--password-stdin"],
+        None,
+    );
+    assert!(
+        !output.status.success(),
+        "a password for an entry the daemon has not loaded must fail\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("has not loaded it"),
+        "stderr must say the daemon has not loaded the entry\n{}",
+        describe(&output)
+    );
+    assert_eq!(
+        fixture.config_text(),
+        hand_edited,
+        "a refused edit must leave config.toml byte-identical"
+    );
+    let mut probe = daemon.probe();
+    if let Ok(live) = probe.config_get("users.bob.uid") {
+        panic!("the daemon must not have gained users.bob: {live}");
+    }
+}
+
+/// A daemon that refuses this caller at the handshake binds no principal, so
+/// the command saves the file itself and says the edit waits for a reload.
+#[test]
+fn user_add_refused_at_the_handshake_is_saved_and_pending() {
+    let fixture = Fixture::unmapped("reader");
+    let _daemon = Daemon::start_expecting(&fixture, Handshake::Refuses(AUTH_REQUIRED));
+    let uid = fixture.other_uid();
+
+    let output = run_cli(
+        &fixture,
+        &[
+            "user",
+            "add",
+            "bob",
+            "--profile",
+            "reader",
+            "--uid",
+            &uid.to_string(),
+        ],
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "an edit refused at the handshake falls back to the direct save\n{}",
+        describe(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("still enforces the previous authorization policy")
+            && stderr.contains("refused this caller"),
+        "a pending edit names the reason on stderr\n{}",
+        describe(&output)
+    );
+    assert_eq!(
+        toml_at(&fixture.config_toml(), "users.bob.uid").and_then(toml::Value::as_integer),
+        Some(i64::from(uid)),
+        "the CLI must have saved config.toml directly:\n{}",
+        fixture.config_text()
+    );
+}
+
+/// A principal the daemon binds but does not let write config is refused the
+/// edit, and the command saves nothing.
+#[test]
+fn user_add_refused_to_the_bound_principal_saves_nothing() {
+    let fixture = Fixture::new("reader");
+    let daemon = Daemon::start(&fixture);
+    let before = fixture.config_text();
+
+    let output = run_cli(
+        &fixture,
+        &[
+            "user",
+            "add",
+            "bob",
+            "--profile",
+            "admin",
+            "--uid",
+            &fixture.other_uid().to_string(),
+        ],
+        None,
+    );
+    assert!(
+        !output.status.success(),
+        "an edit the daemon refused the bound principal must fail\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("identified you and refused this edit"),
+        "stderr must carry the refusal\n{}",
+        describe(&output)
+    );
+    assert_eq!(
+        fixture.config_text(),
+        before,
+        "a refused edit must leave config.toml byte-identical"
+    );
+    let mut probe = daemon.probe();
+    if let Ok(live) = probe.config_get("users.bob.uid") {
+        panic!("the daemon's live roster must not gain users.bob: {live}");
+    }
 }

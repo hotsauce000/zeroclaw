@@ -8,24 +8,35 @@
 //! A hash is a PHC string for scrypt,
 //! `$scrypt$ln=<log2 N>,r=<r>,p=<p>$<salt>$<hash>`, with every parameter spelled
 //! out: a hash that leaned on the library's defaults would change meaning if
-//! those defaults moved. Its cost must fall inside bounds. The floor is the
-//! lowest cost among the scrypt configurations OWASP lists (N times p of
-//! 81920) with at least 16 MiB of memory, so a weak hash is refused; the
-//! ceiling (128 MiB of memory, 16 passes) stops a configured hash from
-//! turning each login attempt into a denial of service.
+//! those defaults moved. Its cost must fall inside the range of the scrypt
+//! configurations OWASP lists, with at least 16 MiB of memory: N times p from
+//! 81920, so a weak hash is refused, to 131072, so a configured hash cannot
+//! turn each login attempt into a denial of service.
+//!
+//! A password is hashed and checked as its NFKC normalization, as NIST
+//! SP 800-63B-4 recommends: the same characters typed on another keyboard or
+//! input method can arrive composed differently, and still match. A new
+//! password may not contain a code point this crate's Unicode version leaves
+//! unassigned, since a later version could give it a decomposition and so
+//! change what a stored hash was taken over.
 
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use scrypt::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use scrypt::{Params, Scrypt};
+use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_public_assigned;
+use zeroize::Zeroizing;
 
-/// Longest password accepted, in bytes. Longer input is never hashed.
+/// Longest password accepted, in bytes as typed. Longer input is never
+/// normalized or hashed.
 pub const MAX_PASSWORD_BYTES: usize = 1024;
 
-/// Shortest new password accepted, in characters. NIST SP 800-63B-4 asks for
-/// at least 15 when a password is the only authentication factor, which a
-/// roster password is.
+/// Shortest new password accepted, in characters, both as typed and once
+/// normalized: normalization can compose several typed code points into one,
+/// or expand one into many. NIST SP 800-63B-4 asks for at least 15 when a
+/// password is the only authentication factor, which a roster password is.
 pub const MIN_NEW_PASSWORD_CHARS: usize = 15;
 
 /// Why [`check_new_password`] refused a password. Only length is checked:
@@ -33,10 +44,14 @@ pub const MIN_NEW_PASSWORD_CHARS: usize = 15;
 /// harder to guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewPasswordError {
-    /// Shorter than [`MIN_NEW_PASSWORD_CHARS`] characters.
+    /// Shorter than [`MIN_NEW_PASSWORD_CHARS`] characters, as typed or once
+    /// normalized.
     TooShort,
-    /// Longer than [`MAX_PASSWORD_BYTES`] bytes.
+    /// Longer than [`MAX_PASSWORD_BYTES`] bytes as typed.
     TooLong,
+    /// Contains a code point Unicode leaves unassigned in the version this
+    /// crate normalizes with.
+    Unassigned,
 }
 
 impl std::fmt::Display for NewPasswordError {
@@ -47,6 +62,7 @@ impl std::fmt::Display for NewPasswordError {
                 "the password is shorter than {MIN_NEW_PASSWORD_CHARS} characters"
             ),
             Self::TooLong => write!(f, "the password is longer than {MAX_PASSWORD_BYTES} bytes"),
+            Self::Unassigned => write!(f, "the password contains an unassigned code point"),
         }
     }
 }
@@ -60,10 +76,38 @@ pub fn check_new_password(password: &str) -> Result<(), NewPasswordError> {
     if password.len() > MAX_PASSWORD_BYTES {
         return Err(NewPasswordError::TooLong);
     }
-    if password.chars().count() < MIN_NEW_PASSWORD_CHARS {
+    if password
+        .chars()
+        .any(|c| !is_public_assigned(c) && !is_private_use(c))
+    {
+        return Err(NewPasswordError::Unassigned);
+    }
+    if password.chars().count().min(password.nfkc().count()) < MIN_NEW_PASSWORD_CHARS {
         return Err(NewPasswordError::TooShort);
     }
     Ok(())
+}
+
+/// Private-use code points are assigned, and never gain a decomposition.
+fn is_private_use(c: char) -> bool {
+    matches!(
+        c,
+        '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}'
+    )
+}
+
+/// What scrypt runs on for `password`: its NFKC normalization, or `None` for
+/// input that is not a usable password (empty, or longer than
+/// [`MAX_PASSWORD_BYTES`] as typed). The copy is sized before it is filled,
+/// so it never reallocates, and it is scrubbed when dropped.
+fn normalized(password: &str) -> Option<Zeroizing<String>> {
+    if password.is_empty() || password.len() > MAX_PASSWORD_BYTES {
+        return None;
+    }
+    let len = password.nfkc().map(char::len_utf8).sum();
+    let mut input = Zeroizing::new(String::with_capacity(len));
+    input.extend(password.nfkc());
+    Some(input)
 }
 
 /// `log2(N)` for new hashes. With [`DEFAULT_R`] and [`DEFAULT_P`] this is
@@ -80,10 +124,13 @@ const MIN_SALT_LEN: usize = 16;
 /// Lowest accepted `log2(N)`: 16 MiB of memory at `r = 8`.
 const MIN_LOG_N: u8 = 14;
 const MAX_LOG_N: u8 = 17;
-const MAX_P: u32 = 16;
 /// Lowest accepted `N * p`: the lowest cost among the scrypt configurations
 /// OWASP lists (N = 2^14 with p = 5, or N = 2^13 with p = 10).
 const MIN_WORK: u64 = 5 << 14;
+/// Highest accepted `N * p`: the highest cost among the scrypt configurations
+/// OWASP lists (N = 2^17 with p = 1, or N = 2^16 with p = 2). It also bounds
+/// `p`, to 8 at the lowest accepted `N`.
+const MAX_WORK: u64 = 1 << 17;
 
 /// Salt and output shared by every decoy: random bytes, fixed in the source.
 /// No password is known to produce them, and a decoy match never counts.
@@ -186,11 +233,12 @@ fn parse(phc: &str) -> Result<PasswordHash<'_>> {
     if r != DEFAULT_R {
         bail!("has r = {r}; only r = {DEFAULT_R} is accepted");
     }
-    if !(1..=MAX_P).contains(&p) {
-        bail!("has p = {p}; the accepted range is 1 to {MAX_P}");
-    }
-    if work((log_n, r, p)) < MIN_WORK {
+    let cost = work((log_n, r, p));
+    if cost < MIN_WORK {
         bail!("costs too little: N * p must be at least {MIN_WORK}");
+    }
+    if cost > MAX_WORK {
+        bail!("costs too much: N * p must be at most {MAX_WORK}");
     }
     let mut salt_buf = [0u8; 64];
     match hash.salt.map(|salt| salt.decode_b64(&mut salt_buf)) {
@@ -204,23 +252,26 @@ fn parse(phc: &str) -> Result<PasswordHash<'_>> {
     Ok(hash)
 }
 
-/// Hash a new `password` for storage, at the default parameters with a fresh
-/// random salt. The password must pass [`check_new_password`].
+/// Hash a new `password` for storage, normalized, at the default parameters
+/// with a fresh random salt. The password must pass [`check_new_password`].
 pub fn hash_password(password: &str) -> Result<String> {
     check_new_password(password)?;
+    let Some(input) = normalized(password) else {
+        bail!("the password is empty");
+    };
     let salt: [u8; MIN_SALT_LEN] = rand::random();
     let salt = SaltString::encode_b64(&salt)
         .map_err(|e| anyhow::Error::msg(format!("encoding the salt failed: {e}")))?;
     let params = Params::new(DEFAULT_LOG_N, DEFAULT_R, DEFAULT_P, OUTPUT_LEN)
         .map_err(|e| anyhow::Error::msg(format!("scrypt parameters: {e}")))?;
     let hash = Scrypt
-        .hash_password_customized(password.as_bytes(), None, None, params, &salt)
+        .hash_password_customized(input.as_bytes(), None, None, params, &salt)
         .map_err(|e| anyhow::Error::msg(format!("hashing the password failed: {e}")))?;
     Ok(hash.to_string())
 }
 
-/// Whether `password` matches `stored`, spending one scrypt verification
-/// whatever the answer.
+/// Whether `password`, normalized, matches `stored`, spending one scrypt
+/// verification whatever the answer.
 ///
 /// With no hash to check (`stored` is `None`, or does not satisfy the policy)
 /// or an input that is not a usable password (empty, or longer than
@@ -230,7 +281,8 @@ pub fn hash_password(password: &str) -> Result<String> {
 /// the time taken does not reveal which case applied. A stored hash whose
 /// parameters differ from the decoy's costs a different amount of work.
 pub fn verify_password(password: &str, stored: Option<&str>, decoy: &Decoy) -> bool {
-    let Some(check) = Check::select(password, stored, decoy) else {
+    let input = normalized(password);
+    let Some(check) = Check::select(input.as_deref().map(String::as_str), stored, decoy) else {
         return false;
     };
     let matched = Scrypt.verify_password(check.input, &check.hash).is_ok();
@@ -247,18 +299,20 @@ struct Check<'a> {
 }
 
 impl<'a> Check<'a> {
+    /// `input` is the normalized password, `None` when it is not usable.
     /// `None` only if the decoy failed to parse, which its tests rule out;
     /// the caller then refuses without hashing.
-    fn select(password: &'a str, stored: Option<&'a str>, decoy: &'a Decoy) -> Option<Self> {
-        let usable = !password.is_empty() && password.len() <= MAX_PASSWORD_BYTES;
-        if usable && let Some(hash) = stored.and_then(|phc| parse(phc).ok()) {
+    fn select(input: Option<&'a str>, stored: Option<&'a str>, decoy: &'a Decoy) -> Option<Self> {
+        if let Some(input) = input
+            && let Some(hash) = stored.and_then(|phc| parse(phc).ok())
+        {
             return Some(Self {
-                input: password.as_bytes(),
+                input: input.as_bytes(),
                 hash,
                 counts: true,
             });
         }
-        let input: &[u8] = if usable { password.as_bytes() } else { b"" };
+        let input: &[u8] = input.map_or(b"", str::as_bytes);
         PasswordHash::new(&decoy.0).ok().map(|hash| Self {
             input,
             hash,
@@ -326,7 +380,9 @@ mod tests {
     #[test]
     fn every_miss_is_checked_against_the_decoy() {
         let decoy = Decoy::for_hashes([STORED.as_str()]);
-        let real = Check::select(PASSWORD, Some(&STORED), &decoy).expect("check");
+        let input = normalized(PASSWORD);
+        let real = Check::select(input.as_deref().map(String::as_str), Some(&STORED), &decoy)
+            .expect("check");
         assert!(real.counts, "a usable password against a real hash counts");
 
         let long = "a".repeat(MAX_PASSWORD_BYTES + 1);
@@ -341,7 +397,9 @@ mod tests {
             (long.as_str(), Some(STORED.as_str()), "over-long input"),
         ];
         for (password, stored, why) in misses {
-            let check = Check::select(password, stored, &decoy).expect("the decoy parses");
+            let input = normalized(password);
+            let check = Check::select(input.as_deref().map(String::as_str), stored, &decoy)
+                .expect("the decoy parses");
             assert!(!check.counts, "{why}: a decoy match must not count");
             assert_eq!(
                 check.hash.to_string(),
@@ -378,9 +436,60 @@ mod tests {
             check_new_password(&"\u{3042}".repeat(MIN_NEW_PASSWORD_CHARS)),
             Ok(())
         );
+        // The minimum holds both as typed and once normalized: fourteen
+        // accented letters typed decomposed are 28 code points but compose to
+        // fourteen, and one typed ligature, or four squared katakana words,
+        // expand to 18 and 15.
+        for short in [
+            "e\u{301}".repeat(MIN_NEW_PASSWORD_CHARS - 1),
+            "\u{fdfa}".to_owned(),
+            "\u{3300}\u{3301}\u{3302}\u{3303}".to_owned(),
+        ] {
+            assert_eq!(
+                check_new_password(&short),
+                Err(NewPasswordError::TooShort),
+                "{short:?}"
+            );
+        }
         assert_eq!(
             check_new_password(&"a".repeat(MAX_PASSWORD_BYTES + 1)),
             Err(NewPasswordError::TooLong)
+        );
+    }
+
+    #[test]
+    fn new_passwords_may_not_contain_unassigned_code_points() {
+        let padding = "a".repeat(MIN_NEW_PASSWORD_CHARS);
+        // U+0378 is unassigned; a later Unicode version could assign it a
+        // decomposition, which would change the normalized password.
+        assert_eq!(
+            check_new_password(&format!("{padding}\u{378}")),
+            Err(NewPasswordError::Unassigned)
+        );
+        assert!(hash_password(&format!("{padding}\u{378}")).is_err());
+        // Private-use code points are assigned and stay stable.
+        assert_eq!(check_new_password(&format!("{padding}\u{f8ff}")), Ok(()));
+    }
+
+    #[test]
+    fn passwords_match_whatever_composition_they_are_typed_in() {
+        let decoy = Decoy::default();
+        // Precomposed and decomposed accents are one password once
+        // normalized, and so are a full-width letter and its ASCII form.
+        let stored =
+            hash_password("\u{ff3a}ero-caf\u{e9}-cr\u{e8}me-br\u{fb}l\u{e9}e").expect("hash");
+        assert!(verify_password(
+            "Zero-cafe\u{301}-cre\u{300}me-bru\u{302}le\u{301}e",
+            Some(&stored),
+            &decoy
+        ));
+        assert!(
+            !verify_password(
+                "zero-cafe\u{301}-cre\u{300}me-bru\u{302}le\u{301}e",
+                Some(&stored),
+                &decoy
+            ),
+            "normalization does not fold case"
         );
     }
 
@@ -449,7 +558,8 @@ mod tests {
         ] {
             validate_phc(&phc(params, 16, 32)).unwrap_or_else(|e| panic!("{params}: {e}"));
         }
-        validate_phc(&phc("ln=17,r=8,p=16", 32, 32)).expect("the ceiling is inclusive");
+        validate_phc(&phc("ln=14,r=8,p=8", 32, 32)).expect("the work ceiling is inclusive");
+        validate_phc(&phc("ln=15,r=8,p=4", 16, 32)).expect("inside both bounds");
     }
 
     #[test]
@@ -458,7 +568,10 @@ mod tests {
             (phc("ln=13,r=8,p=16", 16, 32), "ln below the floor"),
             (phc("ln=18,r=8,p=1", 16, 32), "ln above the ceiling"),
             (phc("ln=15,r=16,p=3", 16, 32), "r other than 8"),
-            (phc("ln=15,r=8,p=17", 16, 32), "p above the ceiling"),
+            (phc("ln=15,r=8,p=17", 16, 32), "work above the ceiling"),
+            (phc("ln=17,r=8,p=16", 16, 32), "work above the ceiling"),
+            (phc("ln=17,r=8,p=2", 16, 32), "work above the ceiling"),
+            (phc("ln=14,r=8,p=9", 16, 32), "work above the ceiling"),
             (phc("ln=15,r=8,p=1", 16, 32), "work below the floor"),
             (phc("ln=14,r=8,p=4", 16, 32), "work below the floor"),
             (phc("ln=15,r=8,p=3", 8, 32), "short salt"),

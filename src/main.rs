@@ -6762,8 +6762,10 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         };
         return handle_oidc_command(oidc_command, &config).await;
     }
-    // Roster edits need no startup prelude: they touch only config.toml.
-    // (`user hash-password` never gets here; it runs before config loads.)
+    // Roster edits need no startup prelude: they touch only config.toml, or
+    // the running daemon that commits it. This is their only dispatch; the
+    // match below never sees them, and `user hash-password` never gets here,
+    // since it runs before the config loads.
     #[cfg(feature = "agent-runtime")]
     if matches!(cli.command, Commands::User { .. }) {
         let Commands::User { user_command } = cli.command else {
@@ -9131,9 +9133,10 @@ Add pricing to the active provider profile or supply a catalog entry."
         #[cfg(feature = "agent-runtime")]
         Commands::Oidc { oidc_command } => handle_oidc_command(oidc_command, &config).await,
 
+        // Dispatched before the startup prelude, like the commands above.
         #[cfg(feature = "agent-runtime")]
-        Commands::User { user_command } => {
-            Box::pin(handle_user_command(user_command, &config)).await
+        Commands::User { .. } => {
+            anyhow::bail!("pre-runtime command was not handled before runtime dispatch")
         }
 
         Commands::Hardware { hardware_command } => {
@@ -12178,19 +12181,23 @@ async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Res
     Ok(())
 }
 
-/// `zeroclaw user`: offline edits to the `[users]` roster. Each edit is
-/// checked as a complete authorization policy before a password is asked
-/// for and again before anything is written, which also makes these
-/// commands a repair path while the daemon is stopped. Like `config set`, a
-/// running daemon picks the change up at its next reload or restart.
+/// `zeroclaw user`: edits to the `[users]` roster. Each edit is checked as a
+/// complete authorization policy before a password is asked for and again
+/// before it is committed. While a daemon serves this configuration, the
+/// edit goes through it, which validates, saves and applies it as one step,
+/// the way `config set` hands it an authorization edit. With no daemon
+/// running, or one that refuses this caller before binding a principal, the
+/// command saves config.toml itself, which also makes these commands a
+/// repair path for a daemon that refuses everyone.
 #[cfg(feature = "agent-runtime")]
 async fn handle_user_command(user_command: UserCommands, config: &Config) -> Result<()> {
     use zeroclaw_config::password_hash::{Decoy, hash_password};
 
     match user_command {
-        // Dispatched before any config is loaded; handled here too so every
-        // variant has one home.
-        UserCommands::HashPassword { password_stdin } => print_password_hash(password_stdin),
+        // `main` runs this before any config is loaded, and returns.
+        UserCommands::HashPassword { .. } => {
+            bail!("`user hash-password` was not handled before the config loaded")
+        }
         UserCommands::List => {
             ensure_roster_loaded(config)?;
             print_roster(config);
@@ -12214,6 +12221,7 @@ async fn handle_user_command(user_command: UserCommands, config: &Config) -> Res
                     ),
                 ));
             }
+            Box::pin(edit.refuse_if_the_daemon_disagrees(&name, false)).await?;
             let sets_password = password || password_stdin;
             if uid.is_none() && !sets_password {
                 bail!(ta(
@@ -12240,18 +12248,22 @@ async fn handle_user_command(user_command: UserCommands, config: &Config) -> Res
                 roster_entry(&mut edit.config, &name)?.password_hash = Some(hash);
             }
             mark_new_map_alias_dirty(&mut edit.config, &format!("users.{name}"));
+            let write =
+                RosterWrite::Set(entry_writes(roster_entry(&mut edit.config, &name)?, &name)?);
             let done = ta(
                 "cli-user-added",
                 &[("name", &name)],
                 format!("Added users.{name}."),
             );
-            Box::pin(edit.save(&done, sets_password)).await
+            Box::pin(edit.save(write, &done, sets_password)).await
         }
         UserCommands::Passwd {
             name,
             password_stdin,
         } => {
             let mut edit = RosterEdit::begin(config)?;
+            roster_entry(&mut edit.config, &name)?;
+            Box::pin(edit.refuse_if_the_daemon_disagrees(&name, true)).await?;
             // Check the policy as it will be once the password is set, before
             // asking for it: a placeholder stands where the new hash goes, so
             // an entry this command is repairing (no credential yet, or a
@@ -12260,15 +12272,15 @@ async fn handle_user_command(user_command: UserCommands, config: &Config) -> Res
                 Some(Decoy::default().as_phc().to_owned());
             check_roster(&edit.config)?;
             let hash = hash_password(&read_new_password(password_stdin)?)?;
-            roster_entry(&mut edit.config, &name)?.password_hash = Some(hash);
-            edit.config
-                .mark_dirty(&format!("users.{name}.password_hash"));
+            roster_entry(&mut edit.config, &name)?.password_hash = Some(hash.clone());
+            let path = format!("users.{name}.password_hash");
+            edit.config.mark_dirty(&path);
             let done = ta(
                 "cli-user-password-set",
                 &[("name", &name)],
                 format!("Set the password for users.{name}."),
             );
-            Box::pin(edit.save(&done, true)).await
+            Box::pin(edit.save(RosterWrite::Set(vec![(path, hash)]), &done, true)).await
         }
         UserCommands::DisablePassword { name } => {
             let mut edit = RosterEdit::begin(config)?;
@@ -12290,14 +12302,15 @@ async fn handle_user_command(user_command: UserCommands, config: &Config) -> Res
                 ));
             }
             entry.password_hash = None;
-            edit.config
-                .mark_dirty(&format!("users.{name}.password_hash"));
+            Box::pin(edit.refuse_if_the_daemon_disagrees(&name, true)).await?;
+            let path = format!("users.{name}.password_hash");
+            edit.config.mark_dirty(&path);
             let done = ta(
                 "cli-user-password-removed",
                 &[("name", &name)],
                 format!("Removed the password from users.{name}."),
             );
-            Box::pin(edit.save(&done, false)).await
+            Box::pin(edit.save(RosterWrite::Clear(path), &done, false)).await
         }
         UserCommands::Remove { name } => {
             let mut edit = RosterEdit::begin(config)?;
@@ -12311,7 +12324,7 @@ async fn handle_user_command(user_command: UserCommands, config: &Config) -> Res
                 &[("name", &name)],
                 format!("Removed users.{name}."),
             );
-            Box::pin(edit.save(&done, false)).await
+            Box::pin(edit.save(RosterWrite::RemoveEntry(name), &done, false)).await
         }
     }
 }
@@ -12416,14 +12429,52 @@ fn roster_entry<'a>(
     })
 }
 
-/// One roster edit: a working copy of the loaded config, and the bytes of
-/// the file it will be saved over. The policy check runs against the working
-/// copy, so a file that changes while the edit is open (a password prompt
-/// can take a while) is refused instead of merged under a check that never
-/// saw the change.
+/// The `config/set-many` writes that author the roster entry `name` as
+/// `entry` holds it: every field it sets, as the strings `set_prop` takes.
+#[cfg(feature = "agent-runtime")]
+fn entry_writes(
+    entry: &zeroclaw_config::schema::UserConfig,
+    name: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut writes = vec![(
+        format!("users.{name}.permission_profiles"),
+        serde_json::to_string(&entry.permission_profiles)?,
+    )];
+    if let Some(uid) = entry.uid {
+        writes.push((format!("users.{name}.uid"), uid.to_string()));
+    }
+    if let Some(principal_id) = &entry.principal_id {
+        writes.push((format!("users.{name}.principal_id"), principal_id.clone()));
+    }
+    if let Some(hash) = &entry.password_hash {
+        writes.push((format!("users.{name}.password_hash"), hash.clone()));
+    }
+    Ok(writes)
+}
+
+/// How a running daemon commits a roster edit, by the config method that
+/// takes it.
+#[cfg(feature = "agent-runtime")]
+enum RosterWrite {
+    /// `config/set-many` with these property writes.
+    Set(Vec<(String, String)>),
+    /// `config/delete` of this property, the way the daemon clears a secret.
+    Clear(String),
+    /// `config/map-key-delete` of the roster entry with this name.
+    RemoveEntry(String),
+}
+
+/// One roster edit: a working copy of the loaded config, the authorization
+/// inputs the edit starts from, and the bytes of the file it will be saved
+/// over. The policy check runs against the working copy. When the command
+/// saves the file itself, a file that changed while the edit was open (a
+/// password prompt can take a while) is refused rather than merged under a
+/// check that never saw the change; the check and the save are not one step,
+/// so a change landing between them is not caught.
 #[cfg(feature = "agent-runtime")]
 struct RosterEdit {
     config: Config,
+    before: config_publication::AuthSnapshot,
     on_disk: Vec<u8>,
 }
 
@@ -12450,37 +12501,100 @@ impl RosterEdit {
         }
         Ok(Self {
             config: config.clone(),
+            before: config_publication::AuthSnapshot::capture(config)?,
             on_disk,
         })
     }
 
-    /// Check the edited roster, refuse if the file changed since the edit
-    /// began, write only the changed paths, and say that a running daemon
-    /// has not seen the change yet.
-    async fn save(mut self, done: &str, sets_password: bool) -> Result<()> {
-        check_roster(&self.config)?;
-        let path = self.config.config_path.clone();
-        let current =
-            std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        if current != self.on_disk {
-            let shown = path.display().to_string();
+    /// Refuse an edit the running daemon would apply to a different entry:
+    /// the command decides from config.toml whether `name` exists
+    /// (`in_file`), but the daemon applies the edit to the roster it holds,
+    /// which differs from the file while a hand edit or an edit reported
+    /// pending waits for a reload. Asked before any password is typed. With
+    /// no daemon running, or one that cannot be asked, there is nothing to
+    /// compare, and the commit reports what became of the edit.
+    async fn refuse_if_the_daemon_disagrees(&self, name: &str, in_file: bool) -> Result<()> {
+        let Some(live) = Box::pin(config_publication::live_map_keys(&self.config, "users")).await
+        else {
+            return Ok(());
+        };
+        let live_has_it = live.iter().any(|key| key == name);
+        if live_has_it == in_file {
+            return Ok(());
+        }
+        if live_has_it {
             bail!(ta(
-                "cli-user-config-changed",
-                &[("path", &shown)],
+                "cli-user-live-entry-exists",
+                &[("name", name)],
                 format!(
-                    "{shown} changed while this command ran, so nothing was written. Run the command again."
+                    "users.{name} is not in config.toml, but the running daemon still holds it: a change waits for a reload. Restart the daemon, then run the command again."
                 ),
             ));
         }
-        Box::pin(self.config.save_dirty()).await?;
+        bail!(ta(
+            "cli-user-live-entry-missing",
+            &[("name", name)],
+            format!(
+                "users.{name} is in config.toml, but the running daemon has not loaded it: a change waits for a reload. Restart the daemon, then run the command again."
+            ),
+        ))
+    }
+
+    /// Check the edited roster, then commit it as `write` through the daemon
+    /// serving this configuration, when one runs and takes it. Otherwise
+    /// refuse if the file changed since the edit began, and write only the
+    /// changed paths. Prints `done`, then how the running daemon took the
+    /// edit, if one runs.
+    async fn save(mut self, write: RosterWrite, done: &str, sets_password: bool) -> Result<()> {
+        check_roster(&self.config)?;
+        let publication = match &write {
+            RosterWrite::Set(writes) => {
+                Box::pin(config_publication::commit_set_many(
+                    &self.before,
+                    &self.config,
+                    writes,
+                    &[],
+                    false,
+                ))
+                .await?
+            }
+            RosterWrite::Clear(path) => {
+                Box::pin(config_publication::commit_delete(
+                    &self.before,
+                    &self.config,
+                    path,
+                ))
+                .await?
+            }
+            RosterWrite::RemoveEntry(name) => {
+                Box::pin(config_publication::commit_map_key_delete(
+                    &self.before,
+                    &self.config,
+                    "users",
+                    name,
+                ))
+                .await?
+            }
+        };
+        // A daemon that applied the edit has already saved config.toml.
+        if !matches!(publication, config_publication::Publication::Applied) {
+            let path = self.config.config_path.clone();
+            let current =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            if current != self.on_disk {
+                let shown = path.display().to_string();
+                bail!(ta(
+                    "cli-user-config-changed",
+                    &[("path", &shown)],
+                    format!(
+                        "{shown} changed while this command ran, so nothing was written. Run the command again."
+                    ),
+                ));
+            }
+            Box::pin(self.config.save_dirty()).await?;
+        }
         println!("{done}");
-        eprintln!(
-            "{}",
-            t(
-                "cli-user-apply-hint",
-                "The running daemon applies this change at its next reload or restart."
-            )
-        );
+        publication.report(false);
         if sets_password && !self.config.security.password_auth.enabled {
             eprintln!(
                 "{}",
@@ -12587,6 +12701,10 @@ fn read_new_password(from_stdin: bool) -> Result<zeroize::Zeroizing<String>> {
                 format!("The password must be at most {max} bytes long."),
             ))
         }
+        Err(NewPasswordError::Unassigned) => bail!(t(
+            "cli-user-password-unassigned",
+            "The password contains a character Unicode does not assign yet, so how it is normalized could change. Choose another character."
+        )),
     }
 }
 
@@ -15475,13 +15593,16 @@ mod tests {
         std::fs::write(&path, "schema_version = 3\n").expect("write config");
         let mut config = Config::default();
         config.config_path = path.clone();
+        config.data_dir = dir.path().join("data");
 
         let mut edit = RosterEdit::begin(&config).expect("begin an edit");
         edit.config.mark_dirty("users");
         let changed = "schema_version = 3\n# written by another process\n";
         std::fs::write(&path, changed).expect("concurrent write");
 
-        let refused = Box::pin(edit.save("done", false)).await;
+        // The edit changes no authorization input, so no daemon is looked
+        // for and the command saves the file itself.
+        let refused = Box::pin(edit.save(RosterWrite::Set(Vec::new()), "done", false)).await;
         assert!(
             refused.is_err(),
             "an edit checked against the old file must not be written over the new one"

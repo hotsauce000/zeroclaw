@@ -1,5 +1,5 @@
-//! Commit authorization edits made by `zeroclaw config` through the running
-//! daemon.
+//! Commit authorization edits made by `zeroclaw config` and `zeroclaw user`
+//! through the running daemon.
 //!
 //! The daemon compiles the policy it enforces from the `[users]`,
 //! `[permission_profiles]` and `[oidc]` sections and
@@ -18,8 +18,10 @@
 //! names.
 //!
 //! While one runs, an edit that writes the authorization inputs, or changes
-//! them, goes to the daemon (`config/set` or `config/set-many`), which
-//! validates, saves, swaps and publishes it as one step. A write that
+//! them, goes to the daemon (`config/set` or `config/set-many`, or for a
+//! roster entry's removal or a cleared secret `config/map-key-delete` or
+//! `config/delete`), which validates, saves, swaps and publishes it as one
+//! step. A write that
 //! re-asserts the value already in the file goes to the daemon too: the file
 //! is not what the daemon enforces. When the daemon cannot be reached, is not
 //! the process the heartbeat names, runs another release or refuses this
@@ -52,7 +54,10 @@ use std::time::Duration;
 use serde_json::Value;
 use zeroclaw_runtime::live_config_authority::{ConfigOwnershipError, ConfigOwnershipGuard};
 use zeroclaw_runtime::rpc::auth::{auth_inputs, is_auth_input_path, validate_accepted_auth_config};
-use zeroclaw_runtime::rpc::types::{ConfigSetManyParams, ConfigSetParams};
+use zeroclaw_runtime::rpc::types::{
+    ConfigDeleteParams, ConfigMapKeyDeleteParams, ConfigMapKeysParams, ConfigMapKeysResult,
+    ConfigSetManyParams, ConfigSetParams,
+};
 
 use crate::config::Config;
 #[cfg(unix)]
@@ -193,6 +198,12 @@ pub(crate) enum Publication {
     /// The daemon validated, saved, swapped and published the edit. The
     /// caller must NOT save locally.
     Applied,
+    /// The daemon took the request but its live configuration already
+    /// lacked what the edit removes, so it changed and saved nothing: an
+    /// entry the file carries that the daemon never loaded, such as one
+    /// added by hand since it started. Save locally, so the file stops
+    /// carrying it too; the daemon has nothing to apply.
+    DaemonUnchanged,
     /// A daemon runs, or may be starting, but did not take the edit: it could
     /// not be asked, is not this configuration's, refused the caller at the
     /// handshake, or was never asked because the write has no daemon path, no
@@ -216,7 +227,7 @@ impl Publication {
     /// has nothing to apply.
     pub(crate) fn envelope_field(&self) -> Option<Value> {
         match self {
-            Self::NotAuthorizationEdit | Self::NoDaemon => None,
+            Self::NotAuthorizationEdit | Self::NoDaemon | Self::DaemonUnchanged => None,
             Self::Applied => Some(serde_json::json!({ "applied": true })),
             Self::Pending { reason, .. } => Some(serde_json::json!({
                 "applied": false,
@@ -226,8 +237,8 @@ impl Publication {
         }
     }
 
-    /// Print the human notice to stderr (nothing for `NotAuthorizationEdit`
-    /// or `NoDaemon`). With `json` output the envelope's `daemon` member
+    /// Print the human notice to stderr (nothing for `NotAuthorizationEdit`,
+    /// `NoDaemon` or `DaemonUnchanged`). With `json` output the envelope's `daemon` member
     /// carries the outcome instead, so stderr stays clean for the machine
     /// reading it.
     pub(crate) fn report(&self, json: bool) {
@@ -241,7 +252,7 @@ impl Publication {
 
     fn notice(&self) -> Option<String> {
         match self {
-            Self::NotAuthorizationEdit | Self::NoDaemon => None,
+            Self::NotAuthorizationEdit | Self::NoDaemon | Self::DaemonUnchanged => None,
             Self::Applied => Some(crate::t(
                 "cli-config-auth-applied",
                 "Authorization change applied to the running daemon.",
@@ -452,6 +463,7 @@ pub(crate) async fn commit_set(
         true,
         holds_config_ownership,
         None,
+        |_| true,
     )
     .await
 }
@@ -496,8 +508,89 @@ pub(crate) async fn commit_set_many(
         false,
         holds_config_ownership,
         uncheckable_test,
+        |_| true,
     )
     .await
+}
+
+/// Same for clearing the property `path` through `config/delete`, which
+/// writes it empty. `config/set` refuses to overwrite a secret with an empty
+/// value, so this is how the daemon takes the clearing of one, as when
+/// `zeroclaw user disable-password` removes a roster password.
+pub(crate) async fn commit_delete(
+    before: &AuthSnapshot,
+    staged: &Config,
+    path: &str,
+) -> anyhow::Result<Publication> {
+    if !(before.changed_by(staged)? || is_auth_input_path(path)) {
+        return Ok(Publication::NotAuthorizationEdit);
+    }
+    let params = serde_json::to_value(ConfigDeleteParams {
+        prop: path.to_owned(),
+    })?;
+    commit(
+        before,
+        staged,
+        "config/delete",
+        params,
+        path,
+        false,
+        false,
+        None,
+        |_| true,
+    )
+    .await
+}
+
+/// Same for removing the entry `key` from the map section `section` through
+/// `config/map-key-delete`, as when `zeroclaw user remove` deletes a roster
+/// entry. A daemon that applies it ends the entry's bindings for established
+/// and new connections at once. One whose live configuration has no such
+/// entry answers that it deleted nothing, which is
+/// `Publication::DaemonUnchanged`.
+pub(crate) async fn commit_map_key_delete(
+    before: &AuthSnapshot,
+    staged: &Config,
+    section: &str,
+    key: &str,
+) -> anyhow::Result<Publication> {
+    let path = format!("{section}.{key}");
+    if !(before.changed_by(staged)? || is_auth_input_path(&path)) {
+        return Ok(Publication::NotAuthorizationEdit);
+    }
+    let params = serde_json::to_value(ConfigMapKeyDeleteParams {
+        path: section.to_owned(),
+        key: key.to_owned(),
+    })?;
+    commit(
+        before,
+        staged,
+        "config/map-key-delete",
+        params,
+        &path,
+        false,
+        false,
+        None,
+        |answer| answer.get("deleted").and_then(Value::as_bool) != Some(false),
+    )
+    .await
+}
+
+/// The entry names under the map section `section` that the daemon serving
+/// `config` holds live, when a recent heartbeat names a running daemon and it
+/// answers this caller. `None` when no heartbeat names one, or it could not
+/// be asked or refused the read; a commit that follows then reports why.
+/// Unlike a commit, this never probes the ownership lock.
+pub(crate) async fn live_map_keys(config: &Config, section: &str) -> Option<Vec<String>> {
+    let pid = running_daemon(config)?;
+    let params = serde_json::to_value(ConfigMapKeysParams {
+        path: section.to_owned(),
+    })
+    .ok()?;
+    let answer = send(config, pid, "config/map-keys", params).await.ok()?;
+    serde_json::from_value::<ConfigMapKeysResult>(answer)
+        .ok()
+        .map(|result| result.keys)
 }
 
 /// The property a notice that a batch's outcome is unknown points at. The
@@ -708,7 +801,9 @@ fn nothing_listening(error: &DaemonCallError) -> bool {
 /// `config` is the CLI's config with the edit staged; `check_path` is the
 /// property a caller should inspect when the outcome is unknown;
 /// `uncheckable_test` is the authorization input a batch's `test` op checked
-/// on `config`, if any.
+/// on `config`, if any; `changed` tells from the daemon's answer whether it
+/// changed anything, and an answer that it did not is
+/// `Publication::DaemonUnchanged`.
 async fn commit(
     before: &AuthSnapshot,
     config: &Config,
@@ -718,6 +813,7 @@ async fn commit(
     suggest_patch: bool,
     holds_config_ownership: bool,
     uncheckable_test: Option<&str>,
+    changed: fn(&Value) -> bool,
 ) -> anyhow::Result<Publication> {
     let pid = match daemon_presence(config, holds_config_ownership) {
         DaemonPresence::Running(pid) => pid,
@@ -746,7 +842,8 @@ async fn commit(
         .into());
     }
     let (reason, detail) = match send(config, pid, method, params).await {
-        Ok(_) => return Ok(Publication::Applied),
+        Ok(answer) if changed(&answer) => return Ok(Publication::Applied),
+        Ok(_) => return Ok(Publication::DaemonUnchanged),
         #[cfg(not(unix))]
         Err(DaemonCallError::UnverifiableEndpoint) => {
             (PendingReason::UnverifiedEndpoint, String::new())
@@ -942,6 +1039,8 @@ mod tests {
     fn envelope_field_reports_whether_the_daemon_applied_the_edit() {
         assert_eq!(Publication::NotAuthorizationEdit.envelope_field(), None);
         assert_eq!(Publication::NoDaemon.envelope_field(), None);
+        assert_eq!(Publication::DaemonUnchanged.envelope_field(), None);
+        assert_eq!(Publication::DaemonUnchanged.notice(), None);
         assert_eq!(
             Publication::Applied.envelope_field(),
             Some(serde_json::json!({ "applied": true }))
@@ -1485,6 +1584,59 @@ mod tests {
         assert!(
             matches!(publication, Publication::NoDaemon),
             "a stale heartbeat: {publication:?}"
+        );
+    }
+
+    /// Without a running daemon, a delete is classified like a write: one
+    /// under the authorization inputs looks for the daemon, and finds none,
+    /// even when it changes nothing, and one outside them never looks.
+    #[tokio::test]
+    async fn deletes_are_classified_like_writes_without_a_daemon() {
+        let (_dir, config) = scratch_config();
+        let mut with_bob = config.clone();
+        with_bob.users.insert(
+            "bob".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                password_hash: None,
+                permission_profiles: vec!["operator".into()],
+            },
+        );
+        let before = AuthSnapshot::capture(&with_bob).expect("encodes");
+
+        let publication = commit_map_key_delete(&before, &config, "users", "bob")
+            .await
+            .expect("classifies");
+        assert!(
+            matches!(publication, Publication::NoDaemon),
+            "removing a roster entry with no daemon: {publication:?}"
+        );
+        let publication = commit_delete(&before, &with_bob, "users.bob.password_hash")
+            .await
+            .expect("classifies");
+        assert!(
+            matches!(publication, Publication::NoDaemon),
+            "clearing a roster secret that changes nothing still looks: {publication:?}"
+        );
+
+        let publication = commit_delete(&before, &with_bob, "gateway.host")
+            .await
+            .expect("classifies");
+        assert!(
+            matches!(publication, Publication::NotAuthorizationEdit),
+            "{publication:?}"
+        );
+        let publication = commit_map_key_delete(&before, &with_bob, "agents", "helper")
+            .await
+            .expect("classifies");
+        assert!(
+            matches!(publication, Publication::NotAuthorizationEdit),
+            "{publication:?}"
+        );
+        assert!(
+            live_map_keys(&with_bob, "users").await.is_none(),
+            "no heartbeat names a daemon to ask"
         );
     }
 
