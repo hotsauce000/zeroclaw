@@ -880,6 +880,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: Vec::new(),
             },
         );

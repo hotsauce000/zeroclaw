@@ -177,8 +177,9 @@ pub fn auth_inputs(config: &Config) -> anyhow::Result<serde_json::Value> {
 }
 
 /// Whether the dotted property `path` writes one of the [`auth_inputs`]: the
-/// `oidc`, `users` or `permission_profiles` section or anything under it, or
-/// `security.trust_daemon_uid`.
+/// `oidc`, `users` or `permission_profiles` section or anything under it,
+/// `security.trust_daemon_uid`, or `security.password_auth` or anything under
+/// it.
 ///
 /// A surface that edits configuration outside the daemon uses this where
 /// comparing [`auth_inputs`] before and after the edit is not enough: a write
@@ -188,6 +189,9 @@ pub fn is_auth_input_path(path: &str) -> bool {
     let section = path.split_once('.').map_or(path, |(section, _)| section);
     matches!(section, "oidc" | "users" | "permission_profiles")
         || path == "security.trust_daemon_uid"
+        || path
+            .strip_prefix("security.password_auth")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 impl AcceptedAuthState {
@@ -1732,9 +1736,12 @@ mod tests {
         assert!(!is_auth_input_path("gateway.host"));
 
         type Mutation = fn(&mut Config);
-        let mutations: [(&str, Mutation); 4] = [
+        let mutations: [(&str, Mutation); 5] = [
             ("security.trust_daemon_uid", |config| {
                 config.security.trust_daemon_uid = !config.security.trust_daemon_uid;
+            }),
+            ("security.password_auth.enabled", |config| {
+                config.security.password_auth.enabled = !config.security.password_auth.enabled;
             }),
             ("users.alice.uid", |config| {
                 config.users.insert(
@@ -1742,6 +1749,7 @@ mod tests {
                     UserConfig {
                         principal_id: None,
                         uid: Some(4242),
+                        password_hash: None,
                         permission_profiles: vec!["operator".into()],
                     },
                 );
@@ -1784,6 +1792,8 @@ mod tests {
             "permission_profiles",
             "permission_profiles.admin.admin",
             "security.trust_daemon_uid",
+            "security.password_auth",
+            "security.password_auth.enabled",
         ] {
             assert!(is_auth_input_path(path), "{path} is an authorization input");
         }
@@ -1792,6 +1802,8 @@ mod tests {
             "gateway.host",
             "security",
             "security.trust_daemon_uid_extra",
+            "security.password_auth_extra",
+            "security.password_authenticator.enabled",
             "security.sandbox.enabled",
             "usersx.me.uid",
             "oidc_providers.corp",
@@ -1850,6 +1862,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: vec!["operator".into()],
             },
         );
@@ -1903,12 +1916,15 @@ mod tests {
                 "no property under {section} was exercised: {exercised:?}"
             );
         }
-        assert!(
-            exercised
-                .iter()
-                .any(|name| name == "security.trust_daemon_uid"),
-            "security.trust_daemon_uid was not exercised: {exercised:?}"
-        );
+        for input in [
+            "security.trust_daemon_uid",
+            "security.password_auth.enabled",
+        ] {
+            assert!(
+                exercised.iter().any(|name| name == input),
+                "{input} was not exercised: {exercised:?}"
+            );
+        }
     }
 
     #[test]
