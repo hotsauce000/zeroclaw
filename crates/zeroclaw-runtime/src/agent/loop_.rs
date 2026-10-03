@@ -278,8 +278,8 @@ fn effort_turn_route(
 fn effort_scoped_provider_config(
     config: &Config,
     allowed_provider_refs: &HashSet<String>,
-) -> Config {
-    let mut scoped = config.clone();
+) -> Box<Config> {
+    let mut scoped = Box::new(config.clone());
     for (_, _, profile) in scoped.providers.models.iter_entries_mut() {
         profile
             .fallback
@@ -1856,7 +1856,7 @@ pub async fn run(
         // (e.g. an xai key) to a different provider family that doesn't expect it.
         let (initial_api_key, initial_uri) =
             api_key_and_uri_for_provider(&config, &provider_name, agent_model_provider);
-        let provider_config = effort_provider_config.as_ref().unwrap_or(&config);
+        let provider_config = effort_provider_config.as_deref().unwrap_or(&config);
         let mut model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
                 provider_config,
@@ -3835,7 +3835,7 @@ async fn process_message_inner(
             &model_provider_ref,
             agent_model_provider.as_ref(),
         );
-        let provider_config = effort_provider_config.as_ref().unwrap_or(&config);
+        let provider_config = effort_provider_config.as_deref().unwrap_or(&config);
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
                 provider_config,
