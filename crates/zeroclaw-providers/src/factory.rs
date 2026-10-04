@@ -318,6 +318,13 @@ fn local_thinking_effort(
         .and_then(serde_json::Value::as_str)
         .filter(|effort| !effort.is_empty() && *effort != "none")
         .or_else(|| {
+            extra
+                .and_then(|body| body.get("reasoning"))
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|effort| !effort.is_empty() && *effort != "none")
+        })
+        .or_else(|| {
             opts.reasoning_effort
                 .as_deref()
                 .filter(|effort| !effort.is_empty() && *effort != "none")
@@ -2380,6 +2387,63 @@ mod tests {
                 for request in capture_local_thinking_requests(family, base, Some(true), None).await
                 {
                     assert_eq!(request["reasoning_effort"], expected, "{family}: {request}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_thinking_nested_effort_and_precedence_reach_all_wires() {
+        for (family, wire_api) in [
+            ("ollama", None),
+            ("llamacpp", None),
+            ("llamacpp", Some(WireApi::Responses)),
+        ] {
+            for (extra, on_effort) in [
+                (serde_json::json!({"reasoning": {"effort": "low"}}), "low"),
+                (
+                    serde_json::json!({"reasoning_effort": "low", "reasoning": {"effort": "high"}}),
+                    "low",
+                ),
+                (
+                    serde_json::json!({"reasoning_effort": "none", "reasoning": {"effort": "low"}}),
+                    "low",
+                ),
+                (
+                    serde_json::json!({"reasoning_effort": "", "reasoning": {"effort": "low"}}),
+                    "low",
+                ),
+                (
+                    serde_json::json!({"reasoning_effort": 7, "reasoning": {"effort": "low"}}),
+                    "low",
+                ),
+                (serde_json::json!({"reasoning": {"effort": "none"}}), "high"),
+                (serde_json::json!({"reasoning": {"effort": ""}}), "high"),
+                (serde_json::json!({"reasoning": {"effort": 7}}), "high"),
+            ] {
+                for enabled in [true, false] {
+                    let base = ModelProviderConfig {
+                        think: Some(enabled),
+                        wire_api,
+                        provider_extra: Some(extra.clone()),
+                        ..Default::default()
+                    };
+                    let expected = if enabled { on_effort } else { "none" };
+                    for request in
+                        capture_local_thinking_requests(family, base, Some(!enabled), Some("high"))
+                            .await
+                    {
+                        assert_eq!(
+                            request["reasoning"]["effort"], expected,
+                            "{family}: {request}"
+                        );
+                        if wire_api != Some(WireApi::Responses) {
+                            assert_eq!(
+                                request["reasoning_effort"], expected,
+                                "{family}: {request}"
+                            );
+                        }
+                    }
                 }
             }
         }

@@ -47,16 +47,19 @@ think = false
 When `think` is unset, these providers inherit
 `[runtime] reasoning_enabled`. If both are unset, ZeroClaw sends no on/off
 override and the backend keeps its default. An alias's explicit `think` value
-takes precedence over the global switch and conflicting manual reasoning
-fields in `provider_extra` or `chat_template_kwargs`. Unrelated request options
-are preserved.
+takes precedence over the global switch. On the Chat Completions wire it also
+overrides conflicting manual reasoning fields in `provider_extra` or
+`chat_template_kwargs`, while preserving unrelated request options.
 
 Ollama's compatible chat endpoint receives `reasoning_effort = "none"` for an
 off request. llama.cpp's chat endpoint also receives
 `chat_template_kwargs = { enable_thinking = false }`. llama.cpp's Responses
 wire receives `reasoning.effort = "none"`. On requests that enable thinking,
-ZeroClaw keeps a non-`none` effort from `provider_extra.reasoning_effort` or
-`runtime.reasoning_effort`, using `"medium"` when neither provides one.
+ZeroClaw selects the first non-empty, non-`none` string from
+`provider_extra.reasoning_effort`, `provider_extra.reasoning.effort`, and
+`runtime.reasoning_effort`, in that order, using `"medium"` when none provides
+one. This effort selection also applies to llama.cpp Responses, whose builder
+does not forward other `provider_extra` fields or `chat_template_kwargs`.
 
 These are backend requests, not a guarantee that every model stops generating
 reasoning. The model and its chat template must support an off mode. A backend
