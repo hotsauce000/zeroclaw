@@ -4296,13 +4296,20 @@ mod tests {
             "an opted-in policy with a missing hint must fail closed"
         );
 
-        let mut ambiguous = config;
-        ambiguous
-            .model_routes
-            .push(ambiguous.model_routes[0].clone());
-        assert!(
-            effort_turn_route(&ambiguous, Some(&policy), "say hello").is_err(),
-            "an opted-in policy with an ambiguous exact hint must fail closed"
+        let mut duplicate_route = config;
+        let mut final_local_route = duplicate_route.model_routes[0].clone();
+        final_local_route.model_provider = "custom.final".into();
+        final_local_route.model = "final-small".into();
+        duplicate_route.model_routes.push(final_local_route);
+        let selected = effort_turn_route(&duplicate_route, Some(&policy), "say hello")
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.model_provider, "custom.final");
+        assert_eq!(selected.model, "final-small");
+        assert_eq!(
+            selected.allowed_provider_refs.as_ref(),
+            &std::collections::HashSet::from(["custom.final".to_string()]),
+            "the final exact-match route must define the provider boundary"
         );
     }
 
