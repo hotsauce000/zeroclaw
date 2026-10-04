@@ -20725,9 +20725,12 @@ mod tests {
             .await
             .expect("the live session has an update lock");
         let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+        let waiting = sessions.model_provider_update_waiting();
         let operation = alice.handle_session_configure(&params);
         let replace = async {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting.notified())
+                .await
+                .expect("configure must reach the provider-update ordering boundary");
             assert!(sessions.remove("cfg").await);
             let successor =
                 install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
@@ -20735,7 +20738,9 @@ mod tests {
             drop(lock);
             successor
         };
-        let (result, successor) = tokio::join!(operation, replace);
+        // Poll the replacement first: without its real Pending signal this
+        // control must reject early rather than depending on scheduler timing.
+        let (successor, result) = tokio::join!(biased; replace, operation);
         let err = result.expect_err("a replaced session cannot be configured by the old owner");
         assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
         assert!(err.message.contains("Session changed while queued"));

@@ -12168,6 +12168,51 @@ mod tests {
         assert!(tool.cancellation_token().is_cancelled());
     }
 
+    async fn background_persistence_failure_fixture(
+        workspace: &Path,
+    ) -> (DelegateTool, wiremock::MockServer) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "background persistence fixture provider failure"}
+            })))
+            .mount(&server)
+            .await;
+        let options = zeroclaw_providers::ModelProviderRuntimeOptions {
+            provider_api_url: Some(server.uri()),
+            ..Default::default()
+        };
+        let tool = with_in_memory_task_store(
+            DelegateTool::new_with_options(sample_agents(), None, test_security(), options)
+                .with_workspace_dir(workspace.to_path_buf()),
+        );
+        (tool, server)
+    }
+
+    async fn assert_background_persistence_fixture_error(
+        server: &wiremock::MockServer,
+        result: &BackgroundDelegateResult,
+    ) {
+        let requests = server
+            .received_requests()
+            .await
+            .expect("owned provider requests");
+        assert_eq!(requests.len(), 1, "the real typed provider dispatched once");
+        assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("typed provider JSON request");
+        assert_eq!(body["model"], "");
+        assert_eq!(result.status, BackgroundTaskStatus::Failed);
+        let error = result
+            .error
+            .as_deref()
+            .expect("fixture provider failure retained");
+        assert!(error.contains("Ollama API error (400 Bad Request)"));
+        assert!(error.contains("background persistence fixture provider failure"));
+    }
+
     #[tokio::test]
     async fn background_task_result_persisted_to_disk() {
         let workspace = std::env::temp_dir().join(format!(
@@ -12176,10 +12221,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone()),
-        );
+        let (tool, provider_fixture) = background_persistence_failure_fixture(&workspace).await;
 
         let result = tool
             .execute(json!({
@@ -12212,9 +12254,10 @@ mod tests {
 
         // Read and parse the result
         let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_background_persistence_fixture_error(&provider_fixture, &bg_result).await;
         assert_eq!(bg_result.task_id, task_id);
         assert_eq!(bg_result.agent, "researcher");
-        // The task will have failed because ollama isn't running, but it should be persisted
+        // The owned provider fixture fails; terminal state must still be persisted.
         assert!(
             bg_result.status == BackgroundTaskStatus::Completed
                 || bg_result.status == BackgroundTaskStatus::Failed
@@ -12232,10 +12275,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone()),
-        );
+        let (tool, provider_fixture) = background_persistence_failure_fixture(&workspace).await;
 
         // Start background task
         let result = tool
@@ -12257,7 +12297,8 @@ mod tests {
             .to_string();
 
         // Wait for background task
-        let _ = wait_for_terminal_background_result(&tool, &task_id).await;
+        let bg_result = wait_for_terminal_background_result(&tool, &task_id).await;
+        assert_background_persistence_fixture_error(&provider_fixture, &bg_result).await;
 
         // Check result
         let check = tool
@@ -12354,10 +12395,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone()),
-        );
+        let (tool, provider_fixture) = background_persistence_failure_fixture(&workspace).await;
 
         // Start a background task
         let result = tool
@@ -12378,7 +12416,8 @@ mod tests {
             .trim();
 
         // Wait for task to complete
-        let _ = wait_for_terminal_background_result(&tool, task_id).await;
+        let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_background_persistence_fixture_error(&provider_fixture, &bg_result).await;
 
         // List results
         let list = tool
