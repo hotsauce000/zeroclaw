@@ -22,12 +22,12 @@
       "reason": "Existing runtime network clients use the shared TLS provider; no adapter selection authority is supplied by this edge."
     },
     "zeroclaw-relay-proto": {
-      "owner": "crates/zeroclaw-runtime/src/agent/turn/mod.rs",
-      "reason": "Existing relayed turn envelopes and broker protocol owned by the turn ingress path."
+      "owner": "crates/zeroclaw-runtime/src/relay.rs",
+      "reason": "Existing daemon relay bridge imports control/data framing, connection-window and rate-limit types at crates/zeroclaw-runtime/src/relay.rs:34. The relay bridge and its connection/cancellation lifecycle remain runtime-owned."
     },
     "zeroclaw-commands": {
-      "owner": "crates/zeroclaw-runtime/src/agent/loop_.rs",
-      "reason": "Existing agent command parsing, distinct from provider/memory/tool selection."
+      "owner": "crates/zeroclaw-runtime/src/rpc/dispatch.rs",
+      "reason": "Existing RPC command catalogue imports CommandSurface and commands_for_surface at crates/zeroclaw-runtime/src/rpc/dispatch.rs:34 and projects the TUI catalogue into InitializeResult at :3707. This catalogue owner is distinct from provider/memory/tool selection."
     },
     "zeroclaw-log": {
       "owner": "crates/zeroclaw-runtime/src/agent/turn/mod.rs",
