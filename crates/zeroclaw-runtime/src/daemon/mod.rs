@@ -7849,4 +7849,134 @@ mod tests {
             "a write to the shared live configuration must reach the refresher without a reload"
         );
     }
+
+    struct R1LifecycleObserver {
+        flushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        dropped_starter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    }
+    impl zeroclaw_api::observability_traits::Observer for R1LifecycleObserver {
+        fn record_event(&self, _: &zeroclaw_api::observability_traits::ObserverEvent) {}
+        fn record_metric(&self, _: &zeroclaw_api::observability_traits::ObserverMetric) {}
+        fn flush(&self) {
+            if let Some(dropped) = &self.dropped_starter {
+                assert_eq!(
+                    dropped.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "daemon must release owned starter before flushing its generation"
+                );
+            }
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn name(&self) -> &str {
+            "r1-lifecycle"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    struct R1StarterLease(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for R1StarterLease {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn r1_daemon_startup_refusal_flushes_supplied_generation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _broadcast_guard = hold_broadcast_hooks().await;
+        let root = TempDir::new().unwrap();
+        let config = test_config(&root);
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let observer = Arc::new(R1LifecycleObserver {
+            flushes: flushes.clone(),
+            dropped_starter: None,
+        });
+        let weak = Arc::downgrade(&observer);
+        let mut caps = crate::composition::test_support::capabilities_with_providers(Arc::new(
+            crate::composition::test_support::RefusingProviders,
+        ));
+        caps.observer = observer;
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(|_, _, _, _| {
+            Box::pin(async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "r1 startup ownership refusal",
+                )
+                .into())
+            })
+        }));
+        let error = tokio::time::timeout(
+            DAEMON_DEADLOCK_GUARD,
+            run_with_capabilities(config, caps, "127.0.0.1".into(), 0, registry, false, true),
+        )
+        .await
+        .expect("daemon startup refusal must finish")
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("r1 startup ownership refusal"));
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert!(
+            weak.upgrade().is_none(),
+            "failed daemon retains supplied generation"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn r1_daemon_shutdown_releases_owned_starter_before_generation_flush() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _broadcast_guard = hold_broadcast_hooks().await;
+        let root = TempDir::new().unwrap();
+        let config = test_config(&root);
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let observer = Arc::new(R1LifecycleObserver {
+            flushes: flushes.clone(),
+            dropped_starter: Some(dropped.clone()),
+        });
+        let weak = Arc::downgrade(&observer);
+        let mut caps = crate::composition::test_support::capabilities_with_providers(Arc::new(
+            crate::composition::test_support::RefusingProviders,
+        ));
+        caps.observer = observer;
+        let mut registry = DaemonRegistry::new();
+        let owned_drop = dropped.clone();
+        registry.register_socket(Box::new(move |_, cancel, clients, ready| {
+            let dropped = owned_drop.clone();
+            Box::pin(async move {
+                let _lease = R1StarterLease(dropped);
+                clients.store(1, Ordering::SeqCst);
+                if let Some(ready) = ready {
+                    ready.report_ready();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                clients.store(0, Ordering::SeqCst);
+                cancel.cancelled().await;
+                Ok(())
+            })
+        }));
+        let exit = tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            run_with_capabilities(config, caps, "127.0.0.1".into(), 0, registry, true, true),
+        )
+        .await
+        .expect("daemon ephemeral shutdown must finish")
+        .unwrap();
+        assert_eq!(exit, DaemonExit::Shutdown);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert!(
+            weak.upgrade().is_none(),
+            "stopped daemon retains supplied generation"
+        );
+    }
 }
