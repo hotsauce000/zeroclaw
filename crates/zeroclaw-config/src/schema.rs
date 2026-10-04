@@ -24472,21 +24472,12 @@ impl Config {
         }
 
         // Model routes
-        let mut model_route_hints = std::collections::HashSet::new();
         for (i, route) in self.model_routes.iter().enumerate() {
             if route.hint.trim().is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].hint"),
                     "model_routes[{i}].hint must not be empty"
-                );
-            }
-            if !model_route_hints.insert(route.hint.as_str()) {
-                validation_bail!(
-                    InvalidFormat,
-                    format!("model_routes[{i}].hint"),
-                    "model_routes[{i}].hint = {:?} duplicates an existing exact route hint",
-                    route.hint
                 );
             }
             let mp = route.model_provider.trim();
@@ -49629,16 +49620,12 @@ model_provider = \"ollama.default\"
         );
 
         let mut duplicate_route = effort_routing_config();
+        let mut final_local_route = duplicate_route.model_routes[0].clone();
+        final_local_route.model_provider = "custom.cloud".into();
+        final_local_route.model = "final-local-model".into();
+        duplicate_route.model_routes.push(final_local_route);
         duplicate_route
-            .model_routes
-            .push(duplicate_route.model_routes[0].clone());
-        let error = duplicate_route
             .validate()
-            .expect_err("duplicate exact route hints must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("duplicates an existing exact route hint")
-        );
+            .expect("legacy duplicate route hints remain valid");
     }
 }

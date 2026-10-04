@@ -117,13 +117,9 @@ pub fn resolve_effort_route<'a>(
     message: &str,
 ) -> Option<ResolvedEffortRoute<'a>> {
     let decision = effort_routing_decision(policy, message);
-    let unique_route = |hint: &str| {
-        let mut matches = routes.iter().filter(|route| route.hint == hint);
-        let route = matches.next()?;
-        matches.next().is_none().then_some(route)
-    };
-    let local_route = unique_route(policy.local_hint.trim())?;
-    let cloud_route = unique_route(policy.cloud_hint.trim())?;
+    let final_route = |hint: &str| routes.iter().rev().find(|route| route.hint == hint);
+    let local_route = final_route(policy.local_hint.trim())?;
+    let cloud_route = final_route(policy.cloud_hint.trim())?;
     let route = match decision.target {
         EffortRouteTarget::Local => local_route,
         EffortRouteTarget::Cloud => cloud_route,
@@ -395,36 +391,66 @@ mod tests {
     }
 
     #[test]
-    fn effort_route_resolution_is_exact_and_rejects_ambiguous_hints() {
-        let policy = EffortRoutingConfig {
+    fn effort_route_resolution_is_exact_and_matches_resolver_final_entry() {
+        use zeroclaw_providers::router::{ModelRouteResolver, Route};
+
+        let mut policy = EffortRoutingConfig {
             local_hint: "local".into(),
             cloud_hint: "cloud".into(),
             cloud_escalation: CloudEscalationPolicy::Never,
         };
-        let route = |hint: &str, provider: &str| ModelRouteConfig {
+        let route = |hint: &str, provider: &str, model: &str| ModelRouteConfig {
             hint: hint.into(),
             model_provider: provider.into(),
-            model: format!("{hint}-model"),
+            model: model.into(),
             api_key: None,
         };
         let exact = vec![
-            route("LOCAL", "custom.wrong"),
-            route("local", "custom.local"),
-            route("cloud", "custom.cloud"),
+            route("LOCAL", "custom.wrong", "wrong-model"),
+            route("local", "custom.first", "first-local-model"),
+            route("cloud", "custom.cloud-first", "first-cloud-model"),
+            route("local", "custom.final", "final-local-model"),
+            route("cloud", "custom.cloud-final", "final-cloud-model"),
         ];
-        let selected = resolve_effort_route(&policy, &exact, "hello").unwrap();
-        assert_eq!(selected.route.model_provider, "custom.local");
+        let local = resolve_effort_route(&policy, &exact, "hello").unwrap();
+        assert_eq!(local.route.model_provider, "custom.final");
+        assert_eq!(local.route.model, "final-local-model");
         assert_eq!(
-            selected.allowed_provider_refs,
-            HashSet::from(["custom.local".to_string()])
+            local.allowed_provider_refs,
+            HashSet::from(["custom.final".to_string()])
         );
 
-        let ambiguous = vec![
-            route("local", "custom.first"),
-            route("local", "custom.second"),
-            route("cloud", "custom.cloud"),
-        ];
-        assert!(resolve_effort_route(&policy, &ambiguous, "hello").is_none());
+        let resolver = ModelRouteResolver::new(
+            exact
+                .iter()
+                .map(|route| {
+                    (
+                        route.hint.clone(),
+                        Route {
+                            provider_name: route.model_provider.clone(),
+                            model: route.model.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            "custom.default".into(),
+            "default-model".into(),
+        );
+        let resolved_local = resolver.resolve("hint:local");
+        assert_eq!(local.route.model_provider, resolved_local.provider_name);
+        assert_eq!(local.route.model, resolved_local.model);
+
+        policy.cloud_escalation = CloudEscalationPolicy::Auto;
+        let cloud = resolve_effort_route(&policy, &exact, &"a".repeat(201)).unwrap();
+        assert_eq!(cloud.route.model_provider, "custom.cloud-final");
+        assert_eq!(cloud.route.model, "final-cloud-model");
+        assert_eq!(
+            cloud.allowed_provider_refs,
+            HashSet::from(["custom.final".to_string(), "custom.cloud-final".to_string(),])
+        );
+        let resolved_cloud = resolver.resolve("hint:cloud");
+        assert_eq!(cloud.route.model_provider, resolved_cloud.provider_name);
+        assert_eq!(cloud.route.model, resolved_cloud.model);
     }
 
     // ── evaluate_response ───────────────────────────────────────
