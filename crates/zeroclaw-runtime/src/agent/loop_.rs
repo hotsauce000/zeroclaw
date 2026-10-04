@@ -1622,14 +1622,6 @@ pub async fn run_with_capabilities(
         }
 
         // ── Tools (including memory tools and peripherals) ────────────
-        let (composio_key, composio_entity_id) = if config.composio.enabled {
-            (
-                config.composio.api_key.as_deref(),
-                Some(config.composio.entity_id.as_str()),
-            )
-        } else {
-            (None, None)
-        };
 
         // Build SOP engine when sops_dir is configured so SOP tools are
         // available on this path (CLI agent run). No channel map is wired on this
@@ -1653,34 +1645,7 @@ pub async fn run_with_capabilities(
         };
 
         let tool_config = Arc::new(config.clone());
-        let mut all_tools_result = tools::all_tools_with_runtime_and_execution_capability(
-            Arc::clone(&tool_config),
-            &security,
-            &risk_profile,
-            agent_alias,
-            runtime.clone(),
-            mem.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.data_dir,
-            &config.agents,
-            agent_model_provider.and_then(|e| e.api_key.as_deref()),
-            &config,
-            None,
-            is_subagent_caller,
-            None,
-            sop_engine,
-            sop_audit,
-            execution_capability
-                .as_ref()
-                .map(AgentExecutionCapability::config_handle),
-            execution_capability.clone(),
-        )?;
-        capabilities.bind_registry(
-            &mut all_tools_result,
+        let prepared_registry = capabilities.prepare_registry(
             &crate::composition::ToolRequest {
                 config: &tool_config,
                 agent_alias,
@@ -1688,9 +1653,24 @@ pub async fn run_with_capabilities(
                 runtime: &runtime,
                 memory: &mem,
             },
+            crate::composition::RegistryContext {
+                is_subagent: is_subagent_caller,
+                sop_engine,
+                sop_audit,
+                live_config: execution_capability
+                    .as_ref()
+                    .map(AgentExecutionCapability::config_handle),
+                execution_capability: execution_capability.clone(),
+                ..crate::composition::RegistryContext::new(&config.data_dir)
+            },
             principal.as_ref(),
         )?;
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
+        let all_tools_result = prepared_registry.built;
+        let skills = if prepared_registry.native {
+            crate::skills::load_skills_for_agent_from_config(&config, agent_alias)
+        } else {
+            Vec::new()
+        };
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
         // to the behavior this path hand-rolled. `caller_allowed` carries the
@@ -1703,8 +1683,8 @@ pub async fn run_with_capabilities(
             skills: &skills,
             runtime: runtime.clone(),
             caller_allowed: allowed_tools.as_deref(),
-            connect_mcp: true,
-            connect_peripherals: true,
+            connect_mcp: prepared_registry.native,
+            connect_peripherals: prepared_registry.native,
             // A memory-free run drops the persistent memory tools so the model
             // cannot read or write memory even though the registry is otherwise
             // built identically.
@@ -1741,15 +1721,19 @@ pub async fn run_with_capabilities(
         let tools_registry = registry;
 
         // Populate all channel-driven tool handles from the registered factory.
-        let count = seed_channel_handles(
-            &config,
-            agent_alias,
-            &ask_user_handle,
-            &channel_room_handle,
-            &reaction_handle,
-            &poll_handle,
-            &escalate_handle,
-        );
+        let count = if prepared_registry.native {
+            seed_channel_handles(
+                &config,
+                agent_alias,
+                &ask_user_handle,
+                &channel_room_handle,
+                &reaction_handle,
+                &poll_handle,
+                &escalate_handle,
+            )
+        } else {
+            0
+        };
         if count > 0 {
             ::zeroclaw_log::record!(
                 INFO,
@@ -2518,9 +2502,7 @@ pub async fn run_with_capabilities(
         } else {
             println!("🦀 ZeroClaw Interactive Mode");
             println!("Type /help for commands.\n");
-            let cli = CLI_CHANNEL_FN.get().expect(
-                "CLI channel factory not registered — call register_cli_channel_fn at startup",
-            )();
+            let cli = capabilities.cli_channel()?;
 
             // Persistent conversation history across turns, with explicit
             // breadcrumb provenance. Legacy v1 files are migrated by inspecting
@@ -3598,15 +3580,6 @@ async fn process_message_inner(
         let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
         let mem: Arc<dyn Memory> = capabilities.agent_memory(&config, agent_alias).await?;
 
-        let (composio_key, composio_entity_id) = if config.composio.enabled {
-            (
-                config.composio.api_key.as_deref(),
-                Some(config.composio.entity_id.as_str()),
-            )
-        } else {
-            (None, None)
-        };
-
         // Build SOP engine when sops_dir is configured so SOP tools are
         // available on this path (process_message CLI agent). No channel map is
         // wired here, so the approval route adapter is the no-op (log-only); the
@@ -3628,34 +3601,7 @@ async fn process_message_inner(
             (None, None)
         };
 
-        let mut all_tools_result_pm = tools::all_tools_with_runtime_and_execution_capability(
-            Arc::clone(&config),
-            &security,
-            &risk_profile,
-            agent_alias,
-            runtime.clone(),
-            mem.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.data_dir,
-            &config.agents,
-            agent_model_provider
-                .as_ref()
-                .and_then(|e| e.api_key.as_deref()),
-            &config,
-            None,
-            false,
-            None,
-            sop_engine,
-            sop_audit,
-            live_config.clone(),
-            execution_capability.clone(),
-        )?;
-        capabilities.bind_registry(
-            &mut all_tools_result_pm,
+        let prepared_registry = capabilities.prepare_registry(
             &crate::composition::ToolRequest {
                 config: &config,
                 agent_alias,
@@ -3663,9 +3609,21 @@ async fn process_message_inner(
                 runtime: &runtime,
                 memory: &mem,
             },
+            crate::composition::RegistryContext {
+                sop_engine,
+                sop_audit,
+                live_config: live_config.clone(),
+                execution_capability: execution_capability.clone(),
+                ..crate::composition::RegistryContext::new(&config.data_dir)
+            },
             principal.as_ref(),
         )?;
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
+        let all_tools_result_pm = prepared_registry.built;
+        let skills = if prepared_registry.native {
+            crate::skills::load_skills_for_agent_from_config(&config, agent_alias)
+        } else {
+            Vec::new()
+        };
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
             agent_alias,
@@ -3674,8 +3632,8 @@ async fn process_message_inner(
             skills: &skills,
             runtime: runtime.clone(),
             caller_allowed: None,
-            connect_mcp: true,
-            connect_peripherals: true,
+            connect_mcp: prepared_registry.native,
+            connect_peripherals: prepared_registry.native,
             exclude_memory: false,
             acp_delivery: false,
             list_deferred_mcp_specs: false,
@@ -3710,15 +3668,19 @@ async fn process_message_inner(
         let tools_registry = registry;
 
         // Populate all channel-driven tool handles from the registered factory.
-        let count = seed_channel_handles(
-            &config,
-            agent_alias,
-            &ask_user_handle,
-            &channel_room_handle,
-            &reaction_handle,
-            &poll_handle,
-            &escalate_handle,
-        );
+        let count = if prepared_registry.native {
+            seed_channel_handles(
+                &config,
+                agent_alias,
+                &ask_user_handle,
+                &channel_room_handle,
+                &reaction_handle,
+                &poll_handle,
+                &escalate_handle,
+            )
+        } else {
+            0
+        };
         if count > 0 {
             ::zeroclaw_log::record!(
                 INFO,

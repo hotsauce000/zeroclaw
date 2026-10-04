@@ -314,17 +314,20 @@ impl ScopedToolRegistry {
             .filter(|tool| tool_allowed_in_context(tool.name(), exclude_memory, acp_delivery))
             .cloned()
             .collect();
-        let pipeline_tool = config.pipeline.enabled.then(|| {
-            Arc::new(tools::PipelineTool::with_access_policy(
-                config.pipeline.clone(),
-                context_filtered_tool_arcs.clone(),
-                zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
-                    security.allowed_tools.as_deref(),
-                    security.excluded_tools.as_deref(),
-                    caller_allowed,
-                ),
-            )) as Arc<dyn Tool>
-        });
+        // Supplied-only registries have no native prefilter inputs. An
+        // enabled native integration must not enlarge their complete tool set.
+        let pipeline_tool =
+            (config.pipeline.enabled && !unfiltered_tool_arcs.is_empty()).then(|| {
+                Arc::new(tools::PipelineTool::with_access_policy(
+                    config.pipeline.clone(),
+                    context_filtered_tool_arcs.clone(),
+                    zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+                        security.allowed_tools.as_deref(),
+                        security.excluded_tools.as_deref(),
+                        caller_allowed,
+                    ),
+                )) as Arc<dyn Tool>
+            });
         if let Some(tool) = pipeline_tool.as_ref() {
             tools_registry.push(Box::new(tools::ArcToolRef(Arc::clone(tool))));
         }

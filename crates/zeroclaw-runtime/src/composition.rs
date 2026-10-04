@@ -29,6 +29,9 @@ use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 
 mod config_backed;
+mod native_tools;
+
+pub(crate) use native_tools::RegistryContext;
 
 /// The config-backed sources the compatibility adapters use, for an
 /// application layer that composes the same recipe.
@@ -130,6 +133,40 @@ impl RuntimeCapabilities {
             .await
     }
 
+    /// Construct the registry recipe the source selected, then bind child
+    /// operations before the existing scoped policy seam sees the registry.
+    pub(crate) fn prepare_registry(
+        &self,
+        request: &ToolRequest<'_>,
+        context: RegistryContext<'_>,
+        principal: Option<&PrincipalId>,
+    ) -> anyhow::Result<PreparedRegistry> {
+        let native = self.tools.uses_native_registry(request);
+        let mut built = if native {
+            native_tools::build(request, context)?
+        } else {
+            // The generic path also warms the turn parsers off the caller's
+            // stack, without constructing any concrete tools.
+            native_tools::warm_turn_parsers()?;
+            crate::tools::AllToolsResult::from_prebuilt_tools(Vec::new())
+        };
+        self.bind_registry(&mut built, request, principal)?;
+        Ok(PreparedRegistry { built, native })
+    }
+
+    pub(crate) fn cli_channel(&self) -> anyhow::Result<Arc<dyn Channel>> {
+        self.channels.channel("cli").ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"alias": "cli"})),
+                "composition_cli_channel_missing"
+            );
+            anyhow::Error::msg("runtime channel source has no CLI channel")
+        })
+    }
+
     /// Bind a registry the runtime built to these capabilities and to
     /// `principal`, before the registry reaches `ScopedToolRegistry::assemble`.
     ///
@@ -180,6 +217,17 @@ impl RuntimeCapabilities {
         }
         Ok(())
     }
+}
+
+/// CLI adapter for the legacy AgentBuilder path with no bound capabilities.
+pub(crate) fn compatibility_cli_channel() -> anyhow::Result<Arc<dyn Channel>> {
+    config_backed::cli_channel()
+}
+
+/// One operation's selected recipe, not a cached policy decision.
+pub(crate) struct PreparedRegistry {
+    pub(crate) built: crate::tools::AllToolsResult,
+    pub(crate) native: bool,
 }
 
 /// What the runtime is asking a [`ProviderSource`] for.
@@ -285,9 +333,20 @@ pub struct ToolRequest<'a> {
 
 /// Supplies tool registries.
 pub trait ToolSource: Send + Sync {
-    /// Return the tools for `request`. The runtime may add its own core tools
-    /// and remove any tool the resolved policy excludes; it never adds a tool
-    /// the policy forbids because a source returned it.
+    /// Explicitly request the existing config-backed native registry and its
+    /// managed integrations. The default constructs only supplied tools;
+    /// returning an empty vector never falls back to native construction.
+    ///
+    /// This chooses a construction recipe, not permissions. The runtime still
+    /// resolves policy, binds child capabilities, and applies the same scoped
+    /// registry gates. Lifecycle handles stay private to the native adapter.
+    fn uses_native_registry(&self, _request: &ToolRequest<'_>) -> bool {
+        false
+    }
+
+    /// Return the tools for `request`. With the native recipe these are
+    /// extensions under native precedence. Otherwise they are the complete
+    /// eager registry. Runtime policy may remove them; sources grant nothing.
     fn tools(&self, request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>>;
 }
 
@@ -465,6 +524,10 @@ pub(crate) mod test_support {
     pub(crate) struct NoTools;
 
     impl ToolSource for NoTools {
+        fn uses_native_registry(&self, _request: &ToolRequest<'_>) -> bool {
+            true
+        }
+
         fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
             Ok(Vec::new())
         }

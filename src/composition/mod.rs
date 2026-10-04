@@ -27,7 +27,12 @@ impl DefaultCapabilities {
     /// new generation; a turn keeps the set it started with.
     pub fn from_config(config: &Config) -> RuntimeCapabilities {
         let observer = zeroclaw_runtime::observability::create_observer(&config.observability);
-        RuntimeCapabilities::config_backed_with_observer(Arc::from(observer))
+        // Select native compatibility at application wiring, not implicitly
+        // in the generic engine. The other defaults share the one recipe.
+        RuntimeCapabilities {
+            tools: Arc::new(zeroclaw_runtime::composition::defaults::NoSuppliedTools),
+            ..RuntimeCapabilities::config_backed_with_observer(Arc::from(observer))
+        }
     }
 }
 

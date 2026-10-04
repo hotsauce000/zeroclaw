@@ -3014,9 +3014,7 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
                 "SOP step agent '{alias}' has no configured risk profile"
             ))
         })?;
-    let resolved_key = config
-        .resolved_model_provider_for_agent(alias)
-        .and_then(|(_, _, cfg)| cfg.api_key.clone());
+
     let memory = capabilities.agent_memory(config, alias).await?;
 
     // Mirror a fresh agent turn: the headless SOP driver reaches this agent's
@@ -3027,44 +3025,8 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
     let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
         Arc::from(crate::platform::create_runtime(&config.runtime)?);
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-
     let tool_config = Arc::new(config.clone());
-    let mut built = crate::tools::all_tools_with_runtime_and_execution_capability(
-        Arc::clone(&tool_config),
-        &security,
-        &risk_profile,
-        alias,
-        runtime.clone(),
-        Arc::clone(&memory),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        &config.data_dir,
-        &config.agents,
-        resolved_key.as_deref(),
-        config,
-        None,
-        false,
-        None,
-        Some(sop_engine),
-        sop_audit,
-        live_config,
-        execution_admission
-            .as_ref()
-            .map(AgentExecutionAdmission::capability),
-    )?;
-    capabilities.bind_registry(
-        &mut built,
+    let prepared_registry = capabilities.prepare_registry(
         &crate::composition::ToolRequest {
             config: &tool_config,
             agent_alias: alias,
@@ -3072,9 +3034,23 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
             runtime: &runtime,
             memory: &memory,
         },
+        crate::composition::RegistryContext {
+            sop_engine: Some(sop_engine),
+            sop_audit,
+            live_config,
+            execution_capability: execution_admission
+                .as_ref()
+                .map(AgentExecutionAdmission::capability),
+            ..crate::composition::RegistryContext::new(&config.data_dir)
+        },
         principal,
     )?;
-    let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
+    let built = prepared_registry.built;
+    let skills = if prepared_registry.native {
+        crate::skills::load_skills_for_agent_from_config(config, alias)
+    } else {
+        Vec::new()
+    };
     // Capture before `runtime` is moved into `ScopedAssembly` below.
     let shell_profile = runtime.shell_profile();
     // The same gated seam run(), process_message, and independent delegation use:
@@ -3091,7 +3067,7 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
             skills: &skills,
             runtime,
             caller_allowed: None,
-            connect_mcp: true,
+            connect_mcp: prepared_registry.native,
             // A nested SOP step re-assembly is per turn (memoized per alias);
             // it has no cross-turn reuse contract, so the per-call
             // `connect_all` path inside `assemble` is the correct choice

@@ -988,7 +988,7 @@ pub(crate) fn plugin_host_services(
 /// debug builds, with Windows frames some 10–25% larger. Reserving roughly
 /// twice the measured worst case keeps the builder off every caller's stack
 /// budget without itself becoming a new cliff.
-const TOOL_REGISTRY_BUILD_STACK_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const TOOL_REGISTRY_BUILD_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Force-compile the process-global lazy regexes used on the turn path.
 ///
@@ -999,7 +999,7 @@ const TOOL_REGISTRY_BUILD_STACK_BYTES: usize = 4 * 1024 * 1024;
 /// a tool registry first, so warming them here — on the registry-builder
 /// thread, before any turn stack exists — keeps the recursion off every
 /// caller. Runs at most once per process.
-fn warm_lazy_regexes() {
+pub(crate) fn warm_lazy_regexes() {
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KV_REGEX);
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KEY_REGEX);
     std::sync::LazyLock::force(&crate::agent::loop_::IMAGE_DATA_URI_REGEX);

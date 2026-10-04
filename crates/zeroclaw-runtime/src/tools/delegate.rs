@@ -1330,7 +1330,7 @@ impl DelegateTool {
             self.runtime.as_ref().cloned().ok_or_else(|| {
                 anyhow::Error::msg("independent delegation requires runtime adapter")
             })?;
-        let risk_profile = config
+        config
             .risk_profile_for_agent(agent_name)
             .cloned()
             .ok_or_else(|| {
@@ -1346,56 +1346,10 @@ impl DelegateTool {
                     "Failed to initialize memory for independent delegate target '{agent_name}'"
                 ))
             })?;
-        let composio_key = if config.composio.enabled {
-            config.composio.api_key.as_deref()
-        } else {
-            None
-        };
-        let composio_entity_id = if config.composio.enabled {
-            Some(config.composio.entity_id.as_str())
-        } else {
-            None
-        };
-        let target_api_key = config
-            .resolved_model_provider_for_agent(agent_name)
-            .and_then(|(_, _, provider)| provider.api_key.as_deref());
 
         let tool_config = Arc::new(config.clone());
-        let mut all_tools_result = crate::tools::all_tools_with_runtime_and_execution_capability(
-            Arc::clone(&tool_config),
-            &target_policy,
-            &risk_profile,
-            agent_name,
-            runtime.clone(),
-            Arc::clone(&memory),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &target_policy.workspace_dir,
-            &config.agents,
-            target_api_key,
-            config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            // The delegated target's registry is built once, here, but its
-            // plugin tools and `send_via` authority resolve per execution. They
-            // must resolve against the daemon's shared handle, not the
-            // `root_config` snapshot this DelegateTool captured at
-            // construction - otherwise a reload or credential rotation is
-            // invisible to every delegated plugin tool for the parent's whole
-            // lifetime. `None` only when the parent registry itself had no live
-            // handle (one-shot callers), which keeps the snapshot fallback.
-            self.live_config.clone(),
-            self.execution_capability.clone(),
-        )?;
         let binding = self.target_binding();
-        binding.capabilities.bind_registry(
-            &mut all_tools_result,
+        let prepared_registry = binding.capabilities.prepare_registry(
             &crate::composition::ToolRequest {
                 config: &tool_config,
                 agent_alias: agent_name,
@@ -1403,11 +1357,21 @@ impl DelegateTool {
                 runtime: &runtime,
                 memory: &memory,
             },
+            crate::composition::RegistryContext {
+                live_config: self.live_config.clone(),
+                execution_capability: self.execution_capability.clone(),
+                ..crate::composition::RegistryContext::new(&target_policy.workspace_dir)
+            },
             binding.principal.as_ref(),
         )?;
+        let all_tools_result = prepared_registry.built;
 
         let target_workspace = config.agent_workspace_dir(agent_name);
-        let skills = crate::skills::load_skills_for_agent_from_config(config, agent_name);
+        let skills = if prepared_registry.native {
+            crate::skills::load_skills_for_agent_from_config(config, agent_name)
+        } else {
+            Vec::new()
+        };
 
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
@@ -1418,7 +1382,7 @@ impl DelegateTool {
                 skills: &skills,
                 runtime,
                 caller_allowed: None,
-                connect_mcp: true,
+                connect_mcp: prepared_registry.native,
                 connect_peripherals: false,
                 exclude_memory: false,
                 acp_delivery: false,

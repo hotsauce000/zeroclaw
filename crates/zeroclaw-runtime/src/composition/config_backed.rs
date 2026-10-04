@@ -27,7 +27,7 @@ pub(super) fn capabilities_with_observer(
         providers: Arc::new(ConfigProviders),
         memory: Arc::new(ConfigMemory),
         tools: Arc::new(NoSuppliedTools),
-        channels: Arc::new(NoOutboundChannels),
+        channels: Arc::new(ConfigChannels),
         observer,
     }
 }
@@ -170,17 +170,50 @@ impl MemorySource for ConfigMemory {
     }
 }
 
-/// Every tool is still built by the runtime's own registry, so the
-/// config-backed set supplies none of its own.
+/// Explicit native compatibility recipe, with no additional supplied tools.
+/// Applications select this adapter to retain the existing native registry.
 pub struct NoSuppliedTools;
 
 impl ToolSource for NoSuppliedTools {
+    fn uses_native_registry(&self, _request: &ToolRequest<'_>) -> bool {
+        true
+    }
+
     fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
         Ok(Vec::new())
     }
 }
 
-/// No entry point sends through `ChannelSource` yet.
+/// Registered CLI channel used only by config-backed compatibility wiring.
+/// Generic entry points never fall back to this factory when a source refuses.
+struct ConfigChannels;
+
+impl ChannelSource for ConfigChannels {
+    fn channel(&self, alias: &str) -> Option<Arc<dyn Channel>> {
+        (alias == "cli")
+            .then(|| {
+                crate::agent::loop_::CLI_CHANNEL_FN
+                    .get()
+                    .map(|factory| Arc::from(factory()))
+            })
+            .flatten()
+    }
+}
+
+pub(super) fn cli_channel() -> anyhow::Result<Arc<dyn Channel>> {
+    ConfigChannels.channel("cli").ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"alias": "cli"})),
+            "composition_cli_factory_missing"
+        );
+        anyhow::Error::msg("CLI channel factory not registered")
+    })
+}
+
+/// A closed source for callers that supply no outbound channels.
 pub struct NoOutboundChannels;
 
 impl ChannelSource for NoOutboundChannels {

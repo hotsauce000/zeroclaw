@@ -3106,17 +3106,6 @@ impl Agent {
             };
         let memory: Arc<dyn Memory> = capabilities.agent_memory(config, agent_alias).await?;
 
-        let composio_key = if config.composio.enabled {
-            config.composio.api_key.as_deref()
-        } else {
-            None
-        };
-        let composio_entity_id = if config.composio.enabled {
-            Some(config.composio.entity_id.as_str())
-        } else {
-            None
-        };
-
         // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset (or
         // empty) by default, so SOP runtime behavior is off until an operator
         // opts in by setting a directory.
@@ -3148,39 +3137,7 @@ impl Agent {
             acp_session_store.map(|store| tools::AcpSessionReadView::new(store, agent_alias));
         let tui_env = tui_env.map(Arc::new);
         let tool_config = Arc::new(config.clone());
-        let mut all_tools_result = tools::all_tools_with_runtime_context(
-            Arc::clone(&tool_config),
-            &security,
-            risk_profile,
-            agent_alias,
-            runtime.clone(),
-            memory.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            agent_model_provider.and_then(|e| e.api_key.as_deref()),
-            config,
-            canvas_store,
-            false,
-            tui_env.clone(),
-            sop_engine,
-            sop_audit,
-            // Daemon-backed constructors supply the shared handle; tools that
-            // resolve config per call (plugin tools, `send_via` authority, and
-            // the A2A outbound client) must follow reloads rather than this
-            // call's `config` snapshot. `None` here would silently pin them to
-            // startup state for the Agent's whole lifetime. One-shot callers
-            // pass `None` and keep the documented snapshot fallback.
-            live_config.clone(),
-            execution_capability,
-            acp_sessions,
-        )?;
-        capabilities.bind_registry(
-            &mut all_tools_result,
+        let prepared_registry = capabilities.prepare_registry(
             &crate::composition::ToolRequest {
                 config: &tool_config,
                 agent_alias,
@@ -3188,12 +3145,27 @@ impl Agent {
                 runtime: &runtime,
                 memory: &memory,
             },
+            crate::composition::RegistryContext {
+                canvas_store,
+                tui_env: tui_env.clone(),
+                sop_engine,
+                sop_audit,
+                live_config: live_config.clone(),
+                execution_capability,
+                acp_sessions,
+                ..crate::composition::RegistryContext::new(&security.workspace_dir)
+            },
             origin.principal(),
         )?;
+        let all_tools_result = prepared_registry.built;
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
-        let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
+        let skills = if prepared_registry.native {
+            crate::skills::load_skills_for_agent_from_config(config, agent_alias)
+        } else {
+            Vec::new()
+        };
         // Captured before `assemble` consumes the result: the concrete delegate
         // instance this registry built, so live-config regressions can drive its
         // nested-registry construction instead of re-deriving the wiring.
@@ -3216,7 +3188,7 @@ impl Agent {
                 // principal list denies every MCP tool and a named list
                 // admits only the named ones.
                 caller_allowed: principal_allowed_tools.as_deref(),
-                connect_mcp: initialize_mcp,
+                connect_mcp: prepared_registry.native && initialize_mcp,
                 connect_peripherals: false,
                 exclude_memory,
                 acp_delivery,
@@ -5241,10 +5213,10 @@ impl Agent {
         println!("Type /quit to exit.\n");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        let cli = crate::agent::loop_::CLI_CHANNEL_FN
-            .get()
-            .expect("CLI channel factory not registered — call register_cli_channel_fn at startup")(
-        );
+        let cli = match self.supplied_capabilities.as_ref() {
+            Some(bound) => bound.capabilities.cli_channel()?,
+            None => crate::composition::compatibility_cli_channel()?,
+        };
 
         let listen_handle = zeroclaw_spawn::spawn!(async move {
             let _ = zeroclaw_api::channel::Channel::listen(&*cli, tx).await;
@@ -18722,6 +18694,10 @@ mod capability_construction_tests {
     const IMPOSTOR: &str = "source impostor";
 
     impl ToolSource for SuppliedTools {
+        fn uses_native_registry(&self, _request: &ToolRequest<'_>) -> bool {
+            true
+        }
+
         fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
             Ok(vec![
                 Box::new(NamedTool {
