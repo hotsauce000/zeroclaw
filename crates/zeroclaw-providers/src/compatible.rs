@@ -16410,13 +16410,11 @@ mod tests {
     /// error, so the URL it embeds must already be scrubbed.
     #[tokio::test]
     async fn list_models_scrubs_url_credentials_from_transport_failure() {
-        // Bind and immediately drop the listener so the port is closed: this
-        // forces a connect-level transport failure (the `map_err` branch that
-        // formats the URL), rather than an HTTP status failure.
-        let closed_addr = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap()
-        };
+        // Keep the port reserved until the request finishes so a parallel test
+        // cannot bind it and receive this request. Closing each accepted socket
+        // without an HTTP response forces the transport-error branch instead.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
 
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Auth".to_string(), "bridge-token".to_string());
@@ -16424,17 +16422,28 @@ mod tests {
             .display_name("url-credential")
             .base_url(&format!(
                 "http://synthetic-user:synthetic-secret@{}:{}",
-                closed_addr.ip(),
-                closed_addr.port()
+                addr.ip(),
+                addr.port()
             ))
             .auth_style(AuthStyle::Bearer)
             .extra_headers(headers)
             .build();
 
-        let error = provider
-            .list_models()
-            .await
-            .expect_err("a closed configured endpoint must surface a transport failure");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = provider.list_models() => {
+                    result.expect_err("an endpoint closed without a response must surface a transport failure")
+                }
+                _ = async {
+                    loop {
+                        let (socket, _) = listener.accept().await.unwrap();
+                        drop(socket);
+                    }
+                } => unreachable!("the endpoint keeps rejecting connections until the request finishes"),
+            }
+        })
+        .await
+        .expect("the transport failure should complete within five seconds");
         let rendered = format!("{error:#}");
         assert!(
             !rendered.contains("synthetic-secret"),
