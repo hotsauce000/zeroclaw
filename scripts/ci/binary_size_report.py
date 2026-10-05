@@ -44,6 +44,7 @@ from dependency_footprint import (
     require_stable_context_string,
     require_string,
     resolve_selection,
+    run_command,
     validate_resolved_inputs,
 )
 
@@ -231,6 +232,13 @@ def build_env_names(triple: str) -> tuple[str, ...]:
         "ZEROCLAW_BUILD_ID",
     )
 
+
+def rustc_host_triple(repo_root: Path) -> str:
+    output = run_command(["rustc", "--version", "--verbose"], repo_root, "rustc host")
+    for line in output.splitlines():
+        if line.startswith("host:"):
+            return require_string(line.split(":", 1)[1].strip(), "rustc host", TARGET_RE)
+    raise fail("rustc --version --verbose: missing host line")
 
 def require_ignored_target_dir(repo_root: Path, directory: Path) -> None:
     try:
@@ -627,16 +635,23 @@ def command_measure(args: argparse.Namespace) -> None:
             file=sys.stderr,
             flush=True,
         )
+    # Distribution selections drop per-target features, so resolve them for the
+    # triple the binary is built for: the explicit --target, or else the host.
+    # Without this a native ARM host would measure features its release
+    # artifact excludes.
+    selection_target = target
     resolved: dict[str, list[str]] = {}
     for profile in profiles:
         selection = profile["selection"]
         if selection and selection not in resolved:
+            if selection_target is None:
+                selection_target = rustc_host_triple(repo_root)
             print(
-                f"resolving feature selection {selection} (builds xtask on first use)",
+                f"resolving feature selection {selection} for {selection_target} (builds xtask on first use)",
                 file=sys.stderr,
                 flush=True,
             )
-            resolved[selection] = resolve_selection(cargo, selection, repo_root, target)
+            resolved[selection] = resolve_selection(cargo, selection, repo_root, selection_target)
     context = context_from_capture(cargo, repo_root, target, resolved, source_identity)
     context["resolved_selections"] = normalize_resolved_selections(resolved, "resolved selections")
     triple = require_string(context["target"], "target triple", TARGET_RE)

@@ -106,7 +106,10 @@ Cargo defaults a source build gets), and `standard-distribution` (the feature
 set of the release archives). Without `--profile`, `measure` builds every
 `zeroclaw` policy profile, including `ci-all` and `hardware-probe`, which are
 CI and hardware aggregates rather than shipped builds. Pass `--target <triple>`
-to build for another target.
+to build for another target. Without it, `measure` resolves the
+`standard-distribution` features for the host triple, so the per-target
+exclusions in `Cargo.toml` apply as they do for that target's release
+archive.
 
 `compare` prints the table, headed by each side's revision and whether it was
 dirty, and writes the JSON result to the file named by `--output`, or to

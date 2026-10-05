@@ -16,6 +16,20 @@ while IFS= read -r name; do
     unset "$name"
 done < <(compgen -e | grep -E "^(${scrubbed_variables})$" || true)
 
+# A fake rustc fixes the host triple, and with it the distribution features
+# resolved for an implicit target, whatever machine runs the suite.
+fake_bin="$test_root/fake-bin"
+mkdir -p "$fake_bin"
+cat >"$fake_bin/rustc" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == "--version --verbose" ]] || exit 90
+printf '%s\n' 'rustc 1.90.0 (fixture)' 'binary: rustc' "host: ${FAKE_RUSTC_HOST}" 'release: 1.90.0'
+SH
+chmod +x "$fake_bin/rustc"
+export PATH="$fake_bin:$PATH"
+export FAKE_RUSTC_HOST=x86_64-unknown-linux-gnu
+
 fail() {
     echo "FAIL: $*" >&2
     exit 1
@@ -108,12 +122,20 @@ if [[ "${1:-}" == "--version" ]]; then
 fi
 
 if [[ "${1:-}" == "run" ]]; then
-    expected=(run --locked --quiet -p xtask --bin generate -- features --selection dist)
-    if [[ -n "${FAKE_EXPECT_TARGET:-}" ]]; then
-        expected+=(--target "$FAKE_EXPECT_TARGET")
-    fi
+    selection_target="${FAKE_EXPECT_TARGET:-$FAKE_RUSTC_HOST}"
+    expected=(run --locked --quiet -p xtask --bin generate -- features --selection dist --target "$selection_target")
     [[ "$#" -eq "${#expected[@]}" && "$*" == "${expected[*]}" ]] || exit 91
-    printf '%s\n' 'channel-matrix,agent-runtime'
+    # Like the canonical dist_target_exclusions, 32-bit ARM targets drop a feature.
+    case "$selection_target" in
+        arm-unknown-linux-gnueabihf | armv7-unknown-linux-gnueabihf)
+            printf '%s\n' 'agent-runtime' >"$FAKE_CARGO_LOG.dist"
+            printf '%s\n' 'agent-runtime'
+            ;;
+        *)
+            printf '%s\n' 'agent-runtime,channel-matrix' >"$FAKE_CARGO_LOG.dist"
+            printf '%s\n' 'channel-matrix,agent-runtime'
+            ;;
+    esac
     exit 0
 fi
 
@@ -145,20 +167,25 @@ done
 [[ "$release" == true && "$locked" == true && "$json" == true ]] || exit 94
 [[ "$package" == zeroclaw && "$bin" == zeroclaw && -n "$target_dir" ]] || exit 94
 [[ "$target" == "${FAKE_EXPECT_TARGET:-}" ]] || exit 95
-profile=""
+# Each policy profile builds in its own directory, so the directory names the
+# profile; its features must be the profile's, or for a selection profile the
+# features the fake xtask resolved in this run.
+profile="$(basename "$target_dir")"
 size=""
 while IFS='|' read -r row_id row_mode row_features _row_selection row_size; do
+    [[ "$row_id" == "$profile" ]] || continue
     row_no_default=true
     if [[ "$row_mode" == defaults ]]; then
         row_no_default=false
     fi
+    if [[ "$row_mode" == selection ]]; then
+        row_features="$(cat "$FAKE_CARGO_LOG.dist")"
+    fi
     if [[ "$no_default" == "$row_no_default" && "$features" == "$row_features" ]]; then
-        profile="$row_id"
         size="$row_size"
     fi
 done <"$FAKE_CARGO_PROFILES"
-[[ -n "$profile" ]] || exit 96
-[[ "$(basename "$target_dir")" == "$profile" ]] || exit 97
+[[ -n "$size" ]] || exit 96
 [[ "$profile" != "${FAKE_CARGO_FAIL_PROFILE:-}" ]] || exit 98
 for entry in ${FAKE_CARGO_SIZES:-}; do
     if [[ "${entry%%=*}" == "$profile" ]]; then
@@ -316,7 +343,9 @@ build_prefix='build --release --locked --message-format=json-render-diagnostics 
 assert_line "$test_root/fake-cargo.log" \
     "${build_prefix} --target-dir ${target_a}/standard-distribution --no-default-features --features agent-runtime,channel-matrix"
 assert_line "$test_root/fake-cargo.log" "${build_prefix} --target-dir ${target_a}/root-default"
-assert_line "$test_root/fake-cargo.log" 'run --locked --quiet -p xtask --bin generate -- features --selection dist'
+# Without --target the distribution features are resolved for the host triple.
+assert_line "$test_root/fake-cargo.log" \
+    "run --locked --quiet -p xtask --bin generate -- features --selection dist --target ${host}"
 
 # Re-running is deterministic, and a bare wrapper invocation dispatches to measure.
 FAKE_CARGO_LOG="$test_root/rerun.log" FAKE_CARGO_PROFILES="$fake_profiles" bash "$tool" \
@@ -680,6 +709,27 @@ expect_failure target-mismatch 'incompatible toolchain or target context (differ
     run_compare "$test_root/report-a.json" "$test_root/report-windows.json"
 expect_invalid non-host-target-path 'report["measurements"][0]["path"] = "foundation/release/zeroclaw.exe"' \
     'before report.measurements[0].path: does not match the policy profile' "$test_root/report-windows.json"
+
+# Without --target, distribution features are resolved for the host, so a native
+# 32-bit ARM host measures the feature set of its own release artifact.
+FAKE_CARGO_LOG="$test_root/arm-host.log" FAKE_RUSTC_HOST=armv7-unknown-linux-gnueabihf run_measure \
+    "$test_root/report-arm-host.json" \
+    "$test_root/target-arm-host" \
+    --profile standard-distribution >/dev/null
+python3 - "$test_root/report-arm-host.json" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert report["context"]["target"] == "armv7-unknown-linux-gnueabihf", report["context"]
+assert report["context"]["resolved_selections"] == {"dist": ["agent-runtime"]}, report["context"]
+[item] = report["measurements"]
+assert item["resolved_inputs"]["features"] == ["agent-runtime"], item
+assert item["path"] == "standard-distribution/release/zeroclaw", item
+PY
+assert_line "$test_root/arm-host.log" \
+    'run --locked --quiet -p xtask --bin generate -- features --selection dist --target armv7-unknown-linux-gnueabihf'
 
 # An explicit host target builds at a different path than the default, so that row has no delta.
 FAKE_EXPECT_TARGET="$host" run_measure \
