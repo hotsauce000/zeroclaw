@@ -1572,7 +1572,9 @@ mod tests {
     /// so every catalogue must carry the literal `zeroclaw plugin remove
     /// <name>` invocation with the package name inlined. The remove refusal
     /// must inline the host's reason verbatim, since it says why nothing was
-    /// deleted. A catalogue that copies English fails as untranslated.
+    /// deleted. The messages for retained install, recovery and staging files,
+    /// and for a changed namespace, must carry the retained path and the
+    /// host's reason. A catalogue that copies English fails as untranslated.
     #[test]
     fn plugin_unadmitted_package_strings_are_translated_in_every_locale() {
         const REASON: &str =
@@ -1580,7 +1582,8 @@ mod tests {
         /// One parity case: the Fluent key, its arguments, and the substrings
         /// every locale's rendering must contain.
         type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
-        let cases: [ParityCase; 2] = [
+        const PATH: &str = "/plugins/.tool-fixture.recovering-v1-0/package";
+        let cases: [ParityCase; 6] = [
             (
                 "cli-plugin-install-unadmitted-package",
                 &[("name", "tool-fixture")],
@@ -1590,6 +1593,22 @@ mod tests {
                 "cli-plugin-remove-unadmitted-package",
                 &[("name", "tool-fixture"), ("reason", REASON)],
                 &["`zeroclaw plugin remove`", "'tool-fixture'", REASON],
+            ),
+            (
+                "cli-plugin-install-retained",
+                &[("path", PATH), ("reason", REASON)],
+                &[PATH, REASON],
+            ),
+            (
+                "cli-plugin-recovery-retained",
+                &[("path", PATH), ("reason", REASON)],
+                &[PATH, REASON, "plugin remove"],
+            ),
+            ("cli-plugin-staging-retained", &[("path", PATH)], &[PATH]),
+            (
+                "cli-plugin-namespace-changed",
+                &[("reason", REASON)],
+                &[REASON],
             ),
         ];
 
