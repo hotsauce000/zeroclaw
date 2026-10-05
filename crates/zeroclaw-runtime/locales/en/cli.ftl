@@ -34,6 +34,9 @@ cli-integrations-chat-slack-prepare = Create an app at {$url}, configure its bot
 cli-integrations-chat-configure = Run {$command}, open Config, and configure a {$channel} instance and its credentials.
 cli-integrations-chat-bind = Bind the channel alias to an agent and review peer-group access.
 cli-integrations-chat-enable = Enable the channel instance only after reviewing its settings and access.
+cli-integrations-chat-imessage-transport = Sends messages through AppleScript automation and receives messages by reading the local Messages database.
+cli-integrations-chat-imessage-permissions = Grant macOS Automation access to control Messages and Full Disk Access to read the Messages database.
+cli-integrations-chat-generic-setup = Run {$command}, open Config, configure the required fields, routing, and access for {$channel}, review the settings, then enable it.
 cli-skills-about = Manage skills (user-defined capabilities)
 cli-sop-about = Manage standard operating procedures (SOPs)
 cli-migrate-about = Migrate data from other agent runtimes
@@ -1408,6 +1411,10 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+# ── Peer-agent delivery ──
+peer-delivery-control-plane-unavailable = in-process peer delivery requires an available durable task store: {$error}
+peer-delivery-registration-failed = peer delivery rejected: {$error}
+peer-delivery-accepted = accepted for in-process delivery to peer agent "{$recipient}" (task_id={$task_id})
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
 
 # ── RPC inbound authentication ──
