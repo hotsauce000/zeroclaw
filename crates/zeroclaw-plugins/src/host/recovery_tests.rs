@@ -319,6 +319,26 @@ fn an_empty_claim_that_gains_an_entry_after_its_verdict_is_kept() {
     assert_eq!(std::fs::read(&late).unwrap(), b"late bytes");
 }
 
+/// When the package is deleted but its transaction cannot be finished, the
+/// remove reports the transaction entry it kept rather than a bare I/O error.
+#[test]
+fn a_remove_that_deleted_but_could_not_finish_names_the_entry() {
+    let root = tempfile::tempdir().unwrap();
+    broken(root.path());
+    let paused = Paused::start(root.path(), "package-deleted", "remove");
+    let claim = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|p| p.contains("recovering-v1"))
+        .unwrap();
+    std::fs::write(root.path().join(&claim).join("stray"), b"stray").unwrap();
+    let output = paused.resume();
+    assert!(
+        output.contains("RecoveryRetained") && output.contains(&claim),
+        "{output}"
+    );
+    assert!(!root.path().join("race").exists());
+}
+
 #[test]
 fn crash_after_claim_restores_then_recovers_on_retry() {
     let root = tempfile::tempdir().unwrap();

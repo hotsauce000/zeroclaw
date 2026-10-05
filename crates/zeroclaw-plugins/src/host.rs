@@ -653,7 +653,17 @@ impl PluginHost {
                 path: self.recovery_root.retained_path(&tx),
                 reason: error.to_string(),
             })?;
-        tx.finish(&self.recovery_root)?;
+        // The package is gone by now; only the transaction's lease and entry
+        // remain, so a failure here names the entry rather than claiming the
+        // remove failed.
+        let entry = self.plugins_dir.join(&tx.entry).display().to_string();
+        #[cfg(test)]
+        recovery::pause("package-deleted");
+        tx.finish(&self.recovery_root)
+            .map_err(|error| PluginError::RecoveryRetained {
+                path: entry,
+                reason: error.to_string(),
+            })?;
         Ok(retained)
     }
 
