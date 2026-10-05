@@ -1000,10 +1000,14 @@ workspace `Cargo.toml` for the authoritative descriptions.
 ### Interrupted installation recovery
 
 `zeroclaw plugin remove <name>` can recover an unloaded, empty or structurally
-incomplete package directory. Signature-policy refusals, healthy packages,
-loaded aliases, symlinks, and uninspectable contents remain protected. Recovery
-claims a single directory generation before admission and deletion; it never
-uses a stale verdict to recursively delete a replacement at the package name.
+incomplete package directory that holds only what an install writes: a
+manifest naming that package, the component file at `wasm_path` with the
+folders on its way, and, for a skill plugin, a `skills/` tree of folders and
+files. Signature-policy refusals, healthy packages, loaded aliases, symlinks,
+uninspectable contents, and directories holding anything else remain
+protected. Recovery claims a single directory generation before admission and
+deletion; it never uses a stale verdict to recursively delete a replacement at
+the package name.
 
 Install and recovery coordinate through a persistent hidden OS lock under the
 plugins root. A process that cannot take it within 60 seconds gives up and

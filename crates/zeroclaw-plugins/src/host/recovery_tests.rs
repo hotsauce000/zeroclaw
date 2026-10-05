@@ -264,7 +264,14 @@ fn an_entry_stopped_before_its_lease_is_removed_and_one_holding_a_package_is_kep
 fn a_delete_stopped_part_way_is_finished_by_the_retry() {
     for step in ["delete-marked", "entry-deleted"] {
         let root = tempfile::tempdir().unwrap();
-        broken(root.path());
+        // The manifest parses but declares a skill bundle that has no skill,
+        // so admission rejects it, and every entry is one an install writes.
+        std::fs::create_dir(root.path().join("race")).unwrap();
+        std::fs::write(
+            root.path().join("race/manifest.toml"),
+            "name = \"race\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\", \"skill\"]\n",
+        )
+        .unwrap();
         let legacy = root.path().join(".race.installing-4242");
         std::fs::create_dir(&legacy).unwrap();
         std::fs::write(root.path().join("race/plugin.wasm"), b"\0asm partial").unwrap();

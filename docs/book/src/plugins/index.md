@@ -163,7 +163,13 @@ cases only:
   manifest, a missing component, a component that does not match its declared
   `wasm_sha256`, or a package this host cannot accept as written, such as a
   component over the admission size limit, a `config_schema` it cannot
-  compile, or an incomplete skill bundle.
+  compile, or an incomplete skill bundle. It must also hold nothing an install
+  never writes. An install writes a package under its manifest's name: the
+  manifest first, and after it only the component at its `wasm_path`, as a
+  file with the folders on the way, and, for a skill plugin, a `skills/`
+  folder of files and subfolders. So next to a manifest that does not parse
+  there may be nothing else, and next to one that parses only those entries,
+  under the name that manifest gives.
 
 Recovery also cleans provably abandoned stages created by the lease protocol.
 Active stages and ambiguous legacy `.<name>.installing-<pid>` directories are
@@ -174,15 +180,17 @@ the incomplete final package is recovered. If no final package exists,
 delete that an earlier `plugin remove` had begun.
 
 Other occupants are refused, and the command prints why: a symlink or a
-file at the name, a directory that holds files but no `manifest.toml`, a
-directory it cannot inspect or list, the directory a loaded package was loaded
-from, a package admission accepts, and a package this host rejects for its
-signature policy (unsigned, from an untrusted publisher, carrying an invalid
-signature, or without a signed `wasm_sha256` in `strict` mode). Admission
-checks the signature before it reads the component, so under `strict` a
-stranded manifest from an unsigned package, or one cut so that its signature
-no longer verifies, is refused for its signature even though its component is
-missing.
+file at the name, a directory that holds files but no `manifest.toml`, one
+that holds files an install never writes, such as a plugin's source checkout
+whose component is not built yet or a `.DS_Store` a file manager added, one
+whose manifest names another package, a directory it cannot inspect or list,
+the directory a loaded package was loaded from, a package admission accepts,
+and a package this host rejects for its signature policy (unsigned, from an
+untrusted publisher, carrying an invalid signature, or without a signed
+`wasm_sha256` in `strict` mode). Admission checks the signature before it reads the component,
+so under `strict` a stranded manifest from an unsigned package, or one cut so
+that its signature no longer verifies, is refused for its signature even
+though its component is missing.
 
 A refused claimed package is restored without replacing any concurrent
 occupant that holds files. On a filesystem without a no-replace rename, an

@@ -505,15 +505,18 @@ impl PluginHost {
     /// host did not load, `remove` is the recovery path for an interrupted
     /// install: it claims and validates the exact directory generation and
     /// cleans only staging whose protocol lease proves abandonment. Ambiguous
-    /// legacy staging is retained. The final directory must be empty, or
-    /// holds a `manifest.toml` and admission rejects its own contents rather
-    /// than its signature. That includes a package this host cannot accept as
-    /// written, such as one whose component exceeds the admission size limit.
-    /// Anything else at the name is left untouched and reported as
+    /// legacy staging is retained. The final directory must be empty, or hold
+    /// a `manifest.toml` naming `name` and nothing an install never writes,
+    /// with admission rejecting its own contents rather than its signature.
+    /// That includes a package this host cannot accept as written, such as one
+    /// whose component exceeds the admission size limit. Anything else at the
+    /// name is left untouched and reported as
     /// [`PluginError::UnadmittedPackage`] with the reason: a symlink or file, a
-    /// directory holding files but no manifest, one that cannot be identified,
-    /// inspected, or listed, a loaded package's directory, a package admission
-    /// accepts, and one this host rejects for its signature policy. A refusal
+    /// directory holding files but no manifest, one holding anything an install
+    /// never writes or whose manifest names another package, one that cannot be
+    /// identified, inspected, or listed, a loaded package's directory, a
+    /// package admission accepts, and one this host rejects for its signature
+    /// policy. A refusal
     /// restores the claimed package without replacing a concurrent occupant
     /// that holds files; if restoration cannot complete, `RecoveryRetained`
     /// names the retained transaction and a later remove retries it.
@@ -687,6 +690,9 @@ impl PluginHost {
             Err(error) if is_structural_admission_failure(&error) => {
                 dir.entries()
                     .map_err(|error| kept(name, format!("it cannot be listed ({error})")))?;
+                if let Some(reason) = beyond_install_footprint(dir, name)? {
+                    return Err(kept(name, reason));
+                }
                 Ok(false)
             }
             Err(error) => Err(error),
@@ -1034,10 +1040,14 @@ fn open_payload_in(dir: &Dir, relative: &str) -> Result<std::fs::File, PluginErr
 }
 
 /// Elsewhere `dir` resolves the path, after a check that no component on the
-/// way is a symlink.
+/// way is a symlink and that the payload is a regular file. Opening a
+/// directory as a file fails there with an access error, which would read as
+/// an I/O failure rather than as a payload that is not a file, as it does on
+/// Unix.
 #[cfg(not(unix))]
 fn open_payload_in(dir: &Dir, relative: &str) -> Result<std::fs::File, PluginError> {
     let mut prefix = PathBuf::new();
+    let mut is_file = false;
     for component in Path::new(relative).components() {
         prefix.push(component);
         let metadata = dir.symlink_metadata(&prefix).map_err(|error| {
@@ -1052,6 +1062,12 @@ fn open_payload_in(dir: &Dir, relative: &str) -> Result<std::fs::File, PluginErr
                 "wasm_path contains a symlink".into(),
             ));
         }
+        is_file = metadata.is_file();
+    }
+    if !is_file {
+        return Err(PluginError::InvalidManifest(
+            "WASM payload is not a regular file".into(),
+        ));
     }
     Ok(dir.open(relative)?.into_std())
 }
@@ -1774,6 +1790,143 @@ fn is_structural_admission_failure(error: &PluginError) -> bool {
         | PluginError::PermissionDenied { .. }
         | PluginError::UnsupportedCapability(_) => false,
     }
+}
+
+/// Why `dir`, claimed as `name`, holds something no install could have
+/// written, if it does. Every installer writes a package under its manifest's
+/// name: `manifest.toml` first, and after it only the component at `wasm_path`,
+/// a regular file with the directories on its way, and, for a skill plugin, a
+/// `skills/` tree of directories and regular files. So when the manifest does
+/// not parse, nothing else was written yet, and otherwise only those entries
+/// can be an interrupted install's. Anything else, such as a plugin's source
+/// tree next to a manifest whose component is not built, is not recovery's to
+/// delete.
+fn beyond_install_footprint(dir: &Dir, name: &str) -> Result<Option<String>, PluginError> {
+    let manifest = dir
+        .read_to_string("manifest.toml")
+        .ok()
+        .and_then(|text| toml::from_str::<PluginManifest>(&text).ok());
+    if let Some(manifest) = &manifest
+        && manifest.name != name
+    {
+        return Ok(Some(format!(
+            "its manifest names '{}', and an install writes each package under its own name",
+            manifest.name
+        )));
+    }
+    let parsed = manifest.is_some();
+    let skill_bundle = manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest.capabilities.contains(&PluginCapability::Skill));
+    let component: Vec<std::ffi::OsString> = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.wasm_path.as_deref())
+        .filter(|path| validate_manifest_subpath("wasm_path", "", path).is_ok())
+        .map(|path| {
+            Path::new(path)
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(segment) => Some(segment.to_owned()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let foreign = |extra: PathBuf| {
+        if parsed {
+            format!(
+                "it holds files an install never writes, such as '{}'",
+                extra.display()
+            )
+        } else {
+            format!(
+                "its manifest.toml does not parse, so nothing beside it can be an interrupted install's, yet it holds '{}'",
+                extra.display()
+            )
+        }
+    };
+    for entry in dir.entries()? {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        if entry_name == "manifest.toml" {
+            continue;
+        }
+        if skill_bundle && entry_name == SKILLS_SUBDIR && entry_type(dir, &entry)?.is_dir() {
+            let skills = dir.open_dir(SKILLS_SUBDIR)?;
+            if let Some(extra) = beyond_copied_tree(&skills, Path::new(SKILLS_SUBDIR))? {
+                return Ok(Some(foreign(extra)));
+            }
+            continue;
+        }
+        if let Some(extra) = beyond_component_path(dir, &entry, &component, Path::new(""))? {
+            return Ok(Some(foreign(extra)));
+        }
+    }
+    Ok(None)
+}
+
+/// The type of `entry` in `dir`, without following a symlink. A filesystem
+/// that does not report entry types while listing gives an unknown type, so
+/// that case asks the directory for the entry's metadata instead.
+fn entry_type(dir: &Dir, entry: &cap_std::fs::DirEntry) -> std::io::Result<cap_std::fs::FileType> {
+    let file_type = entry.file_type()?;
+    if file_type.is_dir() || file_type.is_file() || file_type.is_symlink() {
+        return Ok(file_type);
+    }
+    Ok(dir.symlink_metadata(entry.file_name())?.file_type())
+}
+
+/// The first entry below a copied `skills/` tree that the copy could not have
+/// made: every installer copies only directories and regular files.
+fn beyond_copied_tree(dir: &Dir, walked: &Path) -> Result<Option<PathBuf>, PluginError> {
+    for entry in dir.entries()? {
+        let entry = entry?;
+        let here = walked.join(entry.file_name());
+        let file_type = entry_type(dir, &entry)?;
+        if file_type.is_dir() {
+            if let Some(extra) = beyond_copied_tree(&dir.open_dir(entry.file_name())?, &here)? {
+                return Ok(Some(extra));
+            }
+        } else if !file_type.is_file() {
+            return Ok(Some(here));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `entry` lies on the way to the component, which must be the next of
+/// `component`'s remaining segments: a directory with only the rest of the way
+/// below it, or, for the last segment, the component itself.
+fn beyond_component_path(
+    parent: &Dir,
+    entry: &cap_std::fs::DirEntry,
+    component: &[std::ffi::OsString],
+    walked: &Path,
+) -> Result<Option<PathBuf>, PluginError> {
+    let entry_name = entry.file_name();
+    let here = walked.join(&entry_name);
+    let Some((next, rest)) = component.split_first() else {
+        return Ok(Some(here));
+    };
+    if entry_name != *next {
+        return Ok(Some(here));
+    }
+    let file_type = entry_type(parent, entry)?;
+    if rest.is_empty() {
+        // An installer writes the component as a regular file, never as a
+        // directory, a symlink or a special file.
+        return Ok((!file_type.is_file()).then_some(here));
+    }
+    if !file_type.is_dir() {
+        return Ok(Some(here));
+    }
+    let child = parent.open_dir(&entry_name)?;
+    for inner in child.entries()? {
+        if let Some(extra) = beyond_component_path(&child, &inner?, rest, &here)? {
+            return Ok(Some(extra));
+        }
+    }
+    Ok(None)
 }
 
 /// Why recovery keeps a directory it claimed, worded for the operator.
@@ -3092,6 +3245,175 @@ capabilities = ["tool"]
         }
     }
 
+    /// Recovery deletes only what an install could have left. A broken
+    /// manifest next to anything else, a plugin's source checkout whose
+    /// component is not built, a stray file beside the component, a directory
+    /// where the component goes, or skill drafts next to a manifest without the
+    /// skill capability is kept, every byte of it.
+    #[test]
+    fn remove_keeps_a_directory_holding_files_an_install_never_writes() {
+        let unbuilt = "name = \"devtool\"\nversion = \"0.1.0\"\nwasm_path = \"target/plugin.wasm\"\ncapabilities = [\"tool\"]\n";
+        let mismatched = format!("{unbuilt}wasm_sha256 = \"{}\"\n", "0".repeat(64));
+        for (label, files) in [
+            (
+                "broken manifest and a note",
+                vec![
+                    ("manifest.toml", "name =".to_string()),
+                    ("notes.txt", "keep".to_string()),
+                ],
+            ),
+            (
+                "source checkout, component not built",
+                vec![
+                    ("manifest.toml", unbuilt.to_string()),
+                    ("Cargo.toml", "[package]".to_string()),
+                    ("src/lib.rs", "fn main() {}".to_string()),
+                    (".git/HEAD", "ref: refs/heads/main".to_string()),
+                ],
+            ),
+            (
+                "a stray file beside the component",
+                vec![
+                    ("manifest.toml", mismatched.clone()),
+                    ("target/plugin.wasm", "\0asm".to_string()),
+                    ("target/README", "build output".to_string()),
+                ],
+            ),
+            (
+                "a directory where the component goes",
+                vec![
+                    ("manifest.toml", unbuilt.to_string()),
+                    ("target/plugin.wasm/inner", "not a component".to_string()),
+                ],
+            ),
+            (
+                "skill drafts next to a tool manifest",
+                vec![
+                    ("manifest.toml", unbuilt.to_string()),
+                    ("skills/setup/SKILL.md", "draft".to_string()),
+                ],
+            ),
+        ] {
+            let plugins = tempdir().unwrap();
+            let dir = plugins.path().join("devtool");
+            for (path, contents) in &files {
+                let path = dir.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, contents).unwrap();
+            }
+            let before = nested_package_bytes(&dir);
+            let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+            let err = host.remove("devtool").expect_err(label);
+            // Next to a manifest that does not parse, nothing at all can be an
+            // interrupted install's, and the reason says so.
+            let expected = if files[0].1 == "name =" {
+                "its manifest.toml does not parse, so nothing beside it can be an interrupted install's, yet it holds '"
+            } else {
+                "it holds files an install never writes, such as '"
+            };
+            assert!(
+                matches!(&err, PluginError::UnadmittedPackage { reason, .. } if reason.starts_with(expected)),
+                "{label}: {err}"
+            );
+            assert_eq!(nested_package_bytes(&dir), before, "{label}");
+        }
+    }
+
+    /// What an install writes is still recoverable when the component sits
+    /// below a directory: the manifest, the component's folder and file, and,
+    /// for a skill plugin, `skills/`.
+    #[test]
+    fn remove_recovers_a_broken_package_whose_component_is_nested() {
+        let plugins = tempdir().unwrap();
+        let dir = plugins.path().join("nested");
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::create_dir_all(dir.join("skills/alpha")).unwrap();
+        std::fs::write(
+            dir.join("manifest.toml"),
+            format!(
+                "name = \"nested\"\nversion = \"0.1.0\"\nwasm_path = \"target/plugin.wasm\"\ncapabilities = [\"tool\", \"skill\"]\nwasm_sha256 = \"{}\"\n",
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("target/plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(dir.join("skills/alpha/notes.md"), b"partial").unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        host.remove("nested").unwrap();
+        assert!(!dir.exists());
+    }
+
+    /// Every installer writes a package under its manifest's name, so a
+    /// broken package whose manifest names another one was not left by an
+    /// install of this name, such as a copy kept under another name. It is
+    /// kept, every byte of it.
+    #[test]
+    fn remove_keeps_a_package_whose_manifest_names_another_package() {
+        let plugins = tempdir().unwrap();
+        let dir = plugins.path().join("demo-copy");
+        std::fs::create_dir(&dir).unwrap();
+        write_tool_source(&dir, "demo", b"\0asm partial");
+        std::fs::remove_file(dir.join("plugin.wasm")).unwrap();
+        let before = nested_package_bytes(&dir);
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let err = host
+            .remove("demo-copy")
+            .expect_err("another package's manifest");
+        assert!(
+            matches!(&err, PluginError::UnadmittedPackage { reason, .. } if reason == "its manifest names 'demo', and an install writes each package under its own name"),
+            "{err}"
+        );
+        assert_eq!(nested_package_bytes(&dir), before);
+    }
+
+    /// No install writes a symlink: neither as the component, nor inside a
+    /// skill bundle, whose copy takes only directories and regular files. A
+    /// broken package holding one is kept, and the link's target is never
+    /// touched.
+    #[cfg(unix)]
+    #[test]
+    fn remove_keeps_a_package_holding_a_symlink_an_install_never_writes() {
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("build.wasm"), b"\0asm outside").unwrap();
+        for (label, link, expected) in [
+            ("a linked component", "plugin.wasm", "plugin.wasm"),
+            (
+                "a link in the skill bundle",
+                "skills/alpha/link.md",
+                "skills/alpha/link.md",
+            ),
+        ] {
+            let plugins = tempdir().unwrap();
+            let dir = plugins.path().join("linked");
+            std::fs::create_dir_all(dir.join("skills/alpha")).unwrap();
+            std::fs::write(
+                dir.join("manifest.toml"),
+                "name = \"linked\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\", \"skill\"]\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join("skills/alpha/SKILL.md"), b"# Alpha").unwrap();
+            std::os::unix::fs::symlink(outside.path().join("build.wasm"), dir.join(link)).unwrap();
+            let before = nested_package_bytes(&dir);
+            let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+            let err = host.remove("linked").expect_err(label);
+            assert!(
+                matches!(&err, PluginError::UnadmittedPackage { reason, .. } if *reason == format!("it holds files an install never writes, such as '{expected}'")),
+                "{label}: {err}"
+            );
+            assert_eq!(nested_package_bytes(&dir), before, "{label}");
+            assert!(
+                std::fs::symlink_metadata(dir.join(link))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        assert_eq!(
+            std::fs::read(outside.path().join("build.wasm")).unwrap(),
+            b"\0asm outside"
+        );
+    }
+
     /// A manifest-less directory is deleted only when it is empty. Every
     /// installer wrote `manifest.toml` right after creating the directory, so
     /// one that holds anything, or whose `manifest.toml` is not a file, was
@@ -4178,12 +4500,14 @@ capabilities = ["tool"]
     }
 
     /// Recovery judges a claimed package through the same walk. A FIFO payload
-    /// is contents admission rejects, so `remove` deletes the package instead
-    /// of blocking while it holds the package lock, and the next install takes
-    /// the lock at once.
+    /// fails admission at once instead of blocking `remove` while it holds the
+    /// package lock. No install writes a FIFO, so the package is kept, and the
+    /// next install takes the lock at once.
     #[cfg(unix)]
     #[test]
-    fn remove_recovers_a_package_whose_payload_is_a_fifo_without_blocking() {
+    fn remove_keeps_a_package_whose_payload_is_a_fifo_without_blocking() {
+        use std::os::unix::fs::FileTypeExt;
+
         let plugins = tempdir().unwrap();
         let package = plugins.path().join("piped");
         std::fs::create_dir(&package).unwrap();
@@ -4197,11 +4521,20 @@ capabilities = ["tool"]
                 .unwrap()
                 .remove("piped")
         });
-        assert!(removed.is_ok(), "{removed:?}");
-        assert!(!package.exists());
+        assert!(
+            matches!(&removed, Err(PluginError::UnadmittedPackage { reason, .. }) if reason == "it holds files an install never writes, such as 'plugin.wasm'"),
+            "{removed:?}"
+        );
+        assert!(package.join("manifest.toml").is_file());
+        assert!(
+            std::fs::symlink_metadata(package.join("plugin.wasm"))
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
 
         let source = tempdir().unwrap();
-        write_tool_source(source.path(), "piped", b"\0asm reinstall");
+        write_tool_source(source.path(), "other", b"\0asm other");
         let plugins_dir = plugins.path().to_path_buf();
         let source_dir = source.path().to_str().unwrap().to_owned();
         let installed = without_blocking(move || {
@@ -4209,7 +4542,7 @@ capabilities = ["tool"]
                 .unwrap()
                 .install(&source_dir)
         });
-        assert_eq!(installed.unwrap(), "piped");
+        assert_eq!(installed.unwrap(), "other");
     }
 
     #[test]
