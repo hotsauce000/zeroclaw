@@ -321,7 +321,8 @@ fn an_empty_claim_that_gains_an_entry_after_its_verdict_is_kept() {
 }
 
 /// When the package is deleted but its transaction cannot be finished, the
-/// remove reports the transaction entry it kept rather than a bare I/O error.
+/// remove reports the transaction entry it kept rather than a bare I/O error,
+/// and so does a retry that finishes a delete an earlier remove had begun.
 #[test]
 fn a_remove_that_deleted_but_could_not_finish_names_the_entry() {
     let root = tempfile::tempdir().unwrap();
@@ -338,6 +339,65 @@ fn a_remove_that_deleted_but_could_not_finish_names_the_entry() {
         "{output}"
     );
     assert!(!root.path().join("race").exists());
+
+    let root = tempfile::tempdir().unwrap();
+    broken(root.path());
+    Paused::start(root.path(), "delete-marked", "remove").crash();
+    let claim = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|p| p.contains("recovering-v1"))
+        .unwrap();
+    std::fs::write(root.path().join(&claim).join("stray"), b"stray").unwrap();
+    let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+    let retried = host.remove("race");
+    assert!(
+        matches!(&retried, Err(PluginError::RecoveryRetained { path, .. }) if path.contains(&claim)),
+        "{retried:?}"
+    );
+    assert!(!root.path().join(&claim).join("package").exists());
+}
+
+/// A refusal that put the package back but could not clear its transaction
+/// entry names that entry, and still says why the package was kept.
+#[test]
+fn a_refusal_that_put_the_package_back_but_could_not_finish_names_the_entry() {
+    let root = tempfile::tempdir().unwrap();
+    broken(root.path());
+    let paused = Paused::start(root.path(), "before-restore", "healthy-late");
+    let claim = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|p| p.contains("recovering-v1"))
+        .unwrap();
+    std::fs::write(root.path().join(&claim).join("stray"), b"stray").unwrap();
+    let output = paused.resume();
+    assert!(
+        output.contains("RecoveryRetained")
+            && output.contains(&claim)
+            && output.contains("admission accepts this package"),
+        "{output}"
+    );
+    assert!(root.path().join("race/manifest.toml").is_file());
+}
+
+/// An install that published its package but could not clear its stage has
+/// still installed it: only the stage's entry is left, for the stage sweep.
+#[test]
+fn an_install_that_published_but_could_not_clear_its_stage_succeeds() {
+    let root = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    tests::write_tool_source(source.path(), "race", b"\0asm installed");
+    let paused = Paused::start_install(root.path(), "install-published", source.path());
+    let stage = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|p| p.contains("installing-v1"))
+        .unwrap();
+    std::fs::write(root.path().join(&stage).join("stray"), b"stray").unwrap();
+    let output = paused.resume();
+    assert!(output.contains("RESULT:Ok(\"race\")"), "{output}");
+    assert_eq!(
+        std::fs::read(root.path().join("race/plugin.wasm")).unwrap(),
+        b"\0asm installed"
+    );
 }
 
 #[test]

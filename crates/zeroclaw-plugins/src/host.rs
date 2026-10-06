@@ -484,7 +484,15 @@ impl PluginHost {
                 reason: error.to_string(),
             });
         }
-        tx.finish(root)?;
+        #[cfg(test)]
+        recovery::pause("install-published");
+        // The package is installed. Only the stage's lease and entry are left,
+        // and the sweep of abandoned stages clears or reports an entry left
+        // behind, so failing to finish the stage does not fail the install. A
+        // namespace change still refuses.
+        if let Err(error @ PluginError::NamespaceChanged(_)) = tx.finish(root) {
+            return Err(error);
+        }
 
         let installed_name = manifest.name.clone();
         self.loaded.insert(
@@ -653,17 +661,9 @@ impl PluginHost {
                 path: root.retained_path(&tx),
                 reason: error.to_string(),
             })?;
-        // The package is gone by now; only the transaction's lease and entry
-        // remain, so a failure here names the entry rather than claiming the
-        // remove failed.
-        let entry = self.plugins_dir.join(&tx.entry).display().to_string();
         #[cfg(test)]
         recovery::pause("package-deleted");
-        tx.finish(root)
-            .map_err(|error| PluginError::RecoveryRetained {
-                path: entry,
-                reason: error.to_string(),
-            })?;
+        finish_naming_entry(&self.plugins_dir, root, tx)?;
         Ok(retained)
     }
 
@@ -730,7 +730,19 @@ impl PluginHost {
                 reason: format!("{reason}; restoration refused: {error}"),
             });
         }
-        tx.finish(root)?;
+        // The package is back at its name, so only the entry can be left, and
+        // the error still says why the package was kept.
+        if let Err(error) = finish_naming_entry(&self.plugins_dir, root, tx) {
+            return Err(match error {
+                PluginError::RecoveryRetained { path, reason: left } => {
+                    PluginError::RecoveryRetained {
+                        path,
+                        reason: format!("{reason}; {left}"),
+                    }
+                }
+                other => other,
+            });
+        }
         Err(PluginError::UnadmittedPackage {
             name: name.into(),
             reason,
@@ -774,13 +786,13 @@ impl PluginHost {
                         path: root.retained_path(&tx),
                         reason: error.to_string(),
                     })?;
-                tx.finish(root)?;
+                finish_naming_entry(&self.plugins_dir, root, tx)?;
                 finished = true;
                 continue;
             }
             match tx.dir.symlink_metadata(recovery::PACKAGE) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    tx.finish(root)?;
+                    finish_naming_entry(&self.plugins_dir, root, tx)?;
                 }
                 Err(error) => return Err(error.into()),
                 Ok(_) => {
@@ -792,7 +804,7 @@ impl PluginHost {
                             reason: error.to_string(),
                         });
                     }
-                    tx.finish(root)?;
+                    finish_naming_entry(&self.plugins_dir, root, tx)?;
                 }
             }
         }
@@ -1957,6 +1969,27 @@ fn opened_root<'a>(
     }
     let root = recovery::Root::open(plugins_dir)?;
     Ok(cell.get_or_init(|| root))
+}
+
+/// Finish `tx` once its package is gone or back at its name. Only the
+/// transaction's entry is left then, so a failure names that entry as
+/// [`PluginError::RecoveryRetained`] instead of failing the work already done
+/// with a bare I/O error. A namespace change still refuses as one.
+fn finish_naming_entry(
+    plugins_dir: &Path,
+    root: &recovery::Root,
+    tx: recovery::Transaction,
+) -> Result<(), PluginError> {
+    let entry = plugins_dir.join(&tx.entry).display().to_string();
+    tx.finish(root).map_err(|error| match error {
+        PluginError::NamespaceChanged(_) => error,
+        error => PluginError::RecoveryRetained {
+            path: entry,
+            reason: format!(
+                "only the transaction entry is left, and it could not be removed: {error}"
+            ),
+        },
+    })
 }
 
 /// Why recovery keeps a directory it claimed, worded for the operator.
