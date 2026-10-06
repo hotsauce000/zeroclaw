@@ -851,6 +851,7 @@ cli-config-updated = {$path} を更新しました。
 cli-config-review-hint = `zeroclaw config list` を実行して確認し、必須フィールドを設定してください。
 cli-config-catalog-unavailable-manual = {"  "}⚠ {$provider} のカタログを利用できません（{$error}）。モデル ID を手動で入力してください。
 model-switch-catalog-failed = 設定済みプロバイダープロファイル {$provider} のカタログを読み込めませんでした: {$error}
+model-switch-provider-not-allowed = 有効なエフォートルーティングポリシーでは、{$provider} へのモデル切り替えは許可されていません。
 cli-config-backed-up = {$path} にバックアップしました
 cli-plugin-name-version = プラグイン: {$name} v{$version}
 cli-plugin-description = 説明: {$desc}

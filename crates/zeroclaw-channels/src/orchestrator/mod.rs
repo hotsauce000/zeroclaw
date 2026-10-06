@@ -338,7 +338,8 @@ struct ChannelRouteSelection {
     model_provider: String,
     model: String,
     /// True when this selection came from config and remains eligible for
-    /// automatic classification. `/model` and `model_switch` set it false.
+    /// automatic classification. Operator `/model` overrides set it false;
+    /// model-issued switches preserve the current mode.
     automatic: bool,
     /// Route-specific API key override. When set, this credential is passed
     /// directly to the requested provider instead of the alias entry's key.
@@ -3115,6 +3116,17 @@ fn apply_model_ref(
     } else {
         sel.model = model.to_string();
     }
+}
+
+fn apply_model_issued_route_switch(
+    route: &mut ChannelRouteSelection,
+    model_provider: String,
+    model: String,
+    api_key: Option<String>,
+) {
+    route.model_provider = model_provider;
+    route.model = model;
+    route.api_key = api_key;
 }
 
 fn shadow_note(
@@ -10241,11 +10253,12 @@ async fn process_channel_message_body(
                         // original provider/model pair instead of a
                         // half-switched state.
                         active_model_provider = new_prov;
-                        route.model_provider = resolved_model_provider;
-                        route.model = new_model;
-                        route.automatic = false;
-                        route.api_key = resolved_api_key;
-                        attempt_allowlist = None;
+                        apply_model_issued_route_switch(
+                            &mut route,
+                            resolved_model_provider,
+                            new_model,
+                            resolved_api_key,
+                        );
                         context_limits = resolve_channel_context_limits(
                             runtime_defaults.config.as_ref(),
                             ctx.agent_alias.as_str(),
@@ -10260,7 +10273,7 @@ async fn process_channel_message_body(
                             ChannelRouteSelection {
                                 model_provider: route.model_provider.clone(),
                                 model: route.model.clone(),
-                                automatic: false,
+                                automatic: route.automatic,
                                 api_key: route.api_key.clone(),
                             },
                             &runtime_defaults,
@@ -40796,6 +40809,88 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             get_route_selection(&ctx, &msg, &sender_key, &snapshot).automatic,
             "restoring automatic selection should clear the session override"
+        );
+    }
+
+    #[test]
+    fn model_issued_switch_preserves_route_ownership_for_next_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "default-model",
+        );
+        let msg = scope_test_msg("alice", "chan", None);
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+
+        let mut automatic = default_route_selection_from_snapshot(&snapshot);
+        apply_model_issued_route_switch(
+            &mut automatic,
+            "openrouter.default".into(),
+            "switched-model".into(),
+            None,
+        );
+        set_route_selection(&ctx, &sender_key, automatic, &snapshot);
+        assert!(
+            get_route_selection(&ctx, &msg, &sender_key, &snapshot).automatic,
+            "a model-issued switch during automatic routing must remain eligible for effort classification on the next turn"
+        );
+
+        let mut manual = default_route_selection_from_snapshot(&snapshot);
+        manual.automatic = false;
+        apply_model_issued_route_switch(
+            &mut manual,
+            "openrouter.default".into(),
+            "manual-switched-model".into(),
+            None,
+        );
+        set_route_selection(&ctx, &sender_key, manual, &snapshot);
+        assert!(
+            !get_route_selection(&ctx, &msg, &sender_key, &snapshot).automatic,
+            "a model-issued switch during an operator override must not restore automatic routing"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_session_auto_restores_automatic_route() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "default-model",
+        );
+        let mut msg = scope_test_msg("alice", "chan", None);
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+        set_route_selection(
+            &ctx,
+            &sender_key,
+            ChannelRouteSelection {
+                model_provider: "anthropic.work".into(),
+                model: "claude-sonnet".into(),
+                automatic: false,
+                api_key: None,
+            },
+            &snapshot,
+        );
+        msg.content = "/model auto".into();
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        assert!(handle_runtime_command_if_needed(&ctx, &msg, Some(&target)).await);
+
+        let restored = get_route_selection(&ctx, &msg, &sender_key, &snapshot);
+        assert!(restored.automatic);
+        assert_eq!(restored.model_provider, "openrouter.default");
+        assert_eq!(restored.model, "default-model");
+        assert!(
+            !ctx.route_overrides
+                .lock()
+                .unwrap()
+                .contains_key(&sender_key),
+            "restoring automatic routing should remove the per-sender override"
         );
     }
 

@@ -959,6 +959,7 @@ cli-config-updated = {$path} updated.
 cli-config-review-hint = Run `zeroclaw config list` to review, then set required fields.
 cli-config-catalog-unavailable-manual = {"  "}⚠ Catalog for {$provider} is unavailable ({$error}); enter the model ID manually.
 model-switch-catalog-failed = Could not load catalog for configured provider profile {$provider}: {$error}
+model-switch-provider-not-allowed = Model switch to {$provider} is not allowed by the active effort-routing policy.
 cli-config-backed-up = Backed up to {$path}
 cli-plugin-name-version = Plugin: {$name} v{$version}
 cli-plugin-description = Description: {$desc}

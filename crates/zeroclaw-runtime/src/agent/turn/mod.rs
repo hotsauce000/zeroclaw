@@ -52,7 +52,10 @@ pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ServedRoute, ServedRouteSink, ToolLoopCancelled,
     is_model_switch_requested, is_tool_loop_cancelled,
 };
-pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
+pub(crate) use outcome::{
+    current_model_switch_state, model_switch_provider_allowed,
+    scope_model_switch_provider_allowlist, scope_model_switch_state,
+};
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
@@ -2441,6 +2444,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     .await
                 }
             });
+        let execution = scope_model_switch_provider_allowlist(
+            knobs.provider_attempt_allowlist.clone(),
+            execution,
+        );
         let execution_result = match shared_budget.clone() {
             Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
             None => execution.await,

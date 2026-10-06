@@ -3477,7 +3477,6 @@ impl Agent {
                 self.model_route_resolver = new_route_resolver;
                 self.model_provider_name = new_model_provider;
                 self.model_name = new_model.clone();
-                self.automatic_model_routing = false;
                 Some(new_model)
             }
             Err(e) => {
@@ -4301,7 +4300,7 @@ impl Agent {
                     new_messages: Vec::new(),
                 })?;
         let mut effective_model = model_selection.selector;
-        let mut attempt_allowlist = model_selection.allowed_provider_refs;
+        let attempt_allowlist = model_selection.allowed_provider_refs;
         let mut selected_route = self.model_route_resolver.resolve(&effective_model);
         let turn_id = Self::new_turn_id();
         let mut committed_response = String::new();
@@ -4862,7 +4861,6 @@ impl Agent {
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
                         effective_model = new_effective_model;
-                        attempt_allowlist = None;
                         selected_route = self.model_route_resolver.resolve(&effective_model);
                         continue;
                     }
@@ -17208,6 +17206,10 @@ model_provider = "custom.only"
         assert_eq!(
             agent.model_name, "llama3",
             "model_name must reflect the switched model after success"
+        );
+        assert!(
+            agent.automatic_model_routing,
+            "a model-issued switch must preserve automatic routing for the next turn"
         );
     }
 

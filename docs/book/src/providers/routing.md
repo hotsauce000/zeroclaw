@@ -52,9 +52,9 @@ The first implementation uses ZeroClaw's deterministic complexity estimator. It 
 
 The routing decision is per turn. Logs include the selected target, complexity tier, escalation policy, and message length, but not the message text. A local decision restricts provider attempts to the configured local provider, including stream-to-nonstream recovery, so an availability fallback cannot silently disclose that turn to cloud. A cloud decision permits the configured local and cloud provider references.
 
-Explicit choices take precedence over automatic effort routing. CLI `--provider` or `--model` overrides bypass it. A channel `/model <model-or-hint>` choice and an in-turn `model_switch` remain selected instead of being replaced on the next classifiable turn. Use `/model auto` to clear the sender-session choice and restore configured automatic routing; scoped `/model --user auto` and `/model --agent auto` clear those scoped choices. Structured session provider or model overrides remain explicit for that session.
+Operator choices take precedence over automatic effort routing. CLI `--provider` or `--model` overrides bypass it. A channel `/model <model-or-hint>` choice remains selected instead of being replaced on the next classifiable turn. Use `/model auto` to clear the sender-session choice and restore configured automatic routing; scoped `/model --user auto` and `/model --agent auto` clear those scoped choices. Structured session provider or model overrides remain explicit for that session. A model-issued `model_switch` remains subject to the active effort policy and can select only a provider profile allowed for that turn.
 
-This slice does not provide an ask-before-cloud mode, escalation-frequency limits, or a separate cost cap. Use `cloud_escalation = "never"` when cloud egress is not allowed, and use provider budgets and normal observability for cost controls.
+This slice does not provide an ask-before-cloud mode, escalation-frequency limits, or a separate cost cap. Use `cloud_escalation = "never"` to keep effort-routed model-provider attempts local, and use provider budgets and normal observability for cost controls. This setting does not govern separate network or provider calls made by unrelated tools or media preprocessing.
 
 Effort routing has a deliberately narrow relationship to adjacent work:
 

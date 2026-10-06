@@ -1772,7 +1772,7 @@ pub async fn run(
 
         // ── Resolve model_provider ─────────────────────────────────────────
         let agent_provider_ref = agent_provider_composite(&config, agent_alias);
-        let mut automatic_model_routing = provider_override.is_none() && model_override.is_none();
+        let automatic_model_routing = provider_override.is_none() && model_override.is_none();
         let mut provider_name = provider_override
             .as_deref()
             .or(agent_provider_ref.as_deref())
@@ -2433,14 +2433,19 @@ pub async fn run(
                                 &new_model_provider,
                                 agent_model_provider,
                             );
+                            let switch_provider_config = active_effort_provider_refs
+                                .as_deref()
+                                .map(|allowed| effort_scoped_provider_config(&config, allowed));
+                            let switch_provider_config =
+                                switch_provider_config.as_deref().unwrap_or(&config);
                             model_provider =
                                 zeroclaw_providers::create_routed_model_provider_with_options(
-                                    &config,
+                                    switch_provider_config,
                                     &new_model_provider,
                                     switch_api_key.as_deref(),
                                     switch_uri.as_deref(),
                                     &config.reliability,
-                                    &config.model_routes,
+                                    &switch_provider_config.model_routes,
                                     &new_model,
                                     &zeroclaw_providers::options_for_provider_ref(
                                         &config,
@@ -2454,7 +2459,6 @@ pub async fn run(
 
                             provider_name = new_model_provider;
                             model_name = new_model;
-                            active_effort_provider_refs = None;
                             context_limits = config.resolved_context_limits_for_route(
                                 agent_alias,
                                 &provider_name,
@@ -3099,14 +3103,19 @@ pub async fn run(
                                     &new_model_provider,
                                     agent_model_provider,
                                 );
+                                let switch_provider_config = active_effort_provider_refs
+                                    .as_deref()
+                                    .map(|allowed| effort_scoped_provider_config(&config, allowed));
+                                let switch_provider_config =
+                                    switch_provider_config.as_deref().unwrap_or(&config);
                                 model_provider =
                                     zeroclaw_providers::create_routed_model_provider_with_options(
-                                        &config,
+                                        switch_provider_config,
                                         &new_model_provider,
                                         switch_api_key2.as_deref(),
                                         switch_uri2.as_deref(),
                                         &config.reliability,
-                                        &config.model_routes,
+                                        &switch_provider_config.model_routes,
                                         &new_model,
                                         &zeroclaw_providers::options_for_provider_ref(
                                             &config,
@@ -3120,8 +3129,6 @@ pub async fn run(
 
                                 provider_name = new_model_provider;
                                 model_name = new_model;
-                                automatic_model_routing = false;
-                                active_effort_provider_refs = None;
                                 context_limits = config.resolved_context_limits_for_route(
                                     agent_alias,
                                     &provider_name,
@@ -22315,9 +22322,10 @@ Let me check the result."#;
 
         let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
 
-        // First response: a native tool call requesting a switch to
-        // `ollama.switched`. Second response (only reachable once the
-        // switched-to provider is actually in use): plain "done".
+        // The simple prompt stays on the local route. First response: a native
+        // tool call requesting a different model on that allowed provider.
+        // Second response (only reachable once the switched-to model is
+        // actually in use): plain "done".
         type CallCount = Arc<std::sync::atomic::AtomicUsize>;
 
         async fn respond_switch_then_done(
@@ -22334,7 +22342,7 @@ Let me check the result."#;
                                 "type": "function",
                                 "function": {
                                     "name": "model_switch",
-                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.switched\",\"model\":\"switched-model\"}"
+                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.default\",\"model\":\"switched-model\"}"
                                 }
                             }]
                         }
@@ -22482,9 +22490,362 @@ Let me check the result."#;
             .expect("AgentEnd for the switch agent should be present");
         assert_eq!(
             end_route,
-            ("ollama.switched".to_string(), "switched-model".to_string()),
+            ("ollama.default".to_string(), "switched-model".to_string()),
             "AgentEnd must be attributed to the switched-TO route (set_model_route), \
              not the original one, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_never_effort_policy_blocks_model_issued_cloud_switch() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, ModelRouteConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        type CallCount = Arc<std::sync::atomic::AtomicUsize>;
+
+        async fn local_switch_then_done(State(calls): State<CallCount>) -> Json<serde_json::Value> {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-blocked-cloud-switch",
+                                "type": "function",
+                                "function": {
+                                    "name": "model_switch",
+                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.cloud\",\"model\":\"cloud-model\"}"
+                                }
+                            }]
+                        }
+                    }]
+                }))
+            } else {
+                Json(serde_json::json!({
+                    "choices": [{"message": {"content": "done"}}]
+                }))
+            }
+        }
+
+        async fn cloud_response(State(calls): State<CallCount>) -> Json<serde_json::Value> {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "cloud must not be called"}}]
+            }))
+        }
+
+        let local_calls: CallCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let local_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local test listener should bind");
+        let local_addr = local_listener
+            .local_addr()
+            .expect("local listener should have address");
+        let local_app = Router::new()
+            .route("/v1/chat/completions", post(local_switch_then_done))
+            .with_state(Arc::clone(&local_calls));
+        let local_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(local_listener, local_app)
+                .await
+                .expect("local test server should run");
+        });
+
+        let cloud_calls: CallCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cloud_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("cloud test listener should bind");
+        let cloud_addr = cloud_listener
+            .local_addr()
+            .expect("cloud listener should have address");
+        let cloud_app = Router::new()
+            .route("/v1/chat/completions", post(cloud_response))
+            .with_state(Arc::clone(&cloud_calls));
+        let cloud_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(cloud_listener, cloud_app)
+                .await
+                .expect("cloud test server should run");
+        });
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        for (alias, model, uri) in [
+            ("local", "local-model", format!("http://{local_addr}")),
+            ("cloud", "cloud-model", format!("http://{cloud_addr}")),
+        ] {
+            config.providers.models.ollama.insert(
+                alias.to_string(),
+                OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        timeout_secs: Some(5),
+                        uri: Some(uri),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        config.agents.insert(
+            "never-cloud-switch-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.local".into(),
+                risk_profile: "default".into(),
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            },
+        );
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "ollama.local".into(),
+                model: "local-model".into(),
+                api_key: None,
+            },
+            ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "ollama.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            },
+        ];
+        config.runtime_profiles.insert(
+            "effort".to_string(),
+            RuntimeProfileConfig {
+                effort_routing: Some(EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: CloudEscalationPolicy::Never,
+                }),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let result = super::run(
+            config,
+            "never-cloud-switch-agent",
+            Some("please switch models".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        local_server.abort();
+        cloud_server.abort();
+
+        assert_eq!(
+            result.expect("local provider should complete the turn"),
+            "done"
+        );
+        assert_eq!(
+            local_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the local provider should receive the initial call and the post-tool continuation"
+        );
+        assert_eq!(
+            cloud_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a model-issued switch must not reach the cloud provider under cloud_escalation = never"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_never_effort_policy_keeps_cloud_fallback_out_after_local_switch() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::StatusCode,
+            response::{IntoResponse, Response},
+            routing::post,
+        };
+        use tokio::net::TcpListener;
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, ModelRouteConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        type CallCount = Arc<std::sync::atomic::AtomicUsize>;
+
+        async fn local_switch_then_fail(State(calls): State<CallCount>) -> Response {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                return Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-local-switch-before-failure",
+                                "type": "function",
+                                "function": {
+                                    "name": "model_switch",
+                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.local\",\"model\":\"switched-local-model\"}"
+                                }
+                            }]
+                        }
+                    }]
+                }))
+                .into_response();
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "local failure after switch"})),
+            )
+                .into_response()
+        }
+
+        async fn cloud_response(State(calls): State<CallCount>) -> Json<serde_json::Value> {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "cloud must not be called"}}]
+            }))
+        }
+
+        let local_calls: CallCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let local_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local test listener should bind");
+        let local_addr = local_listener
+            .local_addr()
+            .expect("local listener should have address");
+        let local_app = Router::new()
+            .route("/v1/chat/completions", post(local_switch_then_fail))
+            .with_state(Arc::clone(&local_calls));
+        let local_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(local_listener, local_app)
+                .await
+                .expect("local test server should run");
+        });
+
+        let cloud_calls: CallCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cloud_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("cloud test listener should bind");
+        let cloud_addr = cloud_listener
+            .local_addr()
+            .expect("cloud listener should have address");
+        let cloud_app = Router::new()
+            .route("/v1/chat/completions", post(cloud_response))
+            .with_state(Arc::clone(&cloud_calls));
+        let cloud_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(cloud_listener, cloud_app)
+                .await
+                .expect("cloud test server should run");
+        });
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        config.providers.models.ollama.insert(
+            "local".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("local-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{local_addr}")),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "ollama.cloud",
+                    )],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "cloud".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("cloud-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{cloud_addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "never-cloud-fallback-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.local".into(),
+                risk_profile: "default".into(),
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            },
+        );
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "ollama.local".into(),
+                model: "local-model".into(),
+                api_key: None,
+            },
+            ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "ollama.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            },
+        ];
+        config.runtime_profiles.insert(
+            "effort".to_string(),
+            RuntimeProfileConfig {
+                effort_routing: Some(EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: CloudEscalationPolicy::Never,
+                }),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+        config.reliability.provider_retries = 0;
+
+        let result = super::run(
+            config,
+            "never-cloud-fallback-agent",
+            Some("please switch local models".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        local_server.abort();
+        cloud_server.abort();
+
+        assert!(
+            result.is_err(),
+            "the turn should surface the local failure instead of escaping to cloud"
+        );
+        assert_eq!(
+            local_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the local provider should receive the initial call and the post-switch failure"
+        );
+        assert_eq!(
+            cloud_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a rebuild after an accepted local switch must keep configured cloud fallback outside the never-policy boundary"
         );
     }
 
