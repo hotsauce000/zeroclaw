@@ -4789,6 +4789,7 @@ async fn run_plugin_update(
     }
 
     let mut host = plugin_host_with_configured_security(config)?;
+    let mut noted_displaced = false;
     let targets: Vec<(String, Option<String>)> = if all {
         // A package an interrupted update displaced is not put back by
         // `--all`: only naming it does, so a copy is never restored unasked.
@@ -4798,6 +4799,7 @@ async fn run_plugin_update(
                 "{}",
                 plugin_displaced_note(config, &name, registry.as_deref())
             );
+            noted_displaced = true;
         }
         host.list_plugins()
             .into_iter()
@@ -4813,7 +4815,10 @@ async fn run_plugin_update(
             .collect::<Result<_>>()?
     };
     if targets.is_empty() {
-        println!("{}", t("cli-plugins-none", "No plugins installed."));
+        // When packages are displaced, the notes above already say what to do.
+        if !noted_displaced {
+            println!("{}", t("cli-plugins-none", "No plugins installed."));
+        }
         return Ok(());
     }
 
