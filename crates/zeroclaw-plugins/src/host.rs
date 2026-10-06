@@ -20,7 +20,8 @@ const SKILLS_SUBDIR: &str = "skills";
 /// Manages the lifecycle of WASM plugins.
 pub struct PluginHost {
     plugins_dir: PathBuf,
-    recovery_root: recovery::Root,
+    /// Opened on first use; see [`opened_root`].
+    recovery_root: std::sync::OnceLock<recovery::Root>,
     loaded: HashMap<String, LoadedPlugin>,
     signature_mode: SignatureMode,
     trusted_publisher_keys: Vec<String>,
@@ -142,7 +143,7 @@ impl PluginHost {
 
         let mut host = Self {
             plugins_dir: plugins_dir.to_path_buf(),
-            recovery_root: recovery::Root::open(plugins_dir)?,
+            recovery_root: std::sync::OnceLock::new(),
             loaded: HashMap::new(),
             signature_mode,
             trusted_publisher_keys,
@@ -150,6 +151,11 @@ impl PluginHost {
 
         host.discover()?;
         Ok(host)
+    }
+
+    /// The plugins root, opening it if no package operation has yet.
+    fn root(&self) -> Result<&recovery::Root, PluginError> {
+        opened_root(&self.recovery_root, &self.plugins_dir)
     }
 
     pub fn parse_signature_mode(mode: &str) -> Option<SignatureMode> {
@@ -435,20 +441,16 @@ impl PluginHost {
 
         #[cfg(test)]
         recovery::pause("install-before-lock");
-        let _guard = self.recovery_root.lock()?;
+        let root = opened_root(&self.recovery_root, &self.plugins_dir)?;
+        let _guard = root.lock()?;
         let dest_dir = self.plugins_dir.join(&manifest.name);
-        match self.recovery_root.dir.symlink_metadata(&manifest.name) {
+        match root.dir.symlink_metadata(&manifest.name) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
             Ok(_) => {
                 return Err(PluginError::UnadmittedPackage {
                     name: manifest.name.clone(),
-                    reason: if self
-                        .recovery_root
-                        .dir
-                        .symlink_metadata(&manifest.name)?
-                        .is_dir()
-                    {
+                    reason: if root.dir.symlink_metadata(&manifest.name)?.is_dir() {
                         "an existing directory occupies the destination".into()
                     } else {
                         "it is not a directory".into()
@@ -456,9 +458,7 @@ impl PluginHost {
                 });
             }
         }
-        let tx = self
-            .recovery_root
-            .transaction(&manifest.name, "installing")?;
+        let tx = root.transaction(&manifest.name, "installing")?;
         tx.dir.create_dir(recovery::PACKAGE)?;
         let package = tx.dir.open_dir(recovery::PACKAGE)?;
         let staged = write_package(
@@ -472,19 +472,19 @@ impl PluginHost {
             recovery::clear_owned(&package)?;
             drop(package);
             tx.dir.remove_dir(recovery::PACKAGE)?;
-            tx.finish(&self.recovery_root)?;
+            tx.finish(root)?;
             return Err(error);
         }
         drop(package);
         // Publication never replaces an entry that holds files, even one an
         // unrelated writer put there; see `recovery::rename_new`.
-        if let Err(error) = tx.publish(&self.recovery_root, &manifest.name) {
+        if let Err(error) = tx.publish(root, &manifest.name) {
             return Err(PluginError::RecoveryRetained {
-                path: self.recovery_root.retained_path(&tx),
+                path: root.retained_path(&tx),
                 reason: error.to_string(),
             });
         }
-        tx.finish(&self.recovery_root)?;
+        tx.finish(root)?;
 
         let installed_name = manifest.name.clone();
         self.loaded.insert(
@@ -529,7 +529,8 @@ impl PluginHost {
     pub fn remove_with_report(&mut self, name: &str) -> Result<Vec<PathBuf>, PluginError> {
         #[cfg(test)]
         recovery::pause("remove-before-lock");
-        let _guard = self.recovery_root.lock()?;
+        let root = opened_root(&self.recovery_root, &self.plugins_dir)?;
+        let _guard = root.lock()?;
         if self.loaded.remove(name).is_some() {
             // Existing loaded-package semantics are not the recovery classifier.
             let plugin_dir = self.plugins_dir.join(name);
@@ -569,10 +570,10 @@ impl PluginHost {
             })?;
         #[cfg(test)]
         recovery::pause("before-claim");
-        let tx = self.recovery_root.transaction(name, "recovering")?;
+        let tx = root.transaction(name, "recovering")?;
         #[cfg(test)]
         recovery::pause("claim-created");
-        tx.claim(&self.recovery_root, name)?;
+        tx.claim(root, name)?;
         #[cfg(test)]
         recovery::pause("after-claim");
         let claimed = match tx.dir.open_dir(recovery::PACKAGE) {
@@ -605,15 +606,14 @@ impl PluginHost {
         let retained =
             self.remove_stale_staging(name)
                 .map_err(|error| PluginError::RecoveryRetained {
-                    path: self.recovery_root.retained_path(&tx),
+                    path: root.retained_path(&tx),
                     reason: error.to_string(),
                 })?;
         #[cfg(test)]
         recovery::pause("before-delete");
-        self.recovery_root
-            .check()
+        root.check()
             .map_err(|error| PluginError::RecoveryRetained {
-                path: self.recovery_root.retained_path(&tx),
+                path: root.retained_path(&tx),
                 reason: error.to_string(),
             })?;
         // Admission is about these bytes, not a verdict retained across stage IO.
@@ -633,13 +633,13 @@ impl PluginHost {
             // is a single step.
             tx.mark_deleting()
                 .map_err(|error| PluginError::RecoveryRetained {
-                    path: self.recovery_root.retained_path(&tx),
+                    path: root.retained_path(&tx),
                     reason: error.to_string(),
                 })?;
             #[cfg(test)]
             recovery::pause("delete-marked");
             recovery::clear_owned(&claimed).map_err(|error| PluginError::RecoveryRetained {
-                path: self.recovery_root.retained_path(&tx),
+                path: root.retained_path(&tx),
                 reason: error.to_string(),
             })?;
         }
@@ -650,7 +650,7 @@ impl PluginHost {
             .remove_dir(recovery::PACKAGE)
             .and_then(|()| tx.remove_mark().map_err(std::io::Error::other))
             .map_err(|error| PluginError::RecoveryRetained {
-                path: self.recovery_root.retained_path(&tx),
+                path: root.retained_path(&tx),
                 reason: error.to_string(),
             })?;
         // The package is gone by now; only the transaction's lease and entry
@@ -659,7 +659,7 @@ impl PluginHost {
         let entry = self.plugins_dir.join(&tx.entry).display().to_string();
         #[cfg(test)]
         recovery::pause("package-deleted");
-        tx.finish(&self.recovery_root)
+        tx.finish(root)
             .map_err(|error| PluginError::RecoveryRetained {
                 path: entry,
                 reason: error.to_string(),
@@ -715,6 +715,7 @@ impl PluginHost {
         tx: recovery::Transaction,
         reason: PluginError,
     ) -> Result<T, PluginError> {
+        let root = self.root()?;
         // Recovery's own reason reads as written; any other error keeps its
         // description.
         let reason = match reason {
@@ -723,13 +724,13 @@ impl PluginHost {
         };
         #[cfg(test)]
         recovery::pause("before-restore");
-        if let Err(error) = tx.publish(&self.recovery_root, name) {
+        if let Err(error) = tx.publish(root, name) {
             return Err(PluginError::RecoveryRetained {
-                path: self.recovery_root.retained_path(&tx),
+                path: root.retained_path(&tx),
                 reason: format!("{reason}; restoration refused: {error}"),
             });
         }
-        tx.finish(&self.recovery_root)?;
+        tx.finish(root)?;
         Err(PluginError::UnadmittedPackage {
             name: name.into(),
             reason,
@@ -740,8 +741,9 @@ impl PluginHost {
     /// delete it had begun, or put back a package it had not. Returns whether
     /// it finished a delete.
     fn retry_claims(&self, name: &str) -> Result<bool, PluginError> {
+        let root = self.root()?;
         let mut finished = false;
-        for entry in self.recovery_root.dir.entries()? {
+        for entry in root.dir.entries()? {
             let entry = entry?;
             let Some(entry_name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
@@ -749,8 +751,8 @@ impl PluginHost {
             if !recovery::is_transaction(&entry_name, name, "recovering") {
                 continue;
             }
-            let Some(tx) = self.recovery_root.reopen_transaction(entry_name.clone())? else {
-                if self.recovery_root.remove_empty_entry(&entry_name)? {
+            let Some(tx) = root.reopen_transaction(entry_name.clone())? else {
+                if root.remove_empty_entry(&entry_name)? {
                     continue;
                 }
                 return Err(PluginError::RecoveryRetained {
@@ -763,34 +765,34 @@ impl PluginHost {
             let deleting = tx
                 .is_deleting()
                 .map_err(|error| PluginError::RecoveryRetained {
-                    path: self.recovery_root.retained_path(&tx),
+                    path: root.retained_path(&tx),
                     reason: error.to_string(),
                 })?;
             if deleting {
                 tx.finish_delete()
                     .map_err(|error| PluginError::RecoveryRetained {
-                        path: self.recovery_root.retained_path(&tx),
+                        path: root.retained_path(&tx),
                         reason: error.to_string(),
                     })?;
-                tx.finish(&self.recovery_root)?;
+                tx.finish(root)?;
                 finished = true;
                 continue;
             }
             match tx.dir.symlink_metadata(recovery::PACKAGE) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    tx.finish(&self.recovery_root)?;
+                    tx.finish(root)?;
                 }
                 Err(error) => return Err(error.into()),
                 Ok(_) => {
                     // Restore before restarting recovery; crash retry never
                     // interprets hidden placement as proof of defective contents.
-                    if let Err(error) = tx.publish(&self.recovery_root, name) {
+                    if let Err(error) = tx.publish(root, name) {
                         return Err(PluginError::RecoveryRetained {
-                            path: self.recovery_root.retained_path(&tx),
+                            path: root.retained_path(&tx),
                             reason: error.to_string(),
                         });
                     }
-                    tx.finish(&self.recovery_root)?;
+                    tx.finish(root)?;
                 }
             }
         }
@@ -824,8 +826,9 @@ impl PluginHost {
     }
 
     fn remove_stale_staging(&self, name: &str) -> Result<Vec<PathBuf>, PluginError> {
+        let root = self.root()?;
         let mut retained = Vec::new();
-        for entry in self.recovery_root.dir.entries()? {
+        for entry in root.dir.entries()? {
             let entry = entry?;
             let Some(entry_name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
@@ -844,8 +847,8 @@ impl PluginHost {
                 }
                 continue;
             }
-            let Some(tx) = self.recovery_root.reopen_transaction(entry_name.clone())? else {
-                if !self.recovery_root.remove_empty_entry(&entry_name)? {
+            let Some(tx) = root.reopen_transaction(entry_name.clone())? else {
+                if !root.remove_empty_entry(&entry_name)? {
                     retained.push(self.plugins_dir.join(entry_name));
                 }
                 continue;
@@ -856,7 +859,7 @@ impl PluginHost {
                 Ok(package) => {
                     #[cfg(test)]
                     recovery::pause("before-stage-delete");
-                    self.recovery_root.check()?;
+                    root.check()?;
                     recovery::clear_owned(&package)?;
                     drop(package);
                     tx.dir.remove_dir(recovery::PACKAGE)?;
@@ -864,7 +867,7 @@ impl PluginHost {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-            tx.finish(&self.recovery_root)?;
+            tx.finish(root)?;
         }
         Ok(retained)
     }
@@ -1937,6 +1940,23 @@ fn beyond_component_path(
         }
     }
     Ok(None)
+}
+
+/// The plugins root, opened the first time a package operation needs it. Only
+/// install and remove take the package lock, so a host that only discovers
+/// plugins never opens the root. That matters on Windows, where an open root
+/// pins the plugins directory and every ancestor against rename for as long as
+/// the host lives. The cell is a field of its own so that holding the root
+/// never borrows the rest of the host.
+fn opened_root<'a>(
+    cell: &'a std::sync::OnceLock<recovery::Root>,
+    plugins_dir: &Path,
+) -> Result<&'a recovery::Root, PluginError> {
+    if let Some(root) = cell.get() {
+        return Ok(root);
+    }
+    let root = recovery::Root::open(plugins_dir)?;
+    Ok(cell.get_or_init(|| root))
 }
 
 /// Why recovery keeps a directory it claimed, worded for the operator.
@@ -3543,7 +3563,8 @@ capabilities = ["tool"]
         std::fs::write(package.join("sentinel"), b"readable sibling must survive").unwrap();
         let before = nested_package_bytes(&package);
         let stage = host
-            .recovery_root
+            .root()
+            .unwrap()
             .transaction("locked-skill", "installing")
             .unwrap();
         stage.dir.create_dir(recovery::PACKAGE).unwrap();
@@ -4450,6 +4471,24 @@ capabilities = ["tool"]
         );
         host.remove("shared").unwrap();
         assert_eq!(dir_entries(plugins.path()), [".zeroclaw-package-lock-v1"]);
+    }
+
+    /// Only package operations open the plugins root. A host that only
+    /// discovers holds none of it, so on Windows a daemon's hosts do not pin
+    /// the plugins directory or its ancestors.
+    #[test]
+    fn only_a_package_operation_opens_the_plugins_root() {
+        let plugins = tempdir().unwrap();
+        write_unsigned_tool_plugin(plugins.path(), "listed");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert!(host.get_plugin("listed").is_some());
+        assert!(host.recovery_root.get().is_none());
+        assert!(!plugins.path().join(".zeroclaw-package-lock-v1").exists());
+        assert!(matches!(
+            host.remove("absent"),
+            Err(PluginError::NotFound(_))
+        ));
+        assert!(host.recovery_root.get().is_some());
     }
 
     /// Run `admit` on its own thread, and fail rather than hang if it blocks.

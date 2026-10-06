@@ -11,7 +11,8 @@ fn recovery_process_child() {
     let mut host = PluginHost::from_plugins_dir(Path::new(&root)).unwrap();
     if std::env::var("ZC_RECOVERY_ACTION").as_deref() == Ok("stage") {
         let tx = host
-            .recovery_root
+            .root()
+            .unwrap()
             .transaction("race", "installing")
             .unwrap();
         tx.dir.create_dir(recovery::PACKAGE).unwrap();
@@ -548,18 +549,24 @@ fn no_final_package_never_sweeps_even_provably_abandoned_stage() {
     );
 }
 
+/// A host that only discovers pins nothing. Once a package operation opens
+/// the root, its ancestors are pinned against rename until the host drops.
 #[cfg(windows)]
 #[test]
-fn windows_parent_capabilities_pin_renames_until_host_drop() {
+fn windows_parent_capabilities_pin_renames_once_the_root_is_open() {
     let parent = tempfile::tempdir().unwrap();
     let ancestor = parent.path().join("ancestor");
     std::fs::create_dir(&ancestor).unwrap();
     let root = ancestor.join("plugins");
     std::fs::create_dir(&root).unwrap();
+    let moved = parent.path().join("moved");
     let host = PluginHost::from_plugins_dir(&root).unwrap();
-    assert!(std::fs::rename(&ancestor, parent.path().join("moved")).is_err());
+    std::fs::rename(&ancestor, &moved).unwrap();
+    std::fs::rename(&moved, &ancestor).unwrap();
+    host.root().unwrap();
+    assert!(std::fs::rename(&ancestor, &moved).is_err());
     drop(host);
-    std::fs::rename(&ancestor, parent.path().join("moved")).unwrap();
+    std::fs::rename(&ancestor, &moved).unwrap();
 }
 
 #[test]
