@@ -303,7 +303,8 @@ grammar (1 to 128 ASCII letters, digits, `_`, `-`, or `.`); any other name is
 reported with the config file row to edit instead, so keep required property
 names inside it. When the entry does not exist yet, as for a binding written
 by hand, `plugin info` prints the `plugin bind` command that creates it in
-place of the keys, since `config set` resolves only an entry that exists.
+place of the keys, once per egress decision when your manifest declares
+destinations, since `config set` resolves only an entry that exists.
 
 Call `config.get` and `secrets.get` inside each operation that uses them. The
 host resolves at most one canonical revision for that call and drops its view

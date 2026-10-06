@@ -21,9 +21,12 @@
 //! Only an owning agent is added in memory, since binding an agent is
 //! deliberately outside the ceremony. So the row the ceremony writes is proved
 //! to be the row the runtime reads, and the command it prints is proved to be
-//! the one that opens the destination. The last test drives only the binary
-//! and constructs no channel: a refused install writes and publishes nothing,
-//! and a retry under a free alias binds it.
+//! the one that opens the destination. The two unix-only tests after them
+//! drive only the binary and construct no channel: the command printed for a
+//! package that declares no destination is refused and writes nothing when
+//! run as printed, and grants exactly the hosts appended to it. The last test
+//! drives only the binary and constructs no channel either: a refused install
+//! writes and publishes nothing, and a retry under a free alias binds it.
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
@@ -137,6 +140,23 @@ fn fixture_source_with_declaration() -> TempDir {
     source
 }
 
+/// A plugin source directory with the canonical fixture manifest as is: it
+/// holds `http_client` but declares no destination, so the install ceremony
+/// creates the instance's row with an empty grant and prints the command that
+/// grants the hosts the deployment uses.
+#[cfg(unix)]
+fn fixture_source_without_declaration() -> TempDir {
+    let source = TempDir::new().expect("create plugin source directory");
+    std::fs::copy(fixture(), source.path().join("channel-egress-fixture.wasm"))
+        .expect("copy channel egress component fixture");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(MANIFEST),
+        source.path().join("manifest.toml"),
+    )
+    .expect("copy the canonical fixture manifest");
+    source
+}
+
 // ── operator config ───────────────────────────────────────────────
 
 /// The instance key of channel `alias` of the fixture package installed in
@@ -219,11 +239,15 @@ fn activation_config(plugins: &TempDir, alias: &str, entry: PluginEntryConfig) -
     config.plugins.auto_discover = false;
     config.plugins.max_active_instances = 1;
     config.plugins.plugins_dir = plugins.path().display().to_string();
+    // Every field is named today; the base keeps this literal compiling when
+    // `PluginChannelConfig` gains one.
+    #[allow(clippy::needless_update)]
     config.channels.plugin.insert(
         alias.to_string(),
         PluginChannelConfig {
             package: "channel-egress-fixture".to_string(),
             enabled: true,
+            ..PluginChannelConfig::default()
         },
     );
     add_owning_agent(&mut config, alias);
@@ -438,6 +462,78 @@ fn grant_commands<'a>(stdout: &'a str, key: &str) -> Vec<&'a str> {
         })
         .filter(|command| command.contains(&grant))
         .collect()
+}
+
+/// The printed command that grants the hosts the deployment uses to the row
+/// named `key` of a package that declares none: `config set --no-interactive`
+/// for the row's `egress_hosts`, with no value, at the end of its line.
+#[cfg(unix)]
+fn undeclared_hosts_command<'a>(stdout: &'a str, key: &str) -> Option<&'a str> {
+    let path = format!(" config set --no-interactive 'plugins.entries.{key}.egress_hosts'");
+    stdout.lines().find_map(|line| {
+        let command = &line[line.find("zeroclaw --config-dir ")?..];
+        command.ends_with(&path).then_some(command)
+    })
+}
+
+/// Run `command` as an operator pastes it: through a POSIX `sh` that finds
+/// `zeroclaw` on `PATH`, with this build's directory first, and with
+/// `ZEROCLAW_CONFIG_DIR` removed, so only the printed `--config-dir` selects
+/// the configuration. There is no terminal: standard input is closed, and
+/// `EDITOR=false` is an editor that exits without saving.
+#[cfg(unix)]
+fn run_as_pasted(command: &str) -> Output {
+    let binary_dir = Path::new(env!("CARGO_BIN_EXE_zeroclaw"))
+        .parent()
+        .expect("the binary's directory");
+    let path = std::env::join_paths(std::iter::once(binary_dir.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("join PATH");
+    Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env("PATH", path)
+        .env_remove("ZEROCLAW_CONFIG_DIR")
+        .env("RUST_LOG", "off")
+        .env("LANG", "en_US.UTF-8")
+        .env("EDITOR", "false")
+        .env_remove("VISUAL")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run sh")
+}
+
+/// Install the fixture without a declaration as `plugin.operations` in a
+/// fresh configuration. Returns that configuration's directory, the
+/// instance's key, and the printed command that grants it the deployment's
+/// hosts.
+#[cfg(unix)]
+fn install_without_declaration() -> (TempDir, String, String) {
+    let source = fixture_source_without_declaration();
+    let config_dir = config_dir_with_plugins_dir();
+    let dir = config_dir.path();
+    let install = run_zeroclaw(
+        dir,
+        &[
+            "plugin",
+            "install",
+            source.path().to_str().expect("utf-8 temp path"),
+            "--channel-alias",
+            "operations",
+        ],
+    );
+    let text = combined(&install);
+    assert!(
+        install.status.success(),
+        "an undeclaring package must install and bind: {text}"
+    );
+    let key = expected_channel_key(&plugins_dir_of(dir), "operations");
+    let stdout = String::from_utf8_lossy(&install.stdout);
+    let command = undeclared_hosts_command(&stdout, &key)
+        .unwrap_or_else(|| panic!("the command that grants the deployment's hosts: {text}"))
+        .to_string();
+    (config_dir, key, command)
 }
 
 /// `config.toml` as the binary left it.
@@ -776,26 +872,8 @@ async fn a_declined_grant_denies_egress_until_the_printed_command_is_applied() {
         "the printed command must select this configuration: {command}"
     );
 
-    // Run it as an operator would: pasted into a POSIX shell that finds
-    // `zeroclaw` on `PATH`. This build's directory comes first, and
-    // `ZEROCLAW_CONFIG_DIR` is removed, so only the printed `--config-dir`
-    // selects the configuration.
-    let binary_dir = Path::new(env!("CARGO_BIN_EXE_zeroclaw"))
-        .parent()
-        .expect("the binary's directory");
-    let path = std::env::join_paths(std::iter::once(binary_dir.to_path_buf()).chain(
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
-    ))
-    .expect("join PATH");
-    let applied = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .env("PATH", path)
-        .env_remove("ZEROCLAW_CONFIG_DIR")
-        .env("RUST_LOG", "off")
-        .env("LANG", "en_US.UTF-8")
-        .output()
-        .expect("run sh");
+    // Run it as an operator would, pasted into a POSIX shell.
+    let applied = run_as_pasted(command);
     assert!(
         applied.status.success(),
         "the printed command must run as printed: {command}\n{}",
@@ -826,6 +904,58 @@ async fn a_declined_grant_denies_egress_until_the_printed_command_is_applied() {
         server.hits(),
         1,
         "only the granted construction may reach the socket, once; got: {outcome:?}"
+    );
+}
+
+/// A package that holds a governed transport but declares no destination
+/// gets a printed `config set --no-interactive` command for its row's
+/// `egress_hosts` with no value, so the command as printed carries no
+/// placeholder to write. Pasted as printed, with no terminal and an editor
+/// that saves nothing, it is refused for the missing value and leaves
+/// `config.toml` byte-identical.
+#[cfg(unix)]
+#[test]
+fn the_command_for_undeclared_hosts_writes_nothing_as_printed() {
+    let (config_dir, _key, command) = install_without_declaration();
+    let config_file = config_dir.path().join("config.toml");
+    let before = std::fs::read(&config_file).expect("read config.toml");
+
+    let ran = run_as_pasted(&command);
+
+    let text = combined(&ran);
+    assert!(
+        !ran.status.success() && text.contains("Value required in --no-interactive mode"),
+        "the command run as printed must be refused for the missing value: {command}\n{text}"
+    );
+    assert_eq!(
+        std::fs::read(&config_file).expect("read config.toml"),
+        before,
+        "the command run as printed must write nothing: {command}\n{text}"
+    );
+}
+
+/// The same printed command with the deployment's hosts appended as one
+/// comma-separated value grants exactly those hosts on the instance's row.
+#[cfg(unix)]
+#[test]
+fn the_command_for_undeclared_hosts_grants_the_hosts_appended_to_it() {
+    let (config_dir, key, command) = install_without_declaration();
+
+    let completed = format!("{command} '{DECLARED_HOST},irc.example.net'");
+    let ran = run_as_pasted(&completed);
+
+    assert!(
+        ran.status.success(),
+        "the completed command must run: {completed}\n{}",
+        combined(&ran)
+    );
+    let on_disk = config_on_disk(config_dir.path());
+    let row = entry_on_disk(&on_disk, &key)
+        .unwrap_or_else(|| panic!("the row '{key}' must exist: {on_disk}"));
+    assert_eq!(
+        string_list(row, "egress_hosts"),
+        [DECLARED_HOST, "irc.example.net"],
+        "the appended hosts must be the grant: {on_disk}"
     );
 }
 

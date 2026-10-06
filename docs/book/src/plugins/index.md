@@ -245,7 +245,9 @@ the typed config of an explicitly declared `[channels.plugin.<alias>]` instance
 through that same key, the runtime path that landed in
 [#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146).
 `zeroclaw plugin info <package>` prints every key the package owns: its tool
-binding's and one per bound alias.
+binding's, and one per bound alias when the installed version owns instance
+state and an instance can be named by that alias. The readiness report of a
+bound alias such an instance can be named by follows either way.
 Full-identity keys let different packages and capability
 worlds safely reuse aliases such as `main` without sharing credentials. The
 canonical operator values are a secret-marked string map and
@@ -283,10 +285,13 @@ keeps both, so an upgrade (remove, then install) keeps its state. It also means 
 different package installed later under the same name inherits that instance's
 state and configured secrets. Removal keeps every `[channels.plugin.<alias>]`
 binding that names the package too, so the newcomer is bound to those aliases and
-their rows as well. `plugin remove` prints each kept row that still grants egress
-and each binding it left behind, naming what to delete. Before installing an
-unrelated plugin under a removed plugin's name, delete its `[[plugins.entries]]`
-rows and those bindings, and treat its state as readable by the newcomer.
+their rows as well. `plugin remove` prints each binding it left behind and each
+kept row that still grants egress, naming what to delete: when the installed
+version provides a channel, the row under every bound alias's key, whatever
+else that version owns, and the default tool binding's row when the installed
+version owns instance state. Before installing an unrelated plugin under a
+removed plugin's name, delete its `[[plugins.entries]]` rows and those
+bindings, and treat its state as readable by the newcomer.
 
 Pre-1.0 plugin authors must migrate explicitly: a manifest that requests
 `config_read` without `config_schema` is no longer discovered. Add a closed
@@ -396,16 +401,19 @@ list computed from this one. The directory, the host list, and every other
 argument a command carries (a config path naming a schema property, a package,
 an alias) are each quoted as one literal argument, so nothing a manifest
 declares can be expanded or substituted by your shell; paste the command as
-printed. The exceptions are the placeholders in a printed `plugin bind`
-command: `<alias>`, which you replace with the alias you choose, and
-`<declared|none>`, which you replace with your egress decision. Replace both
-before you run it. On Linux and macOS, a placeholder left at the end of the
-line is a shell syntax error, so that command runs nothing. An `<alias>` left
-in front of a filled-in `--egress`, though, is read by the shell as two
-redirections, from a file named `alias` and into a file named `--egress`: the
-command then fails on the missing file, or runs with your decision taken as
-the alias and no `--egress` flag, and the ceremony refuses it for the missing
-decision.
+printed. The one exception is the grant for a package that declares no
+destinations, printed as a `config set --no-interactive` command for the row's
+`egress_hosts` with no value: append the hosts your deployment uses as one
+comma-separated value. Run as printed, it is refused for the missing value and
+writes nothing. A printed `plugin bind` command is complete as well. Where the
+alias is yours to choose, the command carries the word `ALIAS` in its place:
+your shell passes the word through as is, and because an alias is lowercase, the
+command refuses it as an invalid alias and writes nothing until you replace it
+with the alias you choose. Where creating the instance's row takes an egress
+decision, two commands are printed, first one ending in `--egress none`, then
+one ending in `--egress declared`: run the one you decide on. Pasting both at
+once leaves the instance with no network reach, because the second command
+finds the row the first one created, and an existing row is never extended.
 
 The quoting follows the shell of the platform the command was printed on. On
 Linux and macOS it is the POSIX single-quoted form (`sh`, `bash`, `zsh`,
@@ -433,13 +441,18 @@ holding `http_client`, and every bound channel alias whose package holds
 `package (plugin.<alias>)`. For each, one line names the destinations it
 declares that its row does not grant, since requests there are denied, plus the
 command that closes the gap; for an instance with no row yet, that command
-creates the row with the grant. A channel instance counts every transport the
-egress authority governs because a channel that speaks only over a socket or a
-WebSocket, such as IRC or MQTT, would otherwise never be reported; a tool row
-keeps the `http_client` rule it shipped with. The reverse is never flagged. A
-grant with no matching declaration is a first-class path, not a finding: the
-plugin whose destination is deployment configuration (a self-hosted Gitea, a
-LAN Nextcloud) cannot have that host declared by its author, so you author it.
+creates the row with the grant. A channel instance with no row yet whose alias
+the config alias grammar rejects, such as a hand-written
+`[channels.plugin.ops-team]`, gets the grammar's reason and the table to rename
+instead, since the command that creates the row validates the whole
+configuration and would refuse that alias. A channel instance counts every
+transport the egress authority governs because a channel that speaks only over
+a socket or a WebSocket, such as IRC or MQTT, would otherwise never be
+reported; a tool row keeps the `http_client` rule it shipped with. The reverse
+is never flagged. A grant with no matching declaration is a first-class path,
+not a finding: the plugin whose destination is deployment configuration (a
+self-hosted Gitea, a LAN Nextcloud) cannot have that host declared by its
+author, so you author it.
 
 When the instance's row still carries a pre-1.0 key (a package name rather than
 the `zpi1_…` key), `plugin list` always prints the rename described above,
@@ -504,10 +517,11 @@ while writing them rolls the package back. An install of a channel package
 without `--channel-alias` publishes it as before. If bindings already name
 the package, as a `plugin remove` leaves them, it then prints each bound
 alias's readiness report, described below; otherwise it prints the
-`plugin bind` command to run, with an `<alias>` placeholder and, when the
-manifest declares destinations the channel can reach, an
-`--egress <declared|none>` placeholder for your decision. The ceremony never
-prompts: every decision is a flag.
+`plugin bind` command to run, with `ALIAS` in place of the alias you choose,
+and when the manifest declares destinations the channel can reach, it names
+them and prints that command once per egress decision, first ending in
+`--egress none`, then in `--egress declared`. The ceremony never prompts:
+every decision is a flag.
 
 The command refuses, and writes nothing, when:
 
@@ -548,8 +562,10 @@ transport:
 
 Without such a declaration no decision is needed: the row is created with an
 empty grant, and if the package holds a governed transport but declares no
-destinations, the command prints the one that grants the hosts your deployment
-uses.
+destinations, the command prints a `config set --no-interactive` command for
+the row's `egress_hosts` without a value, for you to complete with the hosts
+your deployment uses as one comma-separated value. As printed, it is refused
+and writes nothing.
 
 The flag only ever applies to a row the command creates. A row that already
 exists, from an earlier run, written by you, or left behind by a removed
@@ -571,28 +587,47 @@ each answer from the source the runtime uses:
 2. Each key the schema lists as `required`, set or missing. A missing key
    comes with the `config set plugins.entries.<key>.config.<name>` command
    that sets it, and a secret key's command prompts for the value without
-   echoing it. For a property name the command line cannot address, the report
-   names the row to edit in the config file instead. An instance whose row does
-   not exist yet, such as a binding written by hand, gets the `plugin bind`
-   command that creates the row in place of per-key commands, since
-   `config set` resolves only rows that exist. When the manifest declares
-   destinations the row can use, the report names them and the command ends in
-   `--egress <declared|none>`, for your decision. Values are never printed.
+   echoing it. No command is printed for a property name outside the portable
+   key grammar; the report names the row to edit in the config file instead.
+   An instance whose row does not exist yet, such as a binding written by
+   hand, gets the `plugin bind` command that creates the row in place of
+   per-key commands, since `config set` resolves only rows that exist. When
+   the manifest declares destinations the row can use, the report names them
+   and prints that command once per egress decision, first ending in
+   `--egress none`, then in `--egress declared`, for you to run the one you
+   decide on. A hand-written binding whose alias `plugin bind` refuses, such
+   as `[channels.plugin.ops-team]`, gets the alias grammar's reason and the
+   table to rename instead. Values are never printed.
 3. The runtime config resolver's verdict on the row, which names the schema
-   path or property that fails, never a value.
-4. The egress gap, in the words `plugin list` uses. `plugin bind` and
-   `plugin install --channel-alias` leave it out, because they have just
-   reported the row's grant with its command.
+   path or property that fails when the resolver reports one, and never a
+   value. That includes a row a `plugin remove` kept that still holds values
+   when the reinstalled manifest declares no `config_schema`: the runtime
+   refuses any value there, and the report names the row by its key with the
+   remedy that fits. When the instance owns no other state, delete the row.
+   When the row still holds the instance's egress grant, because the manifest
+   declares destinations or requests a governed transport, remove only the
+   values under its `config` map and keep the row.
+4. For an instance whose row exists, the egress gap, in the words
+   `plugin list` uses. An instance with no row yet gets no gap line here:
+   item 2's `plugin bind` commands create the row with your egress decision,
+   where `plugin list` prints a `config patch` repair that creates the row
+   already granted. `plugin bind` and `plugin install --channel-alias` leave
+   the gap out, because they have just reported the row's grant with its
+   command.
 5. The activation plan's own verdict, which names the first precondition the
    runtime finds unmet. It checks, in order, `plugins.enabled`, the binding's
    `enabled`, an enabled agent that lists `plugin.<alias>` in its `channels`,
    the package installed and providing a channel, and a free slot under
-   `plugins.max_active_instances`. A disabled plugin system or binding
-   comes with the command that enables it. A missing owner is described
-   rather than given a command, because `config set` on an agent's `channels`
-   list replaces the whole list. When every precondition holds, the plan
-   admits the instance, and it starts at the next daemon start or reload if
-   its component loads. If the runtime cannot build its activation plan at
+   `plugins.max_active_instances`. A disabled plugin system comes with the
+   command that enables it, and so does a disabled binding whose alias the
+   config alias grammar accepts. No command is printed for any other alias,
+   such as a hand-written `[channels.plugin."a.b"]`: the report names the table
+   in which to set `enabled = true` by hand, and for a dotted alias like that
+   one, `config set` would create another binding. A missing owner is
+   described rather than given a command, because `config set` on an agent's
+   `channels` list replaces the whole list. When every precondition holds, the
+   plan admits the instance, and it starts at the next daemon start or reload
+   if its component loads. If the runtime cannot build its activation plan at
    all, the report says so with the runtime's error.
 6. A reminder that a running daemon starts the instance only after a restart
    or reload.

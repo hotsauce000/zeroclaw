@@ -949,10 +949,12 @@ or by `zeroclaw plugin install <source> --channel-alias <alias>`. The
 alias-aware construction that resolves a channel's typed config from that
 configured alias landed in
 [#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146).
-`zeroclaw plugin info <package>` prints every key the package owns, the tool
-binding's and one per bound alias, for migration and later edits, and follows
-each channel key with that instance's readiness: required keys set or missing,
-the config and egress verdicts, and whether the runtime will admit it.
+`zeroclaw plugin info <package>` prints every key the package owns, for
+migration and later edits: the tool binding's, and one per bound alias when the
+installed version owns instance state and an instance can be named by that
+alias. Each such bound alias also gets that instance's readiness, with or
+without a key line: required keys set or missing, the config and egress
+verdicts, and whether the runtime will admit it.
 Schema-driven forms and inline field help are not
 implemented yet. The current surfaces are:
 

@@ -1484,10 +1484,11 @@ mod tests {
     /// a flag or a command the operator has to find or run, so every
     /// catalogue must keep those literal: the binding in its config spelling,
     /// `plugin.<alias>`, the `[channels.plugin.<alias>]` table and the
-    /// `[[plugins.entries]]` row, the `--egress` flags, the config paths, and
-    /// the printed command whole. A catalogue that omits a key ships the raw
-    /// `{key}` sentinel, and one that copies English ships an untranslated
-    /// line; both fail here.
+    /// `[[plugins.entries]]` row, the `--egress` flags, the config paths, the
+    /// `ALIAS` word a printed `plugin bind` command carries until the operator
+    /// replaces it, and the printed command whole. A catalogue that omits a
+    /// key ships the raw `{key}` sentinel, and one that copies English ships
+    /// an untranslated line; both fail here.
     #[test]
     fn plugin_channel_instance_cli_strings_are_translated_in_every_locale() {
         const ALIAS: &str = "operations";
@@ -1504,11 +1505,12 @@ mod tests {
         const REASON: &str = "alias 'Ops' must start with a lowercase letter or digit";
         const ERROR: &str = "plugin 'chat-bridge' config violates config_schema at '/required'";
         const COMMAND: &str = "zeroclaw --config-dir '/srv/zc' config set 'plugins.enabled' 'true'";
+        const PLACEHOLDER: &str = "ALIAS";
 
         /// One parity case: the Fluent key, its arguments, and the substrings
         /// every locale's rendering must contain.
         type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
-        let cases: [ParityCase; 35] = [
+        let cases: [ParityCase; 40] = [
             (
                 "cli-plugin-config-entry-key-channel",
                 &[("alias", ALIAS), ("key", KEY)],
@@ -1516,7 +1518,7 @@ mod tests {
             ),
             (
                 "cli-plugin-removed-binding-kept",
-                &[("name", PACKAGE), ("alias", ALIAS)],
+                &[("name", PACKAGE), ("alias", ALIAS), ("table", TABLE)],
                 &[BINDING, TABLE, PACKAGE],
             ),
             (
@@ -1608,8 +1610,22 @@ mod tests {
             ),
             (
                 "cli-plugin-channel-row-missing-declared",
-                &[("alias", ALIAS), ("hosts", HOSTS), ("command", COMMAND)],
-                &[BINDING, HOSTS, COMMAND],
+                &[("alias", ALIAS), ("hosts", HOSTS)],
+                &[BINDING, HOSTS, "`--egress declared`", "`--egress none`"],
+            ),
+            (
+                "cli-plugin-channel-row-missing-invalid-alias",
+                &[
+                    ("alias", "ops-team"),
+                    ("reason", REASON),
+                    ("table", "[channels.plugin.ops-team]"),
+                ],
+                &[
+                    "plugin.ops-team",
+                    "[channels.plugin.ops-team]",
+                    "`plugin bind`",
+                    REASON,
+                ],
             ),
             (
                 "cli-plugin-channel-alias-unkeyed",
@@ -1617,10 +1633,11 @@ mod tests {
                     ("alias", "op\\u{1b}s"),
                     ("name", PACKAGE),
                     ("reason", REASON),
+                    ("table", "[channels.plugin.\"op\\u{1b}s\"]"),
                 ],
                 &[
                     "plugin.op\\u{1b}s",
-                    "[channels.plugin.op\\u{1b}s]",
+                    "[channels.plugin.\"op\\u{1b}s\"]",
                     PACKAGE,
                     REASON,
                 ],
@@ -1656,6 +1673,16 @@ mod tests {
                 &[BINDING, ERROR],
             ),
             (
+                "cli-plugin-channel-retained-row",
+                &[("alias", ALIAS), ("key", KEY)],
+                &[BINDING, KEY, ROW],
+            ),
+            (
+                "cli-plugin-channel-retained-values",
+                &[("alias", ALIAS), ("key", KEY)],
+                &[BINDING, KEY, ROW, "`config`"],
+            ),
+            (
                 "cli-plugin-channel-config-valid",
                 &[("alias", ALIAS)],
                 &[BINDING],
@@ -1674,6 +1701,16 @@ mod tests {
                 "cli-plugin-channel-activation-binding-disabled",
                 &[("alias", ALIAS), ("command", COMMAND)],
                 &[BINDING, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-activation-binding-disabled-manual",
+                &[("alias", "a.b"), ("table", "[channels.plugin.\"a.b\"]")],
+                &[
+                    "plugin.a.b",
+                    "[channels.plugin.\"a.b\"]",
+                    "`enabled = true`",
+                    "`config set`",
+                ],
             ),
             (
                 "cli-plugin-channel-activation-no-owner",
@@ -1708,7 +1745,18 @@ mod tests {
             (
                 "cli-plugin-channel-bind-hint",
                 &[("name", PACKAGE), ("command", COMMAND)],
-                &[PACKAGE, COMMAND],
+                &[PACKAGE, PLACEHOLDER, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-bind-hint-egress",
+                &[("name", PACKAGE), ("hosts", HOSTS)],
+                &[
+                    PACKAGE,
+                    HOSTS,
+                    PLACEHOLDER,
+                    "`--egress declared`",
+                    "`--egress none`",
+                ],
             ),
         ];
 
@@ -1734,6 +1782,19 @@ mod tests {
                     assert!(
                         value.contains(expected),
                         "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+                // The decision commands print `--egress none` first, so a
+                // block pasted whole fails closed, and the line introducing
+                // them names the flags in that order.
+                if matches!(
+                    key,
+                    "cli-plugin-channel-row-missing-declared"
+                        | "cli-plugin-channel-bind-hint-egress"
+                ) {
+                    assert!(
+                        value.find("`--egress none`") < value.find("`--egress declared`"),
+                        "{key} in {locale} should name `--egress none` first; got: {value:?}"
                     );
                 }
                 // The removal line names the binding on its own, not only

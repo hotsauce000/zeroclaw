@@ -1645,11 +1645,15 @@ mod tests {
         enabled: bool,
         owned: bool,
     ) {
+        // Every field is named today; the base keeps this literal compiling
+        // when `PluginChannelConfig` gains one.
+        #[allow(clippy::needless_update)]
         config.channels.plugin.insert(
             alias.to_string(),
             PluginChannelConfig {
                 package: package.to_string(),
                 enabled,
+                ..PluginChannelConfig::default()
             },
         );
         if owned {
