@@ -576,6 +576,7 @@ cli-quickstart-row-risk-profile = {$glyph} リスクプロファイル — {$sum
 cli-quickstart-row-memory = {$glyph} メモリ              — {$summary}
 cli-quickstart-row-channels = {$glyph} チャンネル (0..N) — {$summary}
 cli-quickstart-row-peer-groups = {$glyph} ピアグループ      — {$summary}
+cli-quickstart-row-plugins = {$glyph} プラグイン         — {$summary}
 cli-quickstart-row-agent-identity = {$glyph} エージェントID   — {$summary}
 cli-quickstart-summary-not-yet-chosen = 未選択
 cli-quickstart-summary-not-yet-visited = 未訪問

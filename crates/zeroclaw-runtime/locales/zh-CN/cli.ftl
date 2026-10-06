@@ -577,6 +577,7 @@ cli-quickstart-row-risk-profile = {$glyph} 风险配置文件     — {$summary}
 cli-quickstart-row-memory = {$glyph} 记忆              — {$summary}
 cli-quickstart-row-channels = {$glyph} 通道 (0..N)      — {$summary}
 cli-quickstart-row-peer-groups = {$glyph} 对等组            — {$summary}
+cli-quickstart-row-plugins = {$glyph} 插件             — {$summary}
 cli-quickstart-row-agent-identity = {$glyph} agent 身份       — {$summary}
 cli-quickstart-summary-not-yet-chosen = 尚未选择
 cli-quickstart-summary-not-yet-visited = 尚未访问

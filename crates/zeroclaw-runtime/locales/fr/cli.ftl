@@ -581,6 +581,7 @@ cli-quickstart-row-risk-profile = {$glyph} Profil de risque   — {$summary}
 cli-quickstart-row-memory = {$glyph} Mémoire            — {$summary}
 cli-quickstart-row-channels = {$glyph} Canaux (0..N)     — {$summary}
 cli-quickstart-row-peer-groups = {$glyph} Groupes de pairs — {$summary}
+cli-quickstart-row-plugins = {$glyph} Plugins            — {$summary}
 cli-quickstart-row-agent-identity = {$glyph} Identité agent   — {$summary}
 cli-quickstart-summary-not-yet-chosen = pas encore choisi
 cli-quickstart-summary-not-yet-visited = pas encore visité

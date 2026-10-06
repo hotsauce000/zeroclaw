@@ -339,11 +339,14 @@ pub fn declared_hosts_for_row(manifest: &PluginManifest, row: &PluginInstanceRow
 }
 
 /// The operator's decision on the destinations a channel instance's manifest
-/// declares.
+/// declares, or, for the default tool binding's row, the decision install
+/// seeds that row by: `plugin install` always seeds the declaration, and
+/// Quickstart lets the operator withhold it.
 ///
-/// It takes effect only when the binding ceremony creates the instance's row,
-/// and the grant it writes there is the record of the decision. A row that
-/// already exists is never extended, whatever the decision says.
+/// It takes effect only when the binding ceremony, or install, creates the
+/// instance's row, and the grant it writes there is the record of the
+/// decision. A row that already exists is never extended, whatever the
+/// decision says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressDecision {
     /// Grant the declared destinations, in canonical form, on the new row.
