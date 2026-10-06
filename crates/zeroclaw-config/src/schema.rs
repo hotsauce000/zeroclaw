@@ -18711,12 +18711,14 @@ pub struct FilesystemConfig {
     pub max_content_bytes: Option<usize>,
     /// Watch broad system roots (`/`, `/home`, `/etc`, `/var`, `/proc`,
     /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. On
-    /// Windows this also covers every drive, volume, and network share root
-    /// and, beneath a drive root, `Windows`, `Windows\Temp`, `Users`, each
-    /// profile in `Users`, `Program Files`, `Program Files (x86)`, and
-    /// `ProgramData`. The pseudo-filesystems `/proc` and `/sys` would surface
-    /// kernel object paths in SOP payloads and flood the watcher with events.
-    /// Off unless explicitly enabled.
+    /// Windows this also covers every drive, volume, and network share root,
+    /// any device path that names something else, and, beneath a drive root,
+    /// `Windows`, `Windows\Temp`, `Users`, each profile in `Users`,
+    /// `Program Files`, `Program Files (x86)`, and `ProgramData`. A path is
+    /// refused when it names one of these as written, resolves to one on
+    /// disk, or cannot be resolved. The pseudo-filesystems `/proc` and `/sys`
+    /// would surface kernel object paths in SOP payloads and flood the watcher
+    /// with events. Off unless explicitly enabled.
     #[tab(Advanced)]
     #[serde(default)]
     pub allow_broad_roots: bool,
@@ -18775,42 +18777,74 @@ fn is_filesystem_broad_root(path: &str) -> bool {
 }
 
 /// Whether `path` names a Windows broad root, read the way Windows resolves
-/// it: `/` and `\` both separate names, repeated and trailing separators are
-/// ignored, names compare case-insensitively, and a `\\?\` or `\\.\` device
-/// prefix resolves to the drive, volume, or share it names. A bare drive
-/// (`C:`), the current drive's root (`\`), and a network share root
-/// (`\\server\share`) count as roots. The match is lexical, like the Unix
-/// check: `.` and `..` segments, links, and substituted drives are not
-/// resolved. It is plain string logic, so tests on every platform cover it.
+/// it. `/` and `\` both separate names, repeated and trailing separators are
+/// ignored, and names compare case-insensitively. Unless the path starts
+/// with `\\?\`, which turns Windows path normalization off, `.` and `..`
+/// segments resolve and trailing dots and spaces are trimmed, as Windows
+/// does. A `\\?\` or `\\.\` device prefix resolves to the drive, `Volume{…}`
+/// GUID, or `UNC` share it names; any other device name, such as
+/// `GLOBALROOT`, counts as a broad root because the check cannot tell what it
+/// opens. A drive-relative spelling (`C:`, `C:Windows`) is read from the
+/// drive's root, since the check cannot know that drive's current folder.
+/// The current drive's root (`\`) and a network share root (`\\server\share`)
+/// count as roots. This reads the path as written; the listener also checks
+/// where the path resolves on disk with
+/// [`FilesystemConfig::validate_resolved_path`]. It is plain string logic, so
+/// tests on every platform cover it.
 fn is_windows_filesystem_broad_root(path: &str) -> bool {
+    // Windows normalizes every path that does not start exactly with `\\?\`.
+    let normalize = !path.starts_with(r"\\?\");
     let path = path.replace('/', "\\");
     if let Some(device_path) = path.strip_prefix(r"\\?\").or(path.strip_prefix(r"\\.\")) {
-        // The first name is the drive, volume, or `UNC` link the prefix opens.
         let mut names = windows_path_names(device_path);
         return match names.next() {
             None => true,
-            Some(link) if link.eq_ignore_ascii_case("UNC") => names.count() <= 2,
-            Some(_) => matches_windows_broad_root(names),
+            Some(link) if link.eq_ignore_ascii_case("UNC") => {
+                is_windows_share_root(names, normalize)
+            }
+            Some(volume) if is_windows_volume_name(volume) => {
+                matches_windows_broad_root(names, normalize)
+            }
+            // `GLOBALROOT` and other device links can open a whole volume.
+            Some(_) => true,
         };
     }
     if let Some(share_path) = path.strip_prefix(r"\\") {
-        // A share's server and share names together form its root.
-        return windows_path_names(share_path).count() <= 2;
+        return is_windows_share_root(windows_path_names(share_path), normalize);
     }
     let mut chars = path.chars();
     if let (Some(letter), Some(':')) = (chars.next(), chars.next())
         && letter.is_ascii_alphabetic()
     {
-        return matches_windows_broad_root(windows_path_names(chars.as_str()));
+        return matches_windows_broad_root(windows_path_names(chars.as_str()), normalize);
     }
     // A leading `\` starts at the current drive's root; other paths are relative.
-    path.starts_with('\\') && matches_windows_broad_root(windows_path_names(&path))
+    path.starts_with('\\') && matches_windows_broad_root(windows_path_names(&path), normalize)
+}
+
+/// Whether `name`, the first name after a device prefix, is a drive (`C:`) or
+/// a volume GUID (`Volume{…}`).
+fn is_windows_volume_name(name: &str) -> bool {
+    let is_drive =
+        name.len() == 2 && name.as_bytes()[0].is_ascii_alphabetic() && name.ends_with(':');
+    let is_volume_guid = name.ends_with('}')
+        && name
+            .get(..7)
+            .is_some_and(|start| start.eq_ignore_ascii_case("Volume{"));
+    is_drive || is_volume_guid
+}
+
+/// Whether a share path's `names`, starting at the server name, stop at the
+/// share's root. The server and share names together form that root, which
+/// `..` cannot climb above, and an incomplete `\\server` counts as one.
+fn is_windows_share_root<'a>(names: impl Iterator<Item = &'a str>, normalize: bool) -> bool {
+    windows_names_below_root(names.skip(2), normalize).is_empty()
 }
 
 /// Whether `names`, read down from a drive or volume root, match an entry of
 /// [`FILESYSTEM_WINDOWS_BROAD_ROOTS`].
-fn matches_windows_broad_root<'a>(names: impl Iterator<Item = &'a str>) -> bool {
-    let names: Vec<&str> = names.collect();
+fn matches_windows_broad_root<'a>(names: impl Iterator<Item = &'a str>, normalize: bool) -> bool {
+    let names = windows_names_below_root(names, normalize);
     FILESYSTEM_WINDOWS_BROAD_ROOTS.iter().any(|root| {
         let root_names: Vec<&str> = windows_path_names(root).collect();
         root_names.len() == names.len()
@@ -18821,13 +18855,39 @@ fn matches_windows_broad_root<'a>(names: impl Iterator<Item = &'a str>) -> bool 
     })
 }
 
+/// `names` below a root as Windows resolves them when `normalize` is set: `.`
+/// drops out, `..` drops the name before it but never climbs above the root,
+/// and trailing dots and spaces are trimmed. Windows trims them from fewer
+/// names than this does, so the extra trimming can only refuse more.
+fn windows_names_below_root<'a>(
+    names: impl Iterator<Item = &'a str>,
+    normalize: bool,
+) -> Vec<&'a str> {
+    let mut resolved = Vec::new();
+    for name in names {
+        if !normalize {
+            resolved.push(name);
+        } else if name == ".." {
+            resolved.pop();
+        } else {
+            let trimmed = name.trim_end_matches(['.', ' ']);
+            if !trimmed.is_empty() {
+                resolved.push(trimmed);
+            }
+        }
+    }
+    resolved
+}
+
 /// The non-empty names of a backslash-separated Windows path.
 fn windows_path_names(path: &str) -> impl Iterator<Item = &str> {
     path.split('\\').filter(|name| !name.is_empty())
 }
 
 impl FilesystemConfig {
-    /// Validate the filesystem listener configuration.
+    /// Validate the filesystem listener configuration. This reads each path
+    /// as written; [`Self::validate_resolved_path`] also checks where a path
+    /// resolves on disk.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.paths.is_empty() {
             anyhow::bail!("at least one path must be configured");
@@ -18848,6 +18908,29 @@ impl FilesystemConfig {
                     "event '{kind}' is invalid; expected created, modified, deleted, or renamed"
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Refuse `path` when it resolves on disk to a broad root, so `..`
+    /// segments, symlinks, junctions, substituted drives, and short names
+    /// cannot reach one without `allow_broad_roots`. A path that cannot be
+    /// resolved, such as one that does not exist, is refused too. The
+    /// listener calls this before it watches a path, and it keeps watching
+    /// the path as written.
+    pub fn validate_resolved_path(&self, path: &str) -> anyhow::Result<()> {
+        if self.allow_broad_roots {
+            return Ok(());
+        }
+        let resolved = match std::fs::canonicalize(path) {
+            Ok(resolved) => resolved,
+            Err(err) => anyhow::bail!("path '{path}' cannot be resolved: {err}"),
+        };
+        if is_filesystem_broad_root(&resolved.to_string_lossy()) {
+            anyhow::bail!(
+                "path '{path}' resolves to broad system root '{}'; set allow_broad_roots = true to watch it",
+                resolved.display()
+            );
         }
         Ok(())
     }
@@ -30002,13 +30085,17 @@ zeroclaw-operators = "operator"
     /// Spellings of Windows broad roots. Each one needs `allow_broad_roots`
     /// on Windows.
     const WINDOWS_BROAD_ROOT_SPELLINGS: &[&str] = &[
-        // Drive roots, a bare drive, and the current drive's root.
+        // Drive roots and the current drive's root.
         r"C:\",
         "C:/",
-        "C:",
-        "d:",
+        "d:/",
         r"C:\\",
         r"\",
+        // Drive-relative spellings, read from the drive's root because the
+        // check cannot know that drive's current folder.
+        "C:",
+        "d:",
+        "C:Windows",
         // System, profile, program, and machine-wide data directories on any
         // drive or the current one, in any case, with any separators.
         r"C:\Windows",
@@ -30026,6 +30113,18 @@ zeroclaw-operators = "operator"
         r"D:\Users\tester",
         r"\Windows",
         "/Users/tester",
+        // Trailing dots and spaces, and `.` and `..` segments, which Windows
+        // resolves away outside `\\?\` paths.
+        r"C:\Windows.",
+        r"C:\Windows ",
+        r"C:\Users\tester.",
+        r"C:\Program Files. ",
+        r"c:\windows\temp.\",
+        r"C:\Windows\.",
+        r"C:\inbox\..",
+        r"C:\Users\tester\Inbox\..",
+        r"\\.\C:\inbox\..\Windows",
+        r"\\server\share\inbox\..",
         // Device-path and network-share spellings.
         r"\\?\C:\",
         r"\\?\C:",
@@ -30037,6 +30136,12 @@ zeroclaw-operators = "operator"
         "//server/share",
         r"\\?\UNC\server\share",
         r"\\.\unc\server\share\",
+        // Device names other than a drive, volume, or share, which can open
+        // a whole volume, at any depth.
+        r"\\?\GLOBALROOT\Device\HarddiskVolume3\",
+        r"\\.\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\inbox",
+        r"\\?\BootPartition\",
+        r"\\?\",
     ];
 
     /// Windows paths scoped below the broad roots. None of them needs
@@ -30045,11 +30150,15 @@ zeroclaw-operators = "operator"
         r"C:\Users\tester\Inbox",
         r"C:\ProgramData\ZeroClaw\inbox",
         r"C:\Windows\Temp\inbox",
+        r"C:\Users\Public\..\tester\Inbox.",
         r"D:\inbox",
         r"\inbox",
         r"\\?\C:\Users\tester\Inbox",
         r"\\server\share\inbox",
         r"\\?\UNC\server\share\inbox",
+        // `\\?\` turns Windows path normalization off, so this names a folder
+        // called `Windows.` rather than `C:\Windows`.
+        r"\\?\C:\Windows.",
         "inbox",
     ];
 
@@ -30131,6 +30240,65 @@ zeroclaw-operators = "operator"
             };
             assert!(cfg.validate().is_ok(), "path {path} must be accepted");
         }
+    }
+
+    #[test]
+    async fn filesystem_resolved_path_accepts_scoped_folder() {
+        let dir = TempDir::new().unwrap();
+        let cfg = FilesystemConfig::default();
+        assert!(
+            cfg.validate_resolved_path(&dir.path().to_string_lossy())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    async fn filesystem_resolved_path_refuses_unresolvable_path() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing").to_string_lossy().into_owned();
+        let mut cfg = FilesystemConfig::default();
+        let err = cfg.validate_resolved_path(&missing).unwrap_err();
+        assert!(err.to_string().contains("cannot be resolved"), "got: {err}");
+        // The opt-in skips resolution; the watcher reports a missing path.
+        cfg.allow_broad_roots = true;
+        assert!(cfg.validate_resolved_path(&missing).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn filesystem_resolved_path_refuses_link_to_broad_root() {
+        let dir = TempDir::new().unwrap();
+        let link = dir.path().join("whole-disk");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let link = link.to_string_lossy().into_owned();
+        // As written the link is an ordinary path; on disk it resolves to `/`.
+        assert!(!is_filesystem_broad_root(&link));
+        let mut cfg = FilesystemConfig::default();
+        let err = cfg.validate_resolved_path(&link).unwrap_err();
+        assert!(
+            err.to_string().contains("resolves to broad system root"),
+            "got: {err}"
+        );
+        cfg.allow_broad_roots = true;
+        assert!(cfg.validate_resolved_path(&link).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    async fn filesystem_resolved_path_refuses_alias_of_drive_root() {
+        // `canonicalize` returns a `\\?\` path such as `\\?\C:\`, which the
+        // Windows matcher reads as the drive root.
+        let windows = std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        let alias = windows.join("..").to_string_lossy().into_owned();
+        let mut cfg = FilesystemConfig::default();
+        let err = cfg.validate_resolved_path(&alias).unwrap_err();
+        assert!(
+            err.to_string().contains("resolves to broad system root"),
+            "got: {err}"
+        );
+        cfg.allow_broad_roots = true;
+        assert!(cfg.validate_resolved_path(&alias).is_ok());
     }
 
     #[test]
