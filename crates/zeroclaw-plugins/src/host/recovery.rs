@@ -180,7 +180,11 @@ impl Root {
             )?
             .into_std();
         lease.lock()?;
-        Ok(Transaction { entry, dir, lease })
+        Ok(Transaction {
+            entry,
+            dir,
+            lease: Lease(lease),
+        })
     }
 
     pub fn reopen_transaction(&self, entry: String) -> Result<Option<Transaction>, PluginError> {
@@ -198,7 +202,11 @@ impl Root {
             .open_with(LEASE, OpenOptions::new().read(true).write(true))?
             .into_std();
         match lease.try_lock() {
-            Ok(()) => Ok(Some(Transaction { entry, dir, lease })),
+            Ok(()) => Ok(Some(Transaction {
+                entry,
+                dir,
+                lease: Lease(lease),
+            })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
         }
@@ -225,7 +233,20 @@ impl Root {
 pub(super) struct Transaction {
     pub entry: String,
     pub dir: Dir,
-    lease: File,
+    lease: Lease,
+}
+
+/// A transaction's held lease. Closing a locked file releases the lock only
+/// once nothing refers to that open file any more, and a child process that
+/// another thread is spawning refers to it until its exec closes it. A
+/// recovery looking right after would take the transaction for a live one, so
+/// the lease is unlocked before it is closed.
+struct Lease(File);
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl Transaction {
@@ -468,6 +489,26 @@ fn pin_ancestors(path: &Path) -> Result<Vec<Dir>, PluginError> {
         return Err(PluginError::NamespaceChanged(path.display().to_string()));
     }
     Ok(held)
+}
+
+#[cfg(all(test, unix))]
+mod lease_release_tests {
+    use super::*;
+
+    /// Dropping a transaction releases its lease at once, even while its open
+    /// file is still shared, here through a duplicate descriptor, as a child
+    /// being spawned shares it until its exec.
+    #[test]
+    fn a_dropped_transaction_releases_its_lease_while_its_file_is_shared() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Root::open(temp.path()).unwrap();
+        let tx = root.transaction("race", "installing").unwrap();
+        let entry = tx.entry.clone();
+        let shared = tx.lease.0.try_clone().unwrap();
+        drop(tx);
+        assert!(root.reopen_transaction(entry).unwrap().is_some());
+        drop(shared);
+    }
 }
 
 #[cfg(test)]

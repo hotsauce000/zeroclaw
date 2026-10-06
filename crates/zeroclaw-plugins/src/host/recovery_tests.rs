@@ -384,20 +384,22 @@ fn healthy_claim_restore_never_clobbers_and_crash_retry_retains_both() {
     let mut host =
         PluginHost::from_plugins_dir_with_security(root.path(), SignatureMode::Strict, vec![])
             .unwrap();
-    assert!(matches!(
-        host.remove("race"),
-        Err(PluginError::RecoveryRetained { .. })
-    ));
+    let blocked = host.remove("race");
+    assert!(
+        matches!(blocked, Err(PluginError::RecoveryRetained { .. })),
+        "{blocked:?}"
+    );
     assert_eq!(
         tests::package_bytes(&root.path().join(&claim).join("package")),
         retained
     );
     assert_eq!(tests::package_bytes(&root.path().join("race")), expected);
     std::fs::rename(root.path().join("race"), root.path().join("second")).unwrap();
-    assert!(matches!(
-        host.remove("race"),
-        Err(PluginError::UnadmittedPackage { .. })
-    ));
+    let restored = host.remove("race");
+    assert!(
+        matches!(restored, Err(PluginError::UnadmittedPackage { .. })),
+        "{restored:?}"
+    );
     assert_eq!(tests::package_bytes(&root.path().join("race")), retained);
 }
 
