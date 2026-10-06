@@ -18,20 +18,23 @@ Full field reference: [config reference](../reference/config.md#channels).
 
 ## Safety
 
-The broad system roots `/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, and `/tmp` are rejected at config validation unless `allow_broad_roots` is set. On macOS the same check also rejects:
+When the listener starts, it refuses to watch the broad system roots `/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, and `/tmp` unless `allow_broad_roots` is set. On macOS it also refuses:
 
 - `/Users` and each folder in it: every home directory (`/Users/<name>`) and `/Users/Shared`
 - `/Volumes` and each mounted volume in it (`/Volumes/<name>`), including the startup disk's entry, which links to `/`
 - `/private`, and `/private/etc`, `/private/tmp`, and `/private/var`, the directories that `/etc`, `/tmp`, and `/var` link to
 
-On macOS, paths match case-insensitively, as a default macOS volume resolves them, and repeated or trailing `/` are ignored, so `/TMP` and `//Users` are rejected as well.
+On macOS, paths match case-insensitively, as a default macOS volume resolves them, and repeated or trailing `/` are ignored, so `/TMP` and `//Users` are refused as well.
 
-On Windows the same check also rejects:
+On Windows it also refuses:
 
-- every drive root (`C:\`, `C:`), volume root, and network share root (`\\server\share`)
+- every drive root (`C:\`), volume root, and network share root (`\\server\share`)
 - beneath a drive root: `Windows`, `Windows\Temp`, `Users`, each user profile in `Users` (`C:\Users\<name>`), `Program Files`, `Program Files (x86)`, and `ProgramData`
+- any device path that names something other than a drive, volume, or share, such as `\\?\GLOBALROOT\Device\HarddiskVolume1\`, because it can open a whole volume
 
-Windows paths match case-insensitively with either separator and with or without trailing separators, and the `\\?\` and `\\.\` device spellings (`\\?\C:\`, `\\?\UNC\server\share`) match the drive or share they name. On every platform the check reads the path as written: it does not resolve `..` segments, links, or substituted drives.
+The listener checks each path twice: as written, and as it resolves on disk, which follows `..` segments, symlinks, junctions, substituted drives, and short names such as `C:\PROGRA~1`. It refuses the path when either form is a broad root, refuses a path it cannot resolve, such as one that does not exist, and keeps watching the path as written.
+
+Written Windows paths match case-insensitively with either separator, ignoring repeated and trailing separators. Outside `\\?\` paths, `.` and `..` segments and trailing dots and spaces resolve as Windows resolves them. The `\\?\` and `\\.\` device spellings (`\\?\C:\`, `\\?\UNC\server\share`) match the drive or share they name. A drive-relative spelling such as `C:` or `C:Windows` is read from the drive's root, because the check cannot know that drive's current folder.
 
 The check never reads `$HOME`, so its result does not depend on the account the daemon runs as. macOS and Windows reject every home directory by its location (`/Users/<name>`, `C:\Users\<name>`). Linux and other Unix systems accept a home directory such as `/home/<name>`, so point `paths` at the folder your SOPs need rather than a whole home directory.
 
@@ -41,7 +44,7 @@ Symlink event paths are rejected before any metadata, hash, or content read by d
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Listener does not start | a broad root was rejected at validation | Narrow `paths` away from the broad roots, or set `allow_broad_roots` |
+| Listener does not start | a path names or resolves to a broad root, or cannot be resolved because it does not exist | Point `paths` at an existing folder below the broad roots, or set `allow_broad_roots` to watch a broad root |
 | Change ignored | excluded by glob, or outside `events` kinds | Check `include`, `exclude`, and `events` against the changed file |
 | SOP not starting | trigger `path` glob does not match | Verify the [trigger](../sop/fan-in/filesystem.md) `path` matches and the file is in watch scope |
 
