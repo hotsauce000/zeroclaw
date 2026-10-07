@@ -1,0 +1,18 @@
+{
+  "name": "zeroclaw",
+  "version": "0.1.0",
+  "description": "Plan a fresh ZeroClaw instance and check native Claude Code authentication without exporting credentials.",
+  "author": {"name": "ZeroClaw Labs"},
+  "repository": "https://github.com/zeroclaw-labs/zeroclaw",
+  "license": "MIT",
+  "keywords": ["zeroclaw", "onboarding", "preflight"],
+  "metadata": {
+    "supportedSurface": "local-claude-code",
+    "minimumClaudeCodeVersion": "2.1.289",
+    "statusProbePlatforms": ["macos", "linux", "wsl"],
+    "helperRuntime": "python3 >= 3.9; standard library only",
+    "nativeZeroClawModelBackend": "unsupported",
+    "operations": ["bootstrap.status", "bootstrap.plan"],
+    "writesInstanceConfiguration": false
+  }
+}
