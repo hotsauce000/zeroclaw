@@ -13268,6 +13268,9 @@ async fn dispatch_models_command(model_command: ModelCommands, config: &mut Conf
     }
 }
 
+#[cfg(all(test, feature = "agent-runtime", unix))]
+mod chatgpt_plan_tool_loop_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13326,7 +13329,7 @@ mod tests {
             config_path: root.path().join("config.toml"),
             ..Default::default()
         };
-        scope_with_observer(&server.uri(), observer, async {
+        Box::pin(scope_with_observer(&server.uri(), observer, async {
             let cli = Cli::try_parse_from([
                 "zeroclaw",
                 "auth",
@@ -13390,7 +13393,7 @@ mod tests {
                 panic!("auth command");
             };
             handle_auth_command(auth_command, &restored).await.unwrap();
-        })
+        }))
         .await;
     }
 

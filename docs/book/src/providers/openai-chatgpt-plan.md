@@ -2,9 +2,10 @@
 
 This opt-in provider uses OpenAI's open-source Sign in with ChatGPT flow.
 It is separate from [Codex subscription authentication](./openai-codex-subscription.md).
-The first implementation supports text requests with tools disabled through
-`auth plan-check`. Agent tools, credential imports, device login, and managed
-hosting are unsupported. Synthetic tests establish the protocol integration;
+The provider supports text and client-side function tools in ZeroClaw's normal
+agent loop. `auth plan-check` remains a tools-disabled text check. Custom tools,
+hosted tools, credential imports, device login, and managed hosting are
+unsupported. Synthetic tests establish the protocol integration;
 live account entitlement and model availability require a separately authorized
 smoke test.
 Native Windows is unsupported in this slice; use Linux, macOS, or WSL.
@@ -61,7 +62,51 @@ The check consumes the selected account's ChatGPT allowance. It uses public
 and succeeds only on `response.completed`. The HTTP request and SSE body share
 a 300-second total deadline. Truncation, incomplete responses, revocation and
 quota failures surface as errors; no metered fallback is selected.
-This check does not establish full agent/tool readiness.
+This check establishes text inference for that request; it does not exercise
+the agent's tool registry or approval policy.
+
+## Run the normal agent loop
+
+Run `zeroclaw --config-dir /path/to/new-instance quickstart`, select the existing
+`openai.subscriber` provider, and choose the normal risk and runtime presets for
+the new agent. The agent references that provider explicitly. Select YOLO only
+for an instance where full autonomy is intended; it removes approval gates and
+workspace scoping. The ordinary tool registry, scoped policy, approvals,
+receipts, and cancellation path continue to own execution.
+
+```sh
+zeroclaw --config-dir /path/to/new-instance agent \
+  --agent <configured-agent-alias> --message "Read the disposable fixture in your workspace"
+```
+
+Function schemas are grouped in the `zeroclaw` namespace. The provider does not
+execute tools: it returns admitted function calls only after a completed
+Responses stream. The runtime then runs the available local tools and sends
+their results in the next request. Calls to an unoffered tool, the wrong
+namespace, incomplete or malformed calls, and unsupported output types fail
+closed. Setting `native_tools = false` disables native function negotiation and
+rejects directly supplied structured tool specs. The normal loop may use its
+existing prompt-guided protocol in that mode. Tool availability and approvals
+remain owned by the agent's scoped policy; this transport flag does not narrow
+the registry. The text check remains available.
+
+Every follow-up resends local history, including function-call IDs, corresponding
+outputs, and opaque reasoning items. No `previous_response_id` or hosted
+conversation is used. Reasoning replay is bound to the originating registration;
+cross-registration, mismatched, duplicate, or orphaned tool history is rejected
+before inference egress. Switching accounts requires an explicitly chosen
+registration and fresh compatible history.
+
+Local MCP wrappers and the local discovery function remain ordinary client-side
+functions under the same policy. The provider does not emit Responses
+`tool_search`, hosted MCP, custom tools, programmatic tool calls, or other hosted
+execution features. Tools are serialized from the effective per-request registry,
+with `strict:false` so their existing parameter schemas are preserved.
+
+An executed harmless local tool followed by a completed final response verifies
+that agent/tool path for the selected account and model. A model catalog entry
+alone does not establish entitlement. Both text and tool checks consume ChatGPT
+allowance; quota or revocation never changes the billing route.
 
 ## Credential lifecycle and rollback
 
@@ -108,3 +153,5 @@ OpenAI documents [registration](https://developers.openai.com/siwc/token-sharing
 [token metadata](https://developers.openai.com/siwc/token-sharing-open-source/token-reference),
 [inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference),
 and [preview restrictions](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
+The public API documents [function namespaces](https://developers.openai.com/api/docs/guides/function-calling)
+and [stateless reasoning replay](https://developers.openai.com/api/docs/guides/reasoning).

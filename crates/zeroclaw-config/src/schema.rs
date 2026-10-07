@@ -1158,6 +1158,7 @@ pub struct ModelProviderConfig {
 /// Config owns only the reference; readiness is resolved at request time.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.chatgpt_plan_auth"]
 pub struct ChatGptPlanAuthConfig {
     /// Exact canonical profile ID, e.g. `chatgpt-plan:subscriber`.
     #[credential_class = "external_auth_store"]

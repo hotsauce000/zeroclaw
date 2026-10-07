@@ -1,11 +1,13 @@
 //! Restricted, explicitly bound ChatGPT plan usage over public Responses.
-//! This first slice supports text without tools. No API-key fallback.
+//! Text and client-side function tools. No API-key fallback or hosted tools.
 use crate::auth::AuthService;
-use crate::traits::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
+use crate::traits::{ChatMessage, ChatRequest, ChatResponse, ModelProvider, TokenUsage, ToolCall};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::time::Duration;
+use zeroclaw_api::tool::ToolSpec;
 use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
 
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
@@ -40,6 +42,7 @@ pub struct ChatGptPlanProvider {
     client: reqwest::Client,
     responses_url: String,
     models_url: String,
+    native_tools: bool,
 }
 
 impl ChatGptPlanProvider {
@@ -120,10 +123,6 @@ impl ChatGptPlanProvider {
             config.fallback.is_empty(),
             "ChatGPT plan provider fallbacks are unsupported; no metered fallback is enabled"
         );
-        anyhow::ensure!(
-            config.native_tools != Some(true) && opts.native_tools != Some(true),
-            "ChatGPT plan tools are unsupported in this slice"
-        );
         let root = opts
             .zeroclaw_dir
             .as_deref()
@@ -146,16 +145,22 @@ impl ChatGptPlanProvider {
             client,
             responses_url,
             models_url,
+            native_tools: opts.native_tools.or(config.native_tools) != Some(false),
         })
     }
 
     async fn complete(
         &self,
         messages: &[ChatMessage],
+        tools: &[ToolSpec],
         model: &str,
         temperature: Option<f64>,
-    ) -> Result<String> {
-        let body = request_body(messages, model, temperature)?;
+    ) -> Result<ChatResponse> {
+        anyhow::ensure!(
+            self.native_tools || tools.is_empty(),
+            "ChatGPT native function tools are disabled for this provider"
+        );
+        let body = request_body(messages, tools, model, temperature, &self.registration)?;
         let access = self
             .auth
             .get_valid_chatgpt_plan_access_token(&self.registration)
@@ -224,17 +229,82 @@ impl ChatGptPlanProvider {
                     pending.iter().all(u8::is_ascii_whitespace),
                     "ChatGPT plan stream has an incomplete event after completion"
                 );
-                return sse.finish();
+                return sse.finish(tools, &self.registration);
             }
         }
         if !pending.is_empty() {
             anyhow::bail!("ChatGPT plan stream ended with an incomplete event");
         }
-        sse.finish()
+        sse.finish(tools, &self.registration)
     }
 }
 
-fn request_body(messages: &[ChatMessage], model: &str, temperature: Option<f64>) -> Result<Value> {
+fn function_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn function_call(item: &Value) -> Result<ToolCall> {
+    anyhow::ensure!(
+        item["namespace"] == "zeroclaw",
+        "Invalid ChatGPT function namespace"
+    );
+    anyhow::ensure!(
+        item.get("status")
+            .is_none_or(|status| status == "completed"),
+        "Invalid ChatGPT function call status"
+    );
+    anyhow::ensure!(
+        item.get("async").is_none_or(|value| value == false)
+            && item
+                .get("caller")
+                .is_none_or(|caller| caller.is_null() || caller["type"] == "direct"),
+        "ChatGPT plan supports only direct client-side function calls"
+    );
+    let id = item["call_id"]
+        .as_str()
+        .context("Invalid ChatGPT function call ID")?;
+    anyhow::ensure!(!id.trim().is_empty(), "Invalid ChatGPT function call ID");
+    let name = item["name"]
+        .as_str()
+        .context("Invalid ChatGPT function name")?;
+    anyhow::ensure!(function_name(name), "Invalid ChatGPT function name");
+    let arguments = item["arguments"]
+        .as_str()
+        .context("Invalid ChatGPT function arguments")?;
+    anyhow::ensure!(
+        serde_json::from_str::<Value>(arguments).is_ok_and(|value| value.is_object()),
+        "Invalid ChatGPT function arguments"
+    );
+    Ok(ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: arguments.into(),
+        extra_content: None,
+    })
+}
+
+fn supported_output_item(item: &Value) -> Result<()> {
+    anyhow::ensure!(
+        matches!(
+            item["type"].as_str(),
+            Some("message" | "reasoning" | "function_call")
+        ),
+        "Unsupported ChatGPT plan output type"
+    );
+    Ok(())
+}
+
+fn request_body(
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+    model: &str,
+    temperature: Option<f64>,
+    registration: &str,
+) -> Result<Value> {
     anyhow::ensure!(
         temperature.is_none(),
         "ChatGPT plan preview does not support temperature"
@@ -242,27 +312,174 @@ fn request_body(messages: &[ChatMessage], model: &str, temperature: Option<f64>)
     anyhow::ensure!(!model.trim().is_empty(), "ChatGPT plan model is required");
     let mut input = Vec::new();
     let mut instructions = Vec::new();
-    for message in messages {
+    let mut pending_calls = HashSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        if ChatMessage::should_skip_internal_pruning_marker(messages, index) {
+            continue;
+        }
         match message.role.as_str() {
             "system" | "developer" => instructions.push(message.content.clone()),
-            "user" | "assistant" => {
-                input.push(json!({"role":message.role,"content":message.content}))
+            "user" => input.push(json!({"role":"user","content":message.content})),
+            "assistant" => {
+                let envelope = serde_json::from_str::<Value>(&message.content).ok();
+                if let Some(envelope) = envelope
+                    .as_ref()
+                    .filter(|value| value.get("tool_calls").is_some())
+                {
+                    let calls: Vec<ToolCall> =
+                        serde_json::from_value(envelope["tool_calls"].clone())
+                            .map_err(|_| protocol_error("Invalid ChatGPT tool-call history"))?;
+                    let replay = envelope
+                        .get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .map(|value| {
+                            serde_json::from_str::<Value>(value)
+                                .map_err(|_| protocol_error("Invalid ChatGPT reasoning history"))
+                        })
+                        .transpose()?;
+                    let items = if let Some(replay) = replay {
+                        anyhow::ensure!(
+                            replay["provider"] == "chatgpt-plan"
+                                && replay["registration"] == registration,
+                            "ChatGPT reasoning history belongs to a different registration"
+                        );
+                        let items = replay["items"]
+                            .as_array()
+                            .context("Invalid ChatGPT reasoning history items")?
+                            .clone();
+                        let replay_calls = items
+                            .iter()
+                            .filter(|item| item["type"] == "function_call")
+                            .map(function_call)
+                            .collect::<Result<Vec<_>>>()?;
+                        anyhow::ensure!(
+                            calls.len() == replay_calls.len()
+                                && calls
+                                    .iter()
+                                    .zip(&replay_calls)
+                                    .all(|(call, replay)| call.id == replay.id
+                                        && call.name == replay.name
+                                        && call.arguments == replay.arguments),
+                            "ChatGPT reasoning history does not match its tool calls"
+                        );
+                        items
+                    } else {
+                        calls.iter().map(|call| json!({"type":"function_call","namespace":"zeroclaw","call_id":call.id,"name":call.name,"arguments":call.arguments})).collect()
+                    };
+                    if !items.iter().any(|item| item["type"] == "message")
+                        && let Some(text) =
+                            envelope["content"].as_str().filter(|text| !text.is_empty())
+                    {
+                        input.push(json!({"role":"assistant","content":text}));
+                    }
+                    for item in items {
+                        supported_output_item(&item)?;
+                        if item["type"] == "function_call" {
+                            let call = function_call(&item)?;
+                            anyhow::ensure!(
+                                pending_calls.insert(call.id),
+                                "Duplicate ChatGPT tool-call history ID"
+                            );
+                        }
+                        input.push(item);
+                    }
+                } else {
+                    input.push(json!({"role":"assistant","content":message.content}));
+                }
             }
-            _ => anyhow::bail!("ChatGPT plan tools and tool history are unsupported in this slice"),
+            "tool" => {
+                let result: Value = serde_json::from_str(&message.content)
+                    .map_err(|_| protocol_error("Invalid ChatGPT tool-result history"))?;
+                let id = result["tool_call_id"]
+                    .as_str()
+                    .context("ChatGPT tool result missing call ID")?;
+                anyhow::ensure!(
+                    pending_calls.remove(id),
+                    "ChatGPT tool result has no matching call ID"
+                );
+                let output = result["content"]
+                    .as_str()
+                    .context("ChatGPT tool result missing text")?;
+                input.push(json!({"type":"function_call_output","call_id":id,"output":output}));
+            }
+            _ => anyhow::bail!("Unsupported ChatGPT message role"),
         }
     }
+    anyhow::ensure!(
+        pending_calls.is_empty(),
+        "ChatGPT tool-call history has missing results"
+    );
     anyhow::ensure!(!input.is_empty(), "ChatGPT plan input is required");
     let mut body = json!({"model":model,"input":input,"store":false,"stream":true});
     if !instructions.is_empty() {
         body["instructions"] = instructions.join("\n\n").into();
     }
+    if !tools.is_empty() {
+        let mut names = HashSet::new();
+        let functions = tools.iter().map(|tool| {
+            anyhow::ensure!(function_name(&tool.name) && names.insert(&tool.name), "Invalid or duplicate ChatGPT function name");
+            anyhow::ensure!(tool.parameters.is_object(), "ChatGPT function parameters must be a JSON schema object");
+            Ok(json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters,"strict":false}))
+        }).collect::<Result<Vec<_>>>()?;
+        body["tools"] = json!([{"type":"namespace","name":"zeroclaw","tools":functions}]);
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
     Ok(body)
+}
+
+fn parse_raw_function(value: &Value) -> Result<ToolSpec> {
+    let object = value
+        .as_object()
+        .context("Only client-side function tool specifications are supported")?;
+    anyhow::ensure!(
+        value["type"] == "function",
+        "Only client-side function tools are supported"
+    );
+    let function = if let Some(function) = object.get("function") {
+        anyhow::ensure!(
+            object
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "function")),
+            "Only client-side function tool fields are supported"
+        );
+        function
+    } else {
+        value
+    };
+    let fields = function
+        .as_object()
+        .context("Only client-side function tool fields are supported")?;
+    anyhow::ensure!(
+        fields.keys().all(|key| matches!(
+            key.as_str(),
+            "type" | "name" | "description" | "parameters" | "strict"
+        )) && fields.get("strict").is_none_or(|value| value == false),
+        "Only client-side function tool fields are supported"
+    );
+    let name = function["name"]
+        .as_str()
+        .context("Client-side function tool missing name")?;
+    let description = function
+        .get("description")
+        .map(|value| {
+            value
+                .as_str()
+                .context("Invalid client-side function description")
+        })
+        .transpose()?
+        .unwrap_or("");
+    let parameters = function
+        .get("parameters")
+        .context("Client-side function tool missing parameters")?;
+    Ok(ToolSpec::new(name, description, parameters.clone()))
 }
 
 #[derive(Default)]
 struct PlanSse {
     completed: bool,
     text: String,
+    output: Vec<Value>,
+    usage: Option<TokenUsage>,
 }
 impl PlanSse {
     fn event(&mut self, event: &str) -> Result<()> {
@@ -316,13 +533,10 @@ impl PlanSse {
                     "Invalid ChatGPT response completion"
                 );
                 if let Some(output) = event["response"]["output"].as_array() {
-                    anyhow::ensure!(
-                        !output.iter().any(|item| matches!(
-                            item["type"].as_str(),
-                            Some("function_call" | "custom_tool_call")
-                        )),
-                        "ChatGPT plan tools are unsupported in this slice"
-                    );
+                    for item in output {
+                        supported_output_item(item)?;
+                    }
+                    self.output = output.clone();
                 }
                 if self.text.is_empty() {
                     if let Some(text) = event["response"]["output_text"].as_str() {
@@ -343,35 +557,74 @@ impl PlanSse {
                         }
                     }
                 }
+                if let Some(usage) = event["response"]
+                    .get("usage")
+                    .filter(|usage| !usage.is_null())
+                {
+                    self.usage = Some(TokenUsage {
+                        input_tokens: usage["input_tokens"].as_u64(),
+                        output_tokens: usage["output_tokens"].as_u64(),
+                        cached_input_tokens: usage["input_tokens_details"]["cached_tokens"]
+                            .as_u64(),
+                        cache_creation_input_tokens: None,
+                    });
+                }
                 self.completed = true;
             }
-            "response.output_item.added" | "response.output_item.done"
-                if matches!(
-                    event["item"]["type"].as_str(),
-                    Some("function_call" | "custom_tool_call")
-                ) =>
-            {
-                anyhow::bail!("ChatGPT plan tools are unsupported in this slice")
+            "response.output_item.added" | "response.output_item.done" => {
+                supported_output_item(&event["item"])?
             }
             _ => {}
         }
         Ok(())
     }
-    fn finish(&self) -> Result<String> {
+    fn finish(&self, tools: &[ToolSpec], registration: &str) -> Result<ChatResponse> {
         anyhow::ensure!(
             self.completed,
             "ChatGPT plan stream ended before response.completed"
         );
+        let mut ids = HashSet::new();
+        let tool_calls = self
+            .output
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .map(|item| {
+                let call = function_call(item)?;
+                anyhow::ensure!(
+                    tools.iter().any(|tool| tool.name == call.name),
+                    "ChatGPT response called an unoffered tool"
+                );
+                anyhow::ensure!(
+                    ids.insert(call.id.clone()),
+                    "Duplicate ChatGPT function call ID"
+                );
+                Ok(call)
+            })
+            .collect::<Result<Vec<_>>>()?;
         anyhow::ensure!(
-            !self.text.trim().is_empty(),
-            "ChatGPT plan response completed without text"
+            !self.text.trim().is_empty() || !tool_calls.is_empty(),
+            "ChatGPT plan response completed without text or tool calls"
         );
-        Ok(self.text.clone())
+        let reasoning_content = if tool_calls.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&json!({"provider":"chatgpt-plan","registration":registration,"items":self.output}))
+                .context("Unable to retain ChatGPT function-call history")?)
+        };
+        Ok(ChatResponse {
+            text: (!self.text.is_empty()).then(|| self.text.clone()),
+            tool_calls,
+            usage: self.usage.clone(),
+            reasoning_content,
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl ModelProvider for ChatGptPlanProvider {
+    fn supports_native_tools(&self) -> bool {
+        self.native_tools
+    }
     fn default_base_url(&self) -> Option<&str> {
         Some(RESPONSES_URL)
     }
@@ -390,7 +643,10 @@ impl ModelProvider for ChatGptPlanProvider {
             messages.push(ChatMessage::system(system));
         }
         messages.push(ChatMessage::user(message));
-        self.complete(&messages, model, temperature).await
+        self.complete(&messages, &[], model, temperature)
+            .await?
+            .text
+            .context("ChatGPT plan response completed without text")
     }
     async fn chat_with_history(
         &self,
@@ -398,7 +654,10 @@ impl ModelProvider for ChatGptPlanProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> Result<String> {
-        self.complete(messages, model, temperature).await
+        self.complete(messages, &[], model, temperature)
+            .await?
+            .text
+            .context("ChatGPT plan response completed without text")
     }
     async fn chat(
         &self,
@@ -406,16 +665,13 @@ impl ModelProvider for ChatGptPlanProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> Result<ChatResponse> {
-        anyhow::ensure!(
-            request.tools.is_none_or(|tools| tools.is_empty()),
-            "ChatGPT plan tools are unsupported in this slice"
-        );
-        Ok(ChatResponse {
-            text: Some(self.complete(request.messages, model, temperature).await?),
-            tool_calls: Vec::new(),
-            usage: None,
-            reasoning_content: None,
-        })
+        self.complete(
+            request.messages,
+            request.tools.unwrap_or(&[]),
+            model,
+            temperature,
+        )
+        .await
     }
     async fn chat_with_tools(
         &self,
@@ -424,16 +680,11 @@ impl ModelProvider for ChatGptPlanProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> Result<ChatResponse> {
-        anyhow::ensure!(
-            tools.is_empty(),
-            "ChatGPT plan tools are unsupported in this slice"
-        );
-        Ok(ChatResponse {
-            text: Some(self.complete(messages, model, temperature).await?),
-            tool_calls: Vec::new(),
-            usage: None,
-            reasoning_content: None,
-        })
+        let tools = tools
+            .iter()
+            .map(parse_raw_function)
+            .collect::<Result<Vec<_>>>()?;
+        self.complete(messages, &tools, model, temperature).await
     }
     async fn list_models(&self) -> Result<Vec<String>> {
         let access = self
