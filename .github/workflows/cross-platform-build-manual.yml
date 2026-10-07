@@ -1,5 +1,5 @@
-name: Windows runner paired comparison
-run-name: Windows runner comparison / ${{ github.sha }}
+name: Windows runner cached comparison
+run-name: Windows cached comparison / ${{ github.sha }}
 
 on:
   workflow_dispatch:
@@ -11,10 +11,117 @@ env:
   TESTED_SOURCE_SHA: 08d2b23738e26f19e612c690e3a90caebf77bb7d
   CARGO_INCREMENTAL: 0
   CARGO_TARGET_DIR: target
+  CARGO_TERM_COLOR: never
 
 jobs:
+  seed:
+    name: ${{ matrix.provider.name }} / compilation cache seed
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/windows-blacksmith-canary-20261004'
+    runs-on: ${{ matrix.provider.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        provider:
+          - name: github
+            runner: windows-2025
+          - name: blacksmith
+            runner: blacksmith-8vcpu-windows-2025
+    env:
+      COMPARISON_PROVIDER: ${{ matrix.provider.name }}
+      COMPARISON_WORKLOAD: compilation-seed
+    steps:
+      - name: Check out frozen workload source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.TESTED_SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify source and initial runner state
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $outputDir = Join-Path $env:RUNNER_TEMP 'windows-cache-comparison'
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+          $sourceSha = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Source identity query failed' }
+          $entries = @(if (Test-Path -LiteralPath 'target') { Get-ChildItem -LiteralPath 'target' -Force })
+          $os = Get-CimInstance Win32_OperatingSystem
+          $system = Get-CimInstance Win32_ComputerSystem
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw 'MSVC inventory is unavailable' }
+          $vsJson = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json
+          if ($LASTEXITCODE -ne 0) { throw 'MSVC inventory failed' }
+          $msvc = @($vsJson | ConvertFrom-Json)
+          $evidence = [ordered]@{
+            workflow_sha = $env:GITHUB_SHA; tested_source_sha = $sourceSha
+            run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT
+            provider = $env:COMPARISON_PROVIDER; workload = $env:COMPARISON_WORKLOAD
+            runner_name = $env:RUNNER_NAME; runner_arch = $env:RUNNER_ARCH
+            image_os = $env:ImageOS; image_version = $env:ImageVersion
+            os_version = $os.Version; os_build = $os.BuildNumber
+            logical_processors = $system.NumberOfLogicalProcessors
+            physical_memory_bytes = $system.TotalPhysicalMemory
+            powershell = $PSVersionTable.PSVersion.ToString()
+            msvc_installation_versions = @($msvc | ForEach-Object { $_.installationVersion })
+            initial_target_entries = @($entries | ForEach-Object { $_.Name })
+          }
+          $evidence | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $outputDir 'inventory.json') -Encoding UTF8
+          if ($sourceSha -ne $env:TESTED_SOURCE_SHA) { throw 'Frozen source identity mismatch' }
+          if ($env:GITHUB_RUN_ATTEMPT -ne '1') { throw 'This comparison does not permit reruns' }
+          if ($entries.Count -ne 0) { throw 'Initial target must be empty; no artifacts will be deleted' }
+          if ($env:RUNNER_ARCH -ne 'X64' -or $msvc.Count -eq 0) { throw 'Windows x64 MSVC prerequisites missing' }
+      - name: Install matching Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+          targets: x86_64-pc-windows-msvc
+      - name: Record toolchains and prepare web placeholder
+        shell: bash
+        run: |
+          set -euo pipefail
+          { rustc -Vv; cargo -V; rustup toolchain list; } | tee "$RUNNER_TEMP/windows-cache-comparison/toolchain.log"
+          mkdir -p web/dist
+          touch web/dist/.gitkeep
+      - name: Restore and register isolated seed cache
+        id: cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: windows-cache-${{ github.run_id }}-${{ matrix.provider.name }}
+          shared-key: build
+          save-if: 'true'
+          cache-on-failure: 'false'
+          lookup-only: 'false'
+      - name: Require unused seed namespace
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          test "$CACHE_HIT" = false
+      - name: Seed unchanged compilation workloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          SECONDS=0
+          cargo check --profile ci --locked --target x86_64-pc-windows-msvc 2>&1 | tee "$RUNNER_TEMP/windows-cache-comparison/compilation.log"
+          printf 'Compilation elapsed seconds: %s\n' "$SECONDS" | tee "$RUNNER_TEMP/windows-cache-comparison/compilation-time.log"
+          SECONDS=0
+          cargo check --locked -p zeroclaw-channels --no-default-features --features voice-wake --target x86_64-pc-windows-msvc 2>&1 | tee "$RUNNER_TEMP/windows-cache-comparison/voice-wake.log"
+          printf 'Voice-wake elapsed seconds: %s\n' "$SECONDS" | tee "$RUNNER_TEMP/windows-cache-comparison/voice-wake-time.log"
+      - name: Upload seed evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-cache-${{ matrix.provider.name }}-seed-${{ github.run_id }}
+          path: ${{ runner.temp }}/windows-cache-comparison
+          if-no-files-found: error
+          retention-days: 7
+
   comparison:
-    name: ${{ matrix.provider.name }} / ${{ matrix.workload.name }}
+    name: ${{ matrix.provider.name }} / cached ${{ matrix.workload.name }}
+    needs: [seed]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/windows-blacksmith-canary-20261004' && needs.seed.result == 'success'
     runs-on: ${{ matrix.provider.runner }}
     timeout-minutes: ${{ matrix.workload.limit }}
     strategy:
@@ -27,130 +134,111 @@ jobs:
             runner: blacksmith-8vcpu-windows-2025
         workload:
           - name: compilation
-            limit: 40
+            limit: 20
           - name: recovery
-            limit: 40
-          - name: service
-            limit: 35
+            limit: 30
     env:
       COMPARISON_PROVIDER: ${{ matrix.provider.name }}
       COMPARISON_WORKLOAD: ${{ matrix.workload.name }}
     steps:
       - name: Check out frozen workload source
-        id: checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ env.TESTED_SOURCE_SHA }}
           persist-credentials: false
-
-      - name: Verify source, cold target and runner prerequisites
-        id: inventory
+      - name: Verify source and initial runner state
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version Latest
-          $outputDir = Join-Path $env:RUNNER_TEMP 'windows-runner-comparison'
+          $outputDir = Join-Path $env:RUNNER_TEMP 'windows-cache-comparison'
           New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
           $sourceSha = (git rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0) { throw 'Source identity query failed' }
-          $targetEntries = @(if (Test-Path -LiteralPath 'target') {
-            Get-ChildItem -LiteralPath 'target' -Force -ErrorAction Stop
-          })
-          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+          $entries = @(if (Test-Path -LiteralPath 'target') { Get-ChildItem -LiteralPath 'target' -Force })
           $os = Get-CimInstance Win32_OperatingSystem
           $system = Get-CimInstance Win32_ComputerSystem
-          $cpus = @(Get-CimInstance Win32_Processor)
-          $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-          $scheduler = Get-Service -Name Schedule
-          $taskCommand = Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue
-          $existingTask = @(if ($null -ne $taskCommand) {
-            Get-ScheduledTask -ErrorAction Stop |
-              Where-Object { $_.TaskName -eq 'ZeroClaw Daemon' }
-          })
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          $msvc = @()
-          if (Test-Path -LiteralPath $vswhere) {
-            $vsJson = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json
-            if ($LASTEXITCODE -ne 0) { throw 'vswhere prerequisite query failed' }
-            $msvc = @($vsJson | ConvertFrom-Json)
-          }
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw 'MSVC inventory is unavailable' }
+          $vsJson = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json
+          if ($LASTEXITCODE -ne 0) { throw 'MSVC inventory failed' }
+          $msvc = @($vsJson | ConvertFrom-Json)
           $evidence = [ordered]@{
-            workflow_sha = $env:GITHUB_SHA
-            tested_source_sha = $sourceSha
-            expected_source_sha = $env:TESTED_SOURCE_SHA
-            run_id = $env:GITHUB_RUN_ID
-            run_attempt = $env:GITHUB_RUN_ATTEMPT
-            provider = $env:COMPARISON_PROVIDER
-            workload = $env:COMPARISON_WORKLOAD
-            recorded_at_utc = [DateTime]::UtcNow.ToString('o')
-            runner_name = $env:RUNNER_NAME
-            runner_arch = $env:RUNNER_ARCH
-            image_os = $env:ImageOS
-            image_version = $env:ImageVersion
-            os_caption = $os.Caption
-            os_version = $os.Version
-            os_build = $os.BuildNumber
-            cpu_names = @($cpus | ForEach-Object { $_.Name })
+            workflow_sha = $env:GITHUB_SHA; tested_source_sha = $sourceSha
+            run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT
+            provider = $env:COMPARISON_PROVIDER; workload = $env:COMPARISON_WORKLOAD
+            runner_name = $env:RUNNER_NAME; runner_arch = $env:RUNNER_ARCH
+            image_os = $env:ImageOS; image_version = $env:ImageVersion
+            os_version = $os.Version; os_build = $os.BuildNumber
             logical_processors = $system.NumberOfLogicalProcessors
             physical_memory_bytes = $system.TotalPhysicalMemory
             powershell = $PSVersionTable.PSVersion.ToString()
-            elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-            scheduler_status = $scheduler.Status.ToString()
-            scheduler_cmdlet_available = ($null -ne $taskCommand)
-            preexisting_zeroclaw_task = ($existingTask.Count -ne 0)
             msvc_installation_versions = @($msvc | ForEach-Object { $_.installationVersion })
-            initial_target_entries = @($targetEntries | ForEach-Object { $_.Name })
-            cargo_registry_cache_present = (Test-Path -LiteralPath (Join-Path $cargoHome 'registry/cache'))
-            cargo_registry_sources_present = (Test-Path -LiteralPath (Join-Path $cargoHome 'registry/src'))
-            cargo_git_checkouts_present = (Test-Path -LiteralPath (Join-Path $cargoHome 'git/checkouts'))
-            rustc_wrapper_configured = (-not [string]::IsNullOrEmpty($env:RUSTC_WRAPPER))
+            initial_target_entries = @($entries | ForEach-Object { $_.Name })
           }
-          $json = $evidence | ConvertTo-Json -Depth 5
-          $json | Set-Content -LiteralPath (Join-Path $outputDir 'inventory.json') -Encoding UTF8
-          $json | Write-Host
-          if ($sourceSha -ne $env:TESTED_SOURCE_SHA) { throw 'Tested source differs from the frozen revision' }
-          if ($targetEntries.Count -ne 0) { throw 'Cold comparison requires empty target outputs; no artifacts will be deleted' }
-          if ($env:RUNNER_ARCH -ne 'X64') { throw 'The experiment requires an x64 Windows runner' }
-          if ($msvc.Count -eq 0) { throw 'MSVC x64 build tools are unavailable' }
-          if ($env:COMPARISON_WORKLOAD -eq 'service') {
-            if (-not $evidence.elevated) { throw 'The existing service smoke requires an elevated runner' }
-            if ($scheduler.Status -ne 'Running' -or $null -eq $taskCommand) { throw 'Task Scheduler prerequisites are unavailable' }
-            if ($existingTask.Count -ne 0) { throw 'The runner already has the fixed smoke task; isolation is unproven' }
-          }
-
+          $evidence | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $outputDir 'inventory.json') -Encoding UTF8
+          if ($sourceSha -ne $env:TESTED_SOURCE_SHA) { throw 'Frozen source identity mismatch' }
+          if ($env:GITHUB_RUN_ATTEMPT -ne '1') { throw 'This comparison does not permit reruns' }
+          if ($entries.Count -ne 0) { throw 'Initial target must be empty; no artifacts will be deleted' }
+          if ($env:RUNNER_ARCH -ne 'X64' -or $msvc.Count -eq 0) { throw 'Windows x64 MSVC prerequisites missing' }
       - name: Install matching Rust toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.98.0
           targets: x86_64-pc-windows-msvc
-
-      - name: Record toolchain and ensure web placeholder
+      - name: Record toolchains and prepare web placeholder
         shell: bash
         run: |
           set -euo pipefail
-          { rustc -Vv; cargo -V; } | tee "$RUNNER_TEMP/windows-runner-comparison/toolchain.log"
+          { rustc -Vv; cargo -V; rustup toolchain list; } | tee "$RUNNER_TEMP/windows-cache-comparison/toolchain.log"
           mkdir -p web/dist
           touch web/dist/.gitkeep
-
-      - name: Check Windows compilation
+      - name: Restore isolated compilation-writer cache
+        id: cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: windows-cache-${{ github.run_id }}-${{ matrix.provider.name }}
+          shared-key: build
+          save-if: 'false'
+          cache-on-failure: 'false'
+          lookup-only: 'false'
+      - name: Require exact hit and record restored dependency state
+        shell: pwsh
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          if ($env:CACHE_HIT -ne 'true') { throw 'Exact seeded cache restore is required; no cold substitute will run' }
+          $dependencies = @(
+            foreach ($profile in @('ci', 'debug')) {
+              $dir = Join-Path 'target/x86_64-pc-windows-msvc' "$profile/deps"
+              if (Test-Path -LiteralPath $dir) { Get-ChildItem -LiteralPath $dir -File -Force }
+            }
+          )
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+          $registryDir = Join-Path $cargoHome 'registry/cache'
+          $archives = @(if (Test-Path -LiteralPath $registryDir) { Get-ChildItem -LiteralPath $registryDir -Recurse -File -Filter '*.crate' })
+          $state = [ordered]@{
+            exact_cache_hit = $true
+            dependency_file_count = $dependencies.Count
+            dependency_bytes = ($dependencies | Measure-Object -Property Length -Sum).Sum
+            registry_archive_count = $archives.Count
+          }
+          $state | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'windows-cache-comparison/restored-cache.json') -Encoding UTF8
+          if ($dependencies.Count -eq 0) { throw 'Archive hit did not restore target dependency artifacts' }
+      - name: Check cached Windows compilation
         if: matrix.workload.name == 'compilation'
         shell: bash
         run: |
           set -euo pipefail
           SECONDS=0
-          cargo check --profile ci --locked --target x86_64-pc-windows-msvc 2>&1 | tee "$RUNNER_TEMP/windows-runner-comparison/compilation.log"
-          printf 'Compilation command elapsed seconds: %s\n' "$SECONDS"
-
-      - name: Check Windows voice-wake
-        if: matrix.workload.name == 'compilation'
-        shell: bash
-        run: |
-          set -euo pipefail
+          cargo check --profile ci --locked --target x86_64-pc-windows-msvc 2>&1 | tee "$RUNNER_TEMP/windows-cache-comparison/compilation.log"
+          printf 'Compilation elapsed seconds: %s\n' "$SECONDS" | tee "$RUNNER_TEMP/windows-cache-comparison/compilation-time.log"
           SECONDS=0
-          cargo check --locked -p zeroclaw-channels --no-default-features --features voice-wake --target x86_64-pc-windows-msvc 2>&1 | tee "$RUNNER_TEMP/windows-runner-comparison/voice-wake.log"
-          printf 'Voice-wake command elapsed seconds: %s\n' "$SECONDS"
-
-      - name: Test Windows task-owner recovery
+          cargo check --locked -p zeroclaw-channels --no-default-features --features voice-wake --target x86_64-pc-windows-msvc 2>&1 | tee "$RUNNER_TEMP/windows-cache-comparison/voice-wake.log"
+          printf 'Voice-wake elapsed seconds: %s\n' "$SECONDS" | tee "$RUNNER_TEMP/windows-cache-comparison/voice-wake-time.log"
+      - name: Test Windows task-owner recovery from compilation cache
         if: matrix.workload.name == 'recovery'
         shell: bash
         run: |
@@ -158,57 +246,35 @@ jobs:
           SECONDS=0
           cargo test --locked -p zeroclaw-runtime --lib \
             --target x86_64-pc-windows-msvc \
-            control_plane::authority::tests::windows_process_exit_is_detected -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-runner-comparison/windows-owner-exit.log"
-          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-runner-comparison/windows-owner-exit.log"
-          printf 'Owner-exit command elapsed seconds: %s\n' "$SECONDS"
+            control_plane::authority::tests::windows_process_exit_is_detected -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-cache-comparison/windows-owner-exit.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-cache-comparison/windows-owner-exit.log"
+          printf 'Owner-exit elapsed seconds: %s\n' "$SECONDS" | tee "$RUNNER_TEMP/windows-cache-comparison/windows-owner-exit-time.log"
           SECONDS=0
           cargo test --locked -p zeroclaw-runtime --lib \
             --target x86_64-pc-windows-msvc \
-            control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-runner-comparison/windows-owner-recovery.log"
-          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-runner-comparison/windows-owner-recovery.log"
-          printf 'Owner-recovery command elapsed seconds: %s\n' "$SECONDS"
-
-      - name: Build controlled Windows service fixture
-        if: matrix.workload.name == 'service'
+            control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-cache-comparison/windows-owner-recovery.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-cache-comparison/windows-owner-recovery.log"
+          printf 'Owner-recovery elapsed seconds: %s\n' "$SECONDS" | tee "$RUNNER_TEMP/windows-cache-comparison/windows-owner-recovery-time.log"
+      - name: Record Cargo reuse diagnostics
+        if: always()
         shell: bash
-        env:
-          CARGO_PROFILE_DEV_DEBUG: 0
         run: |
           set -euo pipefail
-          SECONDS=0
-          cargo build --profile dev --locked -p zeroclaw-runtime \
-            --example windows_service_smoke_fixture \
-            --target x86_64-pc-windows-msvc 2>&1 | tee "$RUNNER_TEMP/windows-runner-comparison/service-build.log"
-          printf 'Service fixture command elapsed seconds: %s\n' "$SECONDS"
-
-      - name: Exercise installed Windows service lifecycle
-        if: matrix.workload.name == 'service'
-        shell: pwsh
-        timeout-minutes: 15
-        run: |
-          ./scripts/ci/windows_service_smoke.ps1 `
-            -FixturePath "target/x86_64-pc-windows-msvc/debug/examples/windows_service_smoke_fixture.exe" `
-            -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
-            -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence"
-
-      - name: Clean up Windows service smoke
-        if: always() && matrix.workload.name == 'service' && steps.checkout.outcome == 'success' && steps.inventory.outcome == 'success'
-        shell: pwsh
-        timeout-minutes: 3
-        run: |
-          ./scripts/ci/windows_service_smoke.ps1 `
-            -FixturePath "target/x86_64-pc-windows-msvc/debug/examples/windows_service_smoke_fixture.exe" `
-            -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
-            -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence" `
-            -CleanupOnly
-
-      - name: Upload comparison evidence
+          evidence_dir="$RUNNER_TEMP/windows-cache-comparison"
+          for command_name in compilation voice-wake windows-owner-exit windows-owner-recovery; do
+            command_log="$evidence_dir/$command_name.log"
+            if [ -f "$command_log" ]; then
+              checking_count=$(grep -cE '^[[:space:]]+Checking ' "$command_log" || true)
+              compiling_count=$(grep -cE '^[[:space:]]+Compiling ' "$command_log" || true)
+              downloaded_count=$(grep -cE '^[[:space:]]+Downloaded ' "$command_log" || true)
+              printf '%s checking=%s compiling=%s downloaded=%s\n' "$command_name" "$checking_count" "$compiling_count" "$downloaded_count" >> "$evidence_dir/reuse-counts.log"
+            fi
+          done
+      - name: Upload reader evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: windows-runner-${{ matrix.provider.name }}-${{ matrix.workload.name }}-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/windows-runner-comparison
-            ${{ runner.temp }}/windows-service-smoke-evidence
-          if-no-files-found: warn
+          name: windows-cache-${{ matrix.provider.name }}-${{ matrix.workload.name }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/windows-cache-comparison
+          if-no-files-found: error
           retention-days: 7
