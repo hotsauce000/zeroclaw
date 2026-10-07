@@ -1,116 +1,66 @@
 # ZeroClaw Claude Code onboarding plugin
 
-This local Code plugin provides `/zeroclaw:onboard` and two read/plan MCP tools.
-It checks native Claude authentication and previews a fresh ZeroClaw instance.
-The host's Claude account can assist with setup; ZeroClaw's independent model
-engine still requires configuration. A native-Code model backend is unsupported.
-The current `claude-code` provider alias resolves to direct Anthropic HTTP.
+This local plugin provides `/zeroclaw:onboard`, read-only status/plan tools and a guarded apply tool. It previews named provider, agent and risk references, then creates a fresh instance through `zeroclaw native-onboard` and the distinct `claude_code_native` provider. Native Code owns login, refresh and billing. The legacy `claude-code` alias continues to invoke direct Anthropic HTTP.
 
 ## Prerequisites and loading
 
-Use unmodified Claude Code **2.1.289+** and **Python 3.9+**, available as
-`python3` on the same local Mac, Linux or WSL host. Code 2.1.289 is this
-package's tested minimum; older versions are not claimed supported. Python's
-standard library is sufficient;
-there is no dependency download, bootstrap executable or control-MCP service.
-Native Windows auth probing returns `unsupported_platform` before discovering
-or spawning Claude. Use a written plan, or run Code and the helper inside WSL
-with its own native account selection; the plugin does not launch WSL or copy
-Windows credentials automatically.
-If Python is absent, the skill can explain the written plan and terminal
-prerequisites, but the MCP checks cannot run. No fresh-machine installation
-claim includes automatic runtime or ZeroClaw provisioning.
+Use unmodified Claude Code **2.1.289+**, **Python 3.9+** as `python3`, and a ZeroClaw build containing `native-onboard` and `claude_code_native` on the same Mac, Linux or WSL host. Released binaries may lack these new capabilities. Status checks the installed command's required flags. The helper uses Python's standard library and downloads nothing. Native Windows probing is unsupported; select a separate WSL account/session explicitly. Missing Python permits written guidance only.
 
-Load the package for one local session, substituting its absolute path:
+Native Code must be able to access its own credential store. A restricted macOS process can report logged out when the host's Keychain login is inaccessible; use the intended native host context rather than exporting or resetting credentials.
+
+Native-default selection and an explicit directory override are distinct authentication choices. On macOS, setting `CLAUDE_CONFIG_DIR` even to the apparent default directory can select a different credential namespace. The default provider preserves native default selection and removes ambient overrides at invocation; an explicitly selected or inherited override remains its literal directory reference. Canonical paths are used for overlap checks rather than changing that native selector.
 
 ```sh
 claude --plugin-dir /absolute/path/to/integrations/claude-plugin
 ```
 
-Invoke `/zeroclaw:onboard`. `/mcp` should show `plugin:zeroclaw:preflight`.
-The package follows the [Code plugin layout][components] and can be shared as
-this directory or a ZIP through the [native plugin distribution flow][publish].
-Session loading avoids a persistent marketplace/settings change. If installing,
-the operator chooses the native scope; this package changes no Claude settings.
-Web chat cannot execute this local helper. Local Code 2.1.289 discovery was
-verified in an isolated bare session with a synthetic API key: the skill and
-both read-only MCP tools appeared. No tool, real account or model request was
-used in that discovery check. Desktop/Cowork and account sync remain unverified.
+Invoke `/zeroclaw:onboard`; `/mcp` should show `plugin:zeroclaw:preflight`. The package follows [native plugin layout][components] and [distribution][publish]. Session loading changes no persistent Claude settings. Web chat cannot run the local helper. Desktop/Cowork and account sync remain unverified. A synthetic bare-session check proved local skill/MCP discovery without real account access or inference.
 
 ## Read and plan contract
 
-`bootstrap.status` accepts optional `claude_config_dir` and `expected_billing`
-(`subscription`, `api`, or `cloud_or_gateway`). It runs only `claude --version`
-and `claude auth status --json`, with argv arrays and the selected directory in
-the child environment. Existing selectors remain intact. The helper preserves
-the parent's environment and does not read credential files or invoke login.
-Native auth status uses exit 1 when logged out. The helper admits only that
-exact command/exit combination with well-formed JSON and `loggedIn: false`,
-then discards the nonzero payload apart from the validated login flag. Other
-nonzero results, including version failures, remain sanitized failures. See the
-[native CLI contract][cli]. The documented `api_key_helper` method is recognized;
-unproven third-party modes keep unknown billing.
-Code itself owns its authentication/storage behavior; a real auth-status smoke
-and refresh/expiry behavior remain unverified in this integration.
-The helper reads only its packaged `.claude-plugin/plugin.json` at startup to
-derive the package version and Code minimum from their canonical manifest fields.
-Missing, oversized or invalid metadata is rejected with `invalid_package_metadata`
-protocol errors, without printing raw file data or parse errors.
+`bootstrap.status` accepts an optional existing absolute `claude_config_dir` reference and `expected_billing` (`subscription`, `api`, or `cloud_or_gateway`). It runs version/auth-status commands with literal argv and preserves the parent environment. It never reads credential files, logs in, switches the host conversation's account or prints identity/token fields. Only recognized enums, the login boolean and constructed billing facts leave preflight. Environment indicators disclose presence only; conflicts/custom endpoints keep billing ambiguous for native `/status` review.
 
-Only recognized method/provider enums, a boolean login flag and constructed
-billing categories leave preflight. Identity, tokens, unknown fields and raw
-errors are discarded. Environment indicators expose presence, never values.
-Conflicting selectors/custom endpoints report ambiguous billing for native
-`/status` review. Status alone never verifies inference or plugin sync.
-Subscription, headless native tokens, Console OAuth, API keys, federation and
-cloud/gateway billing remain distinct. Native login and Console profile
-isolation follow [Code's own authentication contract][auth].
+Native auth status exits 1 when logged out. Only that exact command/exit pair with `loggedIn: false` is admitted, reconstructed as a minimal boolean payload. Other failures and malformed/unknown states remain sanitized failures or unknown billing. See [native authentication][auth] and the [CLI contract][cli]. It also probes `zeroclaw native-onboard --help`; missing/incompatible commands cannot report `bootstrap_cli_status: available`. Help and auth status prove neither applied configuration nor inference. Package version/minimum Code version come from the bounded packaged manifest; invalid metadata fails closed.
 
-`bootstrap.plan` requires `instance_root`, `provider_alias` and `agent_alias`.
-It accepts optional `claude_config_dir`, `risk_preset`, `accept_yolo`,
-`engine_backend` and `accept_api_billing`. Directory inputs are absolute,
-at most 512 characters and free of traversal/control characters. Account
-directories must exist; a fresh instance root must not exist, overlap the native
-account directory or use a symlinked/nonexistent parent. Aliases use lowercase
-letters, digits and underscores, begin with a letter and are at most 48 characters.
+`bootstrap.plan` requires a fresh absolute `instance_root`, `provider_alias` and `agent_alias`. Optional inputs include `claude_config_dir`, `model`, `expected_billing`, `risk_preset`, `accept_yolo`, `engine_backend` and `accept_api_billing`. Roots must not exist, overlap the native account or have a symlinked/missing parent. Directory references reject traversal/control characters. Aliases begin with a lowercase letter, use lowercase letters/digits/underscores and have at most 48 characters. Model IDs are bounded and cannot become CLI options.
 
-The default engine route, `native_claude_code`, returns `unsupported` with no
-execution handoff. The independent `anthropic_api` route requires
-`accept_api_billing: true` and returns `requires_configuration` with the real
-interactive Quickstart argv. Provider alias and risk selection remain terminal
-choices because Quickstart exposes no flags for them. No credentials belong in
-the plan or argv. Billing selection is a proposal, not provider authentication.
+The native route returns `requires_configuration`, the real provider reference `claude_code_native.<provider_alias>`, and this argument-array terminal handoff:
 
-The default risk reference is `balanced`; `yolo` requires `accept_yolo: true`.
-Both refer to ZeroClaw's canonical `RISK_PRESETS` rather than copied policy
-values. Effective policy is `unresolved` until native Quickstart review and
-configuration inspection. Recheck the fresh root immediately before execution;
-a read-only preview cannot reserve it or prove a later policy. The repository's
-protocol design is `docs/book/src/developing/claude-code-onboarding.md`.
+```sh
+zeroclaw --config-dir /absolute/fresh-instance native-onboard \
+  --client claude-code --provider-alias personal --agent-alias assistant \
+  --model default --risk-preset balanced --expected-billing subscription
+```
 
-The server exposes exactly two tools. Unknown methods/install/apply requests
-are rejected. Plans and cancellations perform no writes or subprocess calls.
-No service installation, account switching, credential export, permission
-bypass, connector authorization, control handoff or model request is implemented.
-Future native-Code inference needs a separate loop/session/permission contract
-and assessment against the [native-client terms][terms].
+`default` retains native model selection. Native API billing requires `expected_billing: api, accept_api_billing: true`; it keeps native Code. Explicit `engine_backend: anthropic_api, accept_api_billing: true` selects the separate direct-HTTP/interactive-Quickstart route. Fallback is never silent. Credentials belong in native login/masked terminal prompts, never plan/argv/chat.
+
+Risk defaults to `balanced`. `yolo` requires the exact boolean `accept_yolo: true` and passes `--accept-yolo`. The helper references canonical `RISK_PRESETS` and copies no policy values. A preview always reports effective policy `unresolved`. The native-onboard transaction owns fresh-root admission, authentication and canonical Quickstart apply. Its receipt may be `pending_auth`, `configured`, `ready` or `failed`; `ready` requires bounded real inference and inspected effective policy. Recheck the fresh root before execution.
+
+`bootstrap.apply` accepts the same native plan inputs plus the exact boolean `confirm_create: true`. It rejects the separate HTTP route, unknown arguments and missing creation/risk/billing choices before execution. Native authentication and expected billing must match; the installed binary must expose the canonical command and native client choice. Executable lookup uses absolute PATH entries, pins the canonical paths admitted by preflight and rechecks their filesystem identity before apply. These checks do not authenticate a binary's publisher. It invokes only fixed `native-onboard` arguments with stdin/stdout/stderr disconnected from chat. The command owns all configuration writes and verifies effective policy and a bounded engine reply.
+
+The apply result reports `ready` only after exit 0 and a matching owner-only, regular, non-symlink receipt containing a fresh validation observation. During resume, the previous receipt descriptor remains open until the result is read; the canonical command must publish a new inode. This distinguishes same-second validations from an unchanged old receipt. Nonzero exit, stale/malformed receipts, cancellation or timeout cannot prove readiness. The observation describes that successful check; subsequent calls still resolve native authentication and live policy.
+
+The apply child has a 150-second deadline; prerequisite probes retain their own bounds. MCP cancellation, connection closure and server termination interrupt the owned session. The supervisor reserves the session leader's PID without reaping it, signals normal native children even in separate process groups, and cleans the session before releasing its leader. PID-only system discovery and signal permission are checked before inference. Missing supervision support fails closed. Children deliberately creating another session remain outside this guarantee; this is normal child cleanup, not adversarial process isolation. Owned instance state is retained. To recover, explicitly select `resume: true` and repeat the same choices; canonical CLI admission rejects arbitrary pre-existing roots or request changes.
+
+The helper installs no service and never reads credentials or writes config itself. Installation uses the canonical ZeroClaw installer with an operator-selected prefix and `--no-modify-path --skip-quickstart`; released binaries lacking the new command remain incompatible. It needs neither the historical `zeroclaw-bootstrap` binary nor control-MCP.
+
+## Native inference and permissions
+
+The provider sends the full ZeroClaw conversation and existing prompt-guided tool protocol over stdin to the installed, unmodified client. Each turn checks version/auth/billing, then uses `--safe-mode`, no built-in tools, all native/MCP tools denied, empty strict MCP configuration and no persisted/resumed native session. ZeroClaw remains the sole agent/tool loop: its normal tools enforce canonical risk policy. `yolo` never passes a native permission bypass flag. Administrator-managed policy/hooks and OS controls retain authority. `--bare` skips subscription OAuth/keychain credentials and cannot serve this account-backed path.
+
+The adapter never opens credential files or moves native tokens to HTTP. Native authentication methods remain available; unknown/mismatched billing fails before inference. Native settings can change between probe and request, so Code remains authoritative for final account selection/billing.
+
+Input is capped at 1 MiB and stdout at 4 MiB; each call has a configured deadline. Native stderr/raw errors are discarded. Cancellation kills the POSIX process group; descendants detaching into another group are outside that boundary. Native result text/token usage are returned. Model listing, vision, token streaming, exact replay and stable request identity are not claimed. Native cost estimates differ from actual subscription/API/cloud billing. The [native-client terms][terms] require an unmodified client, native sign-in and direct end-user billing without credential collection/brokerage.
 
 ## Verification and rollback
 
-From the repository root:
-
 ```sh
 python3 -I -B -m unittest discover -s integrations/claude-plugin/tests -v
+cargo test -p zeroclaw-providers --lib claude_code_native
 claude plugin validate --strict integrations/claude-plugin
 ```
 
-Tests use synthetic process fixtures and isolated directories. They cover real
-argv/environment forwarding, missing/wrong binaries, malformed/hostile output,
-credential/billing distinctions, bounded capture/timeouts, protocol-only stdout
-and unchanged config sentinels after rejected install/cancel requests. Manifest
-validation does not prove a live Code session loaded the tools or authenticated
-an account. No live auth/model smoke was run. The session-loaded package is
-removed by ending that session; it creates no ZeroClaw instance state to undo.
+Synthetic tests cover process argv/stdin/account pointers, billing distinctions, hostile output, deadlines/cancellation, missing/incompatible binaries, real provider/factory/history paths and preserved existing config/account sentinels. Live login/inference/effective-policy acceptance is separate from these checks. End the session to unload the plugin. An instance created by native-onboard remains independently owned: stop its processes and retain its root for review or use canonical instance management to remove it. Plugin removal neither deletes that instance nor logs out Code.
 
 [components]: https://code.claude.com/docs/en/plugins/components
 [publish]: https://code.claude.com/docs/en/plugins/publish

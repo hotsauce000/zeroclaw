@@ -1,15 +1,15 @@
 ---
 name: onboard
-description: Check native Claude Code account mode and plan a fresh ZeroClaw instance with explicit engine billing and risk choices.
+description: Check native Claude Code billing, preview a fresh ZeroClaw instance, and apply it with explicit permissions.
 disable-model-invocation: true
 ---
 
 # ZeroClaw onboarding
 
 Guide the operator through a reviewable plan. This plugin supports local Claude
-Code. The host's signed-in setup conversation and ZeroClaw's independent model
-engine are separate. Native-Code inference for the ZeroClaw engine is currently
-unsupported; the existing `claude-code` provider alias uses direct Anthropic HTTP.
+Code. ZeroClaw runs the unmodified native client through its distinct
+`claude_code_native` provider. The existing `claude-code` provider alias still
+uses direct Anthropic HTTP. Account login stays entirely inside native Code.
 
 1. Check prerequisites: unmodified Claude Code 2.1.289+ and `python3` 3.9+ on
    a local Mac, Linux or WSL host. Code 2.1.289 is the tested minimum.
@@ -50,32 +50,57 @@ unsupported; the existing `claude-code` provider alias uses direct Anthropic HTT
    instance-specific consent, represented by `accept_yolo: true`. Explain that
    the preset expands ZeroClaw autonomy and reduces its safeguards; Claude host,
    administrator and OS restrictions retain their own authority.
-5. Ask the operator to choose the engine route explicitly. For subscription
-   native-Code inference, use `engine_backend: native_claude_code` and show the
-   `unsupported` result. Stop at that plan. To proceed with independent Anthropic
-   API billing, require that explicit choice and set
-   `engine_backend: anthropic_api, accept_api_billing: true`. Call
-   `bootstrap.plan` with the selected root, named references and risk choice.
-   Never reinterpret account sign-in or connector authorization as engine auth.
+5. Select `engine_backend: native_claude_code` for native inference. Choose an
+   explicit native billing source and model (normally `subscription` and
+   `default`, which retains native Code's model selection). Native API billing
+   requires `expected_billing: api, accept_api_billing: true`; it keeps the native
+   client. The independent direct-HTTP route is available only when explicitly
+   chosen as `engine_backend: anthropic_api, accept_api_billing: true`.
+   Call `bootstrap.plan` with the root, provider/agent aliases, model, billing
+   and risk choice. Never silently change the route or reinterpret connector
+   authorization as inference entitlement.
 6. Show the returned plan and status. The risk reference is a preset name;
    `effective_policy_status: unresolved` means permissions have not been proven.
-   No install/apply tool exists. If ZeroClaw is absent, link to its
-   [current releases][releases] and [Quickstart][quickstart]; let the operator
-   review and run the appropriate installation path in a terminal. Do not install
-   an OS service. This package needs neither `zeroclaw-bootstrap` nor control-MCP.
-7. For the explicitly selected API route, show `terminal_handoff.argv` as an
-   argument array. If rendering a shell command, quote every argument using that
-   shell's quoting rules; never concatenate operator input unquoted. The operator
-   rechecks that the root is still fresh and starts interactive Quickstart.
-   Its flags only preselect provider type and agent: select the planned provider
-   alias and canonical risk preset in the terminal, review the effective policy,
-   and confirm Create there. Quickstart preserves existing same-named profiles,
-   so a label alone cannot establish effective permissions. Credentials belong
-   exclusively in the native masked prompt, never in argv, chat or this MCP.
-8. On cancellation, leave the plan and stop. After human setup, continue to
-   report `requires_configuration` until configuration is independently inspected;
-   claim inference only after a separately authorized bounded engine test. This
-   first slice performs no model requests, pairing or permission changes.
+   Status and plan are read-only. If ZeroClaw is absent, use its
+   [current releases][releases] and [Quickstart][quickstart] to select the canonical
+   installer. With installation authorization, run the reviewed installer under
+   an operator-selected prefix using `--no-modify-path --skip-quickstart` and
+   make its binary available to this session. Do not install an OS service.
+   Native setup requires a ZeroClaw build containing
+   `native-onboard` and `claude_code_native`; a released binary may lack them.
+   `bootstrap.status` reports `bootstrap_cli_status: available` only when the
+   installed command exposes the required flags. Missing/incompatible status is
+   an unmet prerequisite, never successful installation. This package needs
+   neither `zeroclaw-bootstrap` nor control-MCP.
+7. Show `terminal_handoff.argv` as an argument array and explain the selected
+   billing and permissions. Once the operator has authorized this creation,
+   call `bootstrap.apply` with the same plan inputs and `confirm_create: true`.
+   Keep native billing and risk choices unchanged. This mutating tool calls
+   only `native-onboard`, discards raw CLI output, and may consume model usage.
+   Its child deadline is 150 seconds; cancellation cleans ordinary native
+   process groups in the owned session. Unsupported supervision stops setup.
+   A cancelled/failed instance remains available for inspection and recovery.
+   Set `resume: true` only for an explicitly selected previous transaction and
+   repeat identical choices; the CLI validates its ownership and saved request.
+   If a terminal handoff is needed, quote every argument for the selected shell.
+   `zeroclaw native-onboard` owns native auth/preflight and the canonical
+   Quickstart apply transaction, including provider/agent references and risk
+   preset materialization. Native Code owns login/refresh; the command stores
+   only the selected account-directory reference and expected billing.
+   For the explicitly selected HTTP route, interactive Quickstart owns
+   alias/preset selection; `bootstrap.apply` rejects that route. Never construct
+   or write a parallel config file.
+   Credentials belong exclusively in native login or masked terminal prompts,
+   never in argv, chat or this MCP.
+8. Report the apply result accurately. `ready` requires a successful command and
+   its matching private, newly published receipt with a bounded engine validation; it records
+   the last successful check, not ongoing authentication or quota availability.
+   `pending_auth`, `configured`, failed, cancelled and timed-out results are
+   incomplete. The plugin's preview never proves inference or effective policy.
+   ZeroClaw owns its sole tool loop; native child built-in/MCP tools and
+   customizations are disabled for inference. `yolo` changes only the canonical
+   ZeroClaw risk preset; native administrator and OS policies retain authority.
+   The helper never reads credentials or writes configuration itself.
 
 [auth]: https://code.claude.com/docs/en/authentication
 [releases]: https://github.com/zeroclaw-labs/zeroclaw/releases/latest

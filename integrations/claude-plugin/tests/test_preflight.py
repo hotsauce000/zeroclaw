@@ -55,6 +55,304 @@ class BoundaryTests(unittest.TestCase):
         return {"instance_root": str(self.base / "fresh instance; $(touch injected)"),
                 "provider_alias": "claude_api", "agent_alias": "assistant", **extra}
 
+    def apply_args(self, **extra):
+        return self.plan_args(claude_config_dir=str(self.account), confirm_create=True, **extra)
+
+    def fake_zeroclaw(self):
+        executable = self.bin / "zeroclaw"
+        executable.write_text("#!" + sys.executable + "\n" +
+                              (FIXTURES / "fake_zeroclaw.py").read_text(), encoding="utf-8")
+        executable.chmod(0o700)
+
+    def apply(self, **extra):
+        with patch.dict(os.environ, self.env, clear=True):
+            return helper.apply_instance(self.apply_args(**extra))
+
+    def test_apply_calls_canonical_owner_and_reports_verified_receipt(self):
+        self.fake_zeroclaw()
+        result = self.apply()
+        root = Path(self.apply_args()["instance_root"])
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["inference_verified"])
+        self.assertEqual(result["configuration_owner"], "zeroclaw native-onboard")
+        self.assertEqual(result["provider_reference"], "claude_code_native.claude_api")
+        self.assertEqual(self.secret_file.read_bytes(), b"synthetic-credential-sentinel")
+        self.assertTrue((root / "config.toml").is_file())
+        call = json.loads((self.base / "zeroclaw-call.json").read_text())
+        self.assertEqual(call["argv"][:6], ["--config-dir", str(root), "native-onboard",
+                                          "--client", "claude-code", "--provider-alias"])
+        self.assertEqual(call["stdin"], "")
+        self.assertNotIn("sk-ant-", json.dumps(result))
+        self.assertNotIn("fixture-private-diagnostic", json.dumps(result))
+
+    def test_apply_preserves_native_default_without_creating_directory_override(self):
+        self.fake_zeroclaw()
+        arguments = self.apply_args()
+        del arguments["claude_config_dir"]
+        with patch.dict(os.environ, self.env, clear=True):
+            result = helper.apply_instance(arguments)
+        self.assertEqual(result["status"], "ready")
+        call = json.loads((self.base / "zeroclaw-call.json").read_text())
+        self.assertNotIn("--native-config-dir", call["argv"])
+        receipt = json.loads((Path(arguments["instance_root"]) / "native-onboard.json").read_text())
+        self.assertIsNone(receipt["request"]["native_config_dir"])
+
+    def test_project_relative_path_entries_cannot_select_shadow_launchers(self):
+        self.fake_zeroclaw()
+        for name in ("claude", "zeroclaw"):
+            shadow = self.base / name
+            shadow.write_text("#!" + sys.executable + "\nfrom pathlib import Path\n"
+                              "Path('shadow-executed').touch()\n", encoding="utf-8")
+            shadow.chmod(0o700)
+        self.env["PATH"] = ".:" + str(self.bin) + ":relative:"
+        previous = Path.cwd()
+        try:
+            os.chdir(self.base)
+            self.assertEqual(self.apply()["status"], "ready")
+        finally:
+            os.chdir(previous)
+        self.assertFalse((self.base / "shadow-executed").exists())
+
+    def test_apply_retains_the_executable_admitted_by_preflight(self):
+        self.fake_zeroclaw()
+        evil = self.bin / "other-zeroclaw"
+        marker = self.base / "unadmitted-executable"
+        evil.write_text("#!" + sys.executable + "\nfrom pathlib import Path\n"
+                        "Path(" + repr(str(marker)) + ").touch()\n", encoding="utf-8")
+        evil.chmod(0o700)
+        with patch.object(helper.shutil, "which", side_effect=[str(self.bin / "claude"),
+                         str(self.bin / "zeroclaw"), str(evil)]):
+            result = self.apply()
+        self.assertEqual(result["status"], "ready")
+        self.assertFalse(marker.exists())
+
+    def test_same_second_resume_requires_new_atomic_receipt_publication(self):
+        self.fake_zeroclaw()
+        self.env["FIXTURE_VALIDATION_TIME"] = "1000"
+        with patch.object(helper.time, "time", return_value=1000.9):
+            self.assertEqual(self.apply()["status"], "ready")
+            receipt = Path(self.apply_args()["instance_root"]) / "native-onboard.json"
+            old = receipt.read_bytes()
+            self.env["FIXTURE_ZEROCLAW_MODE"] = "no_refresh"
+            result = self.apply(resume=True)
+            self.assertEqual(receipt.read_bytes(), old)
+            self.assertNotEqual(result["status"], "ready")
+            self.assertFalse(result["inference_verified"])
+            self.env["FIXTURE_ZEROCLAW_MODE"] = "ready"
+            # A real new publication in the same second is admitted, even if
+            # timestamp and serialized bytes happen to be identical.
+            self.assertEqual(self.apply(resume=True)["status"], "ready")
+
+    def test_apply_requires_exact_creation_risk_and_billing_choices_before_spawn(self):
+        self.fake_zeroclaw()
+        for extra in [{"confirm_create": False}, {"confirm_create": 1},
+                      {"confirm_create": "true"}, {"risk_preset": "yolo"},
+                      {"expected_billing": "api"}, {"engine_backend": "anthropic_api",
+                       "accept_api_billing": True}, {"argv": ["--dangerous"]}]:
+            with self.subTest(extra=extra), patch.dict(os.environ, self.env, clear=True), self.assertRaises(ValueError):
+                helper.apply_instance({**self.apply_args(), **extra})
+        self.assertFalse((self.base / "zeroclaw-call.json").exists())
+        self.assertFalse(Path(self.apply_args()["instance_root"]).exists())
+
+    def test_apply_refuses_missing_incompatible_or_mismatched_prerequisites(self):
+        self.assertEqual(self.apply()["status"], "missing_zeroclaw")
+        self.fake_zeroclaw()
+        self.env["FIXTURE_ZEROCLAW_MODE"] = "incompatible"
+        self.assertEqual(self.apply()["status"], "incompatible_zeroclaw")
+        self.env["FIXTURE_ZEROCLAW_MODE"] = "ready"
+        self.env["FIXTURE_AUTH"] = str(FIXTURES / "auth_api.json")
+        self.assertEqual(self.apply()["status"], "native_billing_not_verified")
+        self.assertFalse((self.base / "zeroclaw-call.json").exists())
+
+    def test_unavailable_supervision_refuses_before_any_cli_or_instance_work(self):
+        self.fake_zeroclaw()
+        with patch.object(helper.SUPERVISION, "check_support", return_value=False):
+            result = self.apply()
+        self.assertEqual(result["status"], "process_supervision_unavailable")
+        self.assertFalse(result["inference_verified"])
+        self.assertFalse(self.log.exists())
+        self.assertFalse((self.base / "zeroclaw-call.json").exists())
+        self.assertFalse(Path(self.apply_args()["instance_root"]).exists())
+
+    def test_supervision_failure_is_reported_without_claiming_cleanup_or_ready(self):
+        self.fake_zeroclaw()
+        with patch.object(helper.SUPERVISION, "check_support", return_value=True), \
+                patch.object(helper.SUPERVISION, "passive_exited", side_effect=helper.SUPERVISION.SupervisionError()):
+            result = self.apply()
+        self.assertEqual(result["status"], "cleanup_unverified")
+        self.assertFalse(result["inference_verified"])
+        self.assertIsNone(result["last_validation_at"])
+
+    def test_apply_never_claims_ready_from_failed_stale_or_invalid_receipts(self):
+        self.fake_zeroclaw()
+        for mode in ["nonzero", "missing_receipt", "wrong_request", "no_validation", "receipt_symlink", "stale_validation"]:
+            with self.subTest(mode=mode):
+                self.env["FIXTURE_ZEROCLAW_MODE"] = mode
+                result = self.apply(instance_root=str(self.base / mode))
+                self.assertNotEqual(result["status"], "ready")
+                self.assertFalse(result["inference_verified"])
+                self.assertNotIn("sk-ant-", json.dumps(result))
+        self.assertEqual(self.secret_file.read_bytes(), b"synthetic-credential-sentinel")
+
+    def test_apply_resume_is_explicit_and_only_canonical_owner_admits_it(self):
+        self.fake_zeroclaw()
+        self.env["FIXTURE_ZEROCLAW_MODE"] = "configured"
+        result = self.apply()
+        self.assertEqual(result["status"], "configured")
+        self.assertFalse(result["inference_verified"])
+        with self.assertRaises(ValueError):
+            self.apply()
+        self.env["FIXTURE_ZEROCLAW_MODE"] = "ready"
+        self.assertEqual(self.apply(resume=True)["status"], "ready")
+
+    def test_apply_deadline_interrupts_process_and_retains_owned_state(self):
+        self.fake_zeroclaw()
+        self.env["FIXTURE_ZEROCLAW_MODE"] = "sleep"
+        with patch.object(helper, "APPLY_TIMEOUT_SECONDS", 0.4):
+            result = self.apply()
+        self.assertEqual(result["status"], "apply_timeout")
+        self.assertFalse(result["inference_verified"])
+        self.assertTrue(Path(self.apply_args()["instance_root"]).exists())
+        call = json.loads((self.base / "zeroclaw-call.json").read_text())
+        self.assertLess(time.monotonic() - call["started_monotonic"], 3)
+        pid = call["pid"]
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def assert_native_heartbeat_stopped(self):
+        heartbeat = self.base / "native-heartbeat"
+        before = heartbeat.stat().st_size if heartbeat.exists() else 0
+        time.sleep(.15)
+        after = heartbeat.stat().st_size if heartbeat.exists() else 0
+        self.assertEqual(before, after, "ordinary native child continued after cancellation")
+
+    def test_apply_timeout_cleans_noncooperative_native_group(self):
+        self.fake_zeroclaw()
+        self.env["FIXTURE_ZEROCLAW_MODE"] = "multi_group_sleep"
+        with patch.object(helper, "APPLY_TIMEOUT_SECONDS", .5):
+            result = self.apply()
+        self.assertEqual(result["status"], "apply_timeout")
+        self.assertFalse(result["inference_verified"])
+        call = json.loads((self.base / "zeroclaw-call.json").read_text())
+        self.assertIn("native_child_pid", call)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(call["pid"], 0)
+        self.assert_native_heartbeat_stopped()
+
+    def test_mcp_cancel_close_and_termination_clean_native_other_group(self):
+        self.fake_zeroclaw()
+        self.env["FIXTURE_ZEROCLAW_MODE"] = "multi_group_sleep"
+        for action in ("cancel", "close", "terminate"):
+            with self.subTest(action=action):
+                log = self.base / "zeroclaw-call.json"
+                if log.exists():
+                    log.unlink()
+                request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "bootstrap.apply", "arguments": self.apply_args(
+                               instance_root=str(self.base / ("native-" + action)))}}
+                process = subprocess.Popen([sys.executable, "-I", "-B", str(SCRIPT), "--stdio"],
+                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           cwd=self.base, env=self.env)
+                try:
+                    process.stdin.write((json.dumps(request) + "\n").encode())
+                    process.stdin.flush()
+                    deadline = time.monotonic() + 6
+                    while not log.exists() and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertTrue(log.exists())
+                    call = json.loads(log.read_text())
+                    self.assertIn("native_child_pid", call)
+                    if action == "cancel":
+                        cancel = {"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                  "params": {"requestId": 1}}
+                        process.stdin.write((json.dumps(cancel) + "\n").encode())
+                        process.stdin.flush()
+                    if action == "terminate":
+                        process.terminate()
+                    else:
+                        process.stdin.close()
+                    process.wait(timeout=5)
+                    response = json.loads(process.stdout.read())
+                    result = json.loads(response["result"]["content"][0]["text"])
+                    self.assertEqual(result["status"], "apply_cancelled")
+                    self.assertFalse(result["inference_verified"])
+                    self.assertEqual(process.stderr.read(), b"")
+                    self.assert_native_heartbeat_stopped()
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    if not process.stdin.closed:
+                        process.stdin.close()
+                    process.stdout.close()
+                    process.stderr.close()
+
+    def test_native_headless_token_presence_requires_matching_reported_method(self):
+        self.env["CLAUDE_CODE_OAUTH_TOKEN"] = "synthetic-native-token"
+        self.fixture({"loggedIn": True, "authMethod": "oauth_token", "apiProvider": "firstParty"})
+        self.assertEqual(self.status()["native_code"]["auth"]["billing_status"], "matches")
+        self.env["ANTHROPIC_API_KEY"] = "synthetic-api-key"
+        self.assertEqual(self.status()["native_code"]["auth"]["billing_status"], "unknown")
+
+    def test_mcp_connection_close_cancels_active_apply(self):
+        self.fake_zeroclaw()
+        self.env["FIXTURE_ZEROCLAW_MODE"] = "sleep"
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "bootstrap.apply", "arguments": self.apply_args()}}
+        process = subprocess.Popen([sys.executable, "-I", "-B", str(SCRIPT), "--stdio"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   cwd=self.base, env=self.env)
+        try:
+            process.stdin.write((json.dumps(request) + "\n").encode())
+            process.stdin.flush()
+            deadline = time.monotonic() + 5
+            while not (self.base / "zeroclaw-call.json").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue((self.base / "zeroclaw-call.json").exists())
+            process.stdin.close()
+            process.wait(timeout=4)
+            response = json.loads(process.stdout.read())
+            self.assertEqual(json.loads(response["result"]["content"][0]["text"])["status"], "apply_cancelled")
+            self.assertEqual(process.stderr.read(), b"")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+            process.stderr.close()
+
+    def test_mcp_apply_is_mutating_and_cancellation_reaches_canonical_process(self):
+        self.fake_zeroclaw()
+        self.env["FIXTURE_ZEROCLAW_MODE"] = "sleep"
+        tools = {tool["name"]: tool for tool in helper.TOOLS}
+        self.assertFalse(tools["bootstrap.apply"]["annotations"]["readOnlyHint"])
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "bootstrap.apply", "arguments": self.apply_args()}}
+        process = subprocess.Popen([sys.executable, "-I", "-B", str(SCRIPT), "--stdio"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   cwd=self.base, env=self.env)
+        try:
+            process.stdin.write((json.dumps(request) + "\n").encode())
+            process.stdin.flush()
+            deadline = time.monotonic() + 5
+            while not (self.base / "zeroclaw-call.json").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue((self.base / "zeroclaw-call.json").exists())
+            cancel = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}
+            process.stdin.write((json.dumps(cancel) + "\n").encode())
+            process.stdin.flush()
+            process.stdin.close()
+            process.wait(timeout=4)
+            response = json.loads(process.stdout.read())
+            self.assertEqual(json.loads(response["result"]["content"][0]["text"])["status"], "apply_cancelled")
+            self.assertEqual(process.stderr.read(), b"")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+            process.stderr.close()
+
     def run_server(self, requests, raw=None, **extra_env):
         payload = raw if raw is not None else b"".join(
             (json.dumps(r) + "\n").encode() for r in requests)
@@ -175,7 +473,8 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(result["native_code"]["auth"]["credential_mode"], "claude_subscription")
         self.assertTrue(result["native_code"]["auth"]["billing_matches_expectation"])
         self.assertEqual(result["zeroclaw_engine"]["status"], "requires_configuration")
-        self.assertEqual(result["zeroclaw_engine"]["native_code_backend"], "unsupported")
+        self.assertEqual(result["zeroclaw_engine"]["native_code_backend"], "claude_code_native")
+        self.assertEqual(result["zeroclaw_engine"]["bootstrap_cli_status"], "missing_zeroclaw")
         self.assertFalse(result["zeroclaw_engine"]["inference_verified"])
 
     def test_allowlist_excludes_identity_unknown_fields_and_hostile_strings(self):
@@ -306,13 +605,13 @@ class BoundaryTests(unittest.TestCase):
         metadata = manifest["metadata"]
         self.assertEqual(metadata["operations"], [t["name"] for t in helper.TOOLS])
         self.assertEqual(metadata["minimumClaudeCodeVersion"], ".".join(map(str, helper.MIN_CLAUDE_VERSION)))
-        self.assertEqual(metadata["nativeZeroClawModelBackend"], "unsupported")
-        self.assertFalse(metadata["writesInstanceConfiguration"])
+        self.assertEqual(metadata["nativeZeroClawModelBackend"], "claude_code_native")
+        self.assertTrue(metadata["writesInstanceConfiguration"])
         self.assertFalse((ROOT / "bin").exists())
         self.assertFalse((ROOT / "hooks").exists())
         archive = self.base / "plugin.zip"
         shipped = [".claude-plugin/plugin.json", ".mcp.json", "scripts/preflight.py",
-                   "skills/onboard/SKILL.md", "README.md", "LICENSE"]
+                   "scripts/process_supervision.py", "skills/onboard/SKILL.md", "README.md", "LICENSE"]
         with zipfile.ZipFile(archive, "w") as z:
             for name in shipped:
                 z.write(ROOT / name, name)
@@ -457,14 +756,75 @@ class BoundaryTests(unittest.TestCase):
     def test_plan_is_read_only_references_canonical_presets_and_cannot_be_ready(self):
         args = self.plan_args()
         result = helper.plan(args)
-        self.assertEqual(result["status"], "unsupported")
+        self.assertEqual(result["status"], "requires_configuration")
         self.assertEqual(result["risk"]["preset"], "balanced")
         self.assertEqual(result["risk"]["effective_policy_status"], "unresolved")
         self.assertEqual(result["provider"]["alias"], "claude_api")
         self.assertEqual(result["agent"]["risk_profile"], "balanced")
-        self.assertIsNone(result["terminal_handoff"])
+        self.assertEqual(result["terminal_handoff"]["owner"], "zeroclaw native-onboard")
         self.assertFalse(Path(args["instance_root"]).exists())
         self.assertFalse(self.log.exists())
+
+    def test_native_plan_names_real_provider_agent_and_canonical_bootstrap(self):
+        args = self.plan_args(claude_config_dir=str(self.account))
+        result = helper.plan(args)
+        self.assertEqual(result["status"], "requires_configuration")
+        self.assertEqual(result["provider"]["config_reference"], "claude_code_native.claude_api")
+        self.assertEqual(result["agent"]["model_provider"], "claude_code_native.claude_api")
+        self.assertEqual(result["provider"]["expected_billing"], "subscription")
+        self.assertEqual(result["native_account_directory"]["path"], str(self.account))
+        self.assertEqual(result["terminal_handoff"]["owner"], "zeroclaw native-onboard")
+        self.assertIn("--native-config-dir", result["terminal_handoff"]["argv"])
+        self.assertNotIn("setup-token", json.dumps(result))
+        self.assertFalse(result["writes_performed"])
+        self.assertFalse(result["inference_verified"])
+        self.assertFalse(Path(args["instance_root"]).exists())
+
+    def test_native_plan_requires_explicit_api_billing_acceptance(self):
+        args = self.plan_args(expected_billing="api")
+        with self.assertRaises(ValueError):
+            helper.plan(args)
+        result = helper.plan({**args, "accept_api_billing": True})
+        self.assertEqual(result["provider"]["engine_backend"], "native_claude_code")
+        self.assertEqual(result["provider"]["expected_billing"], "api")
+        self.assertEqual(result["provider"]["config_reference"], "claude_code_native.claude_api")
+
+    def test_native_plan_model_billing_and_yolo_are_literal_canonical_arguments(self):
+        args = self.plan_args(model="sonnet[1m]", risk_preset="yolo", accept_yolo=True,
+                              expected_billing="api", accept_api_billing=True,
+                              claude_config_dir=str(self.account))
+        result = helper.plan(args)
+        argv = result["terminal_handoff"]["argv"]
+        self.assertEqual(argv, ["zeroclaw", "--config-dir", args["instance_root"],
+                               "native-onboard", "--client", "claude-code",
+                               "--provider-alias", "claude_api", "--agent-alias", "assistant",
+                               "--model", "sonnet[1m]", "--risk-preset", "yolo",
+                               "--expected-billing", "api", "--accept-yolo", "--accept-api-billing",
+                               "--native-config-dir", str(self.account)])
+        self.assertFalse(self.log.exists())
+        self.assertFalse(Path(args["instance_root"]).exists())
+        for field in [{"model": "--dangerously-skip-permissions"}, {"model": "a;touch injected"},
+                      {"model": "x" * 129}, {"model": 1}, {"expected_billing": "unknown"}]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                helper.plan(self.plan_args(**field))
+
+    def test_installed_bootstrap_command_requires_real_flags_without_writes(self):
+        executable = self.bin / "zeroclaw"
+        flags = ["claude-code", "--client", "--provider-alias", "--agent-alias", "--model", "--risk-preset",
+                 "--expected-billing", "--accept-yolo", "--accept-api-billing", "--native-config-dir"]
+        for expected, output in [("available", " ".join(flags)),
+                                 ("incompatible_zeroclaw", " ".join(flags[1:])),
+                                 ("incompatible_zeroclaw", " ".join(flags[:-1])),
+                                 ("incompatible_zeroclaw", "synthetic-secret-unrecognized")]:
+            executable.write_text("#!" + sys.executable + "\nimport sys\n"
+                                  "assert sys.argv[1:] == ['native-onboard', '--help']\n"
+                                  "print(" + repr(output) + ")\n", encoding="utf-8")
+            executable.chmod(0o700)
+            result = self.status()
+            self.assertEqual(result["zeroclaw_engine"]["bootstrap_cli_status"], expected)
+            self.assertFalse(result["zeroclaw_engine"]["inference_verified"])
+            self.assertNotIn("synthetic-secret", json.dumps(result))
+        self.assertEqual(self.secret_file.read_bytes(), b"synthetic-credential-sentinel")
 
     def test_api_handoff_needs_explicit_billing_choice_and_uses_only_real_flags(self):
         args = self.plan_args(engine_backend="anthropic_api")
@@ -531,9 +891,12 @@ class BoundaryTests(unittest.TestCase):
         ]
         output = self.run_server(requests)
         self.assertEqual([r["id"] for r in output], [0, 1, 2, 3])
-        self.assertEqual({t["name"] for t in output[1]["result"]["tools"]}, {"bootstrap.status", "bootstrap.plan"})
-        self.assertTrue(all(t["annotations"]["readOnlyHint"] for t in output[1]["result"]["tools"]))
-        self.assertEqual(json.loads(output[-1]["result"]["content"][0]["text"])["status"], "unsupported")
+        tools = {t["name"]: t for t in output[1]["result"]["tools"]}
+        self.assertEqual(set(tools), {"bootstrap.status", "bootstrap.plan", "bootstrap.apply"})
+        self.assertTrue(tools["bootstrap.status"]["annotations"]["readOnlyHint"])
+        self.assertTrue(tools["bootstrap.plan"]["annotations"]["readOnlyHint"])
+        self.assertFalse(tools["bootstrap.apply"]["annotations"]["readOnlyHint"])
+        self.assertEqual(json.loads(output[-1]["result"]["content"][0]["text"])["status"], "requires_configuration")
         self.assertFalse(Path(self.plan_args()["instance_root"]).exists())
 
     def test_unknown_methods_install_and_wrong_inputs_never_touch_existing_config(self):
