@@ -86,16 +86,23 @@ their results in the next request. Calls to an unoffered tool, the wrong
 namespace, incomplete or malformed calls, and unsupported output types fail
 closed. Setting `native_tools = false` disables native function negotiation and
 rejects directly supplied structured tool specs. The normal loop may use its
-existing prompt-guided protocol in that mode. Tool availability and approvals
+existing prompt-guided protocol in that mode, but tool follow-ups without
+provider-issued provenance cannot be resumed. Tool availability and approvals
 remain owned by the agent's scoped policy; this transport flag does not narrow
 the registry. The text check remains available.
 
 Every follow-up resends local history, including function-call IDs, corresponding
 outputs, and opaque reasoning items. No `previous_response_id` or hosted
-conversation is used. Reasoning replay is bound to the originating registration;
-cross-registration, mismatched, duplicate, or orphaned tool history is rejected
-before inference egress. Switching accounts requires an explicitly chosen
-registration and fresh compatible history.
+conversation is used. Replay is bound to the originating issued client and
+validated account identity, using an opaque digest from the same canonical
+credential snapshot as the request's bearer. Account identifiers stay in the
+auth store. Each returned call carries this digest in local history metadata,
+so the check survives retained history that omits opaque reasoning. History
+without these provider-issued stamps requires a fresh compatible conversation.
+Cross-registration, mismatched, duplicate, or orphaned tool history is rejected
+before inference egress. Completed call IDs cannot be reused in later rounds,
+and a new response cannot reuse an ID from supplied history. Switching accounts
+requires an explicitly chosen registration and fresh compatible history.
 
 Local MCP wrappers and the local discovery function remain ordinary client-side
 functions under the same policy. The provider does not emit Responses

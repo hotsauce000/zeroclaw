@@ -414,6 +414,10 @@ impl PlanOAuth {
     }
 
     async fn access_token(&self, service: &AuthService, binding: &str) -> Result<String> {
+        Ok(self.credential(service, binding).await?.access_token)
+    }
+
+    async fn credential(&self, service: &AuthService, binding: &str) -> Result<PlanCredential> {
         anyhow::ensure!(
             binding.starts_with("chatgpt-plan:") && binding.len() > "chatgpt-plan:".len(),
             "Explicit ChatGPT plan registration reference required"
@@ -427,7 +431,7 @@ impl PlanOAuth {
         if registration.refresh_started_at.is_none()
             && !tokens.is_expiring_within(Duration::from_secs(90))
         {
-            return Ok(tokens.access_token.clone());
+            return Ok(PlanCredential::from_validated(registration, tokens));
         }
         let _lock = service.store.acquire_plan_refresh_lock(binding).await?;
         // Another process may already have refreshed and rotated this session.
@@ -446,7 +450,7 @@ impl PlanOAuth {
             "Bound ChatGPT registration changed during refresh"
         );
         if !tokens.is_expiring_within(Duration::from_secs(90)) {
-            return Ok(tokens.access_token.clone());
+            return Ok(PlanCredential::from_validated(current, tokens));
         }
         if let Some(earliest) = current.earliest_refresh_at {
             anyhow::ensure!(
@@ -500,7 +504,6 @@ impl PlanOAuth {
         } else {
             replacement.id_token = tokens.id_token.clone();
         }
-        let access = replacement.access_token.clone();
         let mut updated = profile.clone();
         updated.token_set = Some(replacement);
         updated
@@ -513,8 +516,10 @@ impl PlanOAuth {
             .as_mut()
             .context("Missing ChatGPT registration")?
             .refresh_started_at = None;
+        let (registration, tokens) = registration_tokens(&updated)?;
+        let credential = PlanCredential::from_validated(registration, tokens);
         service.store.upsert_profile(updated, false).await?;
-        Ok(access)
+        Ok(credential)
     }
 }
 
@@ -549,7 +554,39 @@ fn registration_tokens(profile: &AuthProfile) -> Result<(&ChatGptPlanRegistratio
     Ok((registration, tokens))
 }
 
+/// Ephemeral bearer and replay identity from one validated canonical profile
+/// snapshot. Never persist or independently re-resolve either half.
+pub(crate) struct PlanCredential {
+    pub(crate) access_token: String,
+    pub(crate) registration_provenance: String,
+}
+
+impl PlanCredential {
+    fn from_validated(registration: &ChatGptPlanRegistration, tokens: &TokenSet) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"zeroclaw.chatgpt-plan.replay-registration.v1\0");
+        // Length prefixes prevent ambiguous concatenations. Account identifiers
+        // stay in the canonical auth store rather than tool/history metadata.
+        for part in [&registration.client_id, &registration.subject] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        Self {
+            access_token: tokens.access_token.clone(),
+            registration_provenance: hex::encode(digest.finalize()),
+        }
+    }
+}
+
 impl AuthService {
+    pub(crate) async fn resolve_chatgpt_plan_credential(
+        &self,
+        binding: &str,
+    ) -> Result<PlanCredential> {
+        PlanOAuth::default().credential(self, binding).await
+    }
+
     /// Exact registration only; deliberately bypasses active/default selection.
     pub async fn get_valid_chatgpt_plan_access_token(&self, binding: &str) -> Result<String> {
         PlanOAuth::default().access_token(self, binding).await

@@ -160,16 +160,23 @@ impl ChatGptPlanProvider {
             self.native_tools || tools.is_empty(),
             "ChatGPT native function tools are disabled for this provider"
         );
-        let body = request_body(messages, tools, model, temperature, &self.registration)?;
-        let access = self
+        let credential = self
             .auth
-            .get_valid_chatgpt_plan_access_token(&self.registration)
+            .resolve_chatgpt_plan_credential(&self.registration)
             .await?;
+        let (body, history_call_ids) = request_body(
+            messages,
+            tools,
+            model,
+            temperature,
+            &self.registration,
+            &credential.registration_provenance,
+        )?;
         let response = tokio::time::timeout(
             Duration::from_secs(30),
             self.client
                 .post(&self.responses_url)
-                .bearer_auth(access)
+                .bearer_auth(&credential.access_token)
                 .header("Accept", "text/event-stream")
                 .json(&body)
                 .send(),
@@ -229,13 +236,23 @@ impl ChatGptPlanProvider {
                     pending.iter().all(u8::is_ascii_whitespace),
                     "ChatGPT plan stream has an incomplete event after completion"
                 );
-                return sse.finish(tools, &self.registration);
+                return sse.finish(
+                    tools,
+                    &self.registration,
+                    &credential.registration_provenance,
+                    &history_call_ids,
+                );
             }
         }
         if !pending.is_empty() {
             anyhow::bail!("ChatGPT plan stream ended with an incomplete event");
         }
-        sse.finish(tools, &self.registration)
+        sse.finish(
+            tools,
+            &self.registration,
+            &credential.registration_provenance,
+            &history_call_ids,
+        )
     }
 }
 
@@ -304,7 +321,8 @@ fn request_body(
     model: &str,
     temperature: Option<f64>,
     registration: &str,
-) -> Result<Value> {
+    registration_provenance: &str,
+) -> Result<(Value, HashSet<String>)> {
     anyhow::ensure!(
         temperature.is_none(),
         "ChatGPT plan preview does not support temperature"
@@ -313,6 +331,7 @@ fn request_body(
     let mut input = Vec::new();
     let mut instructions = Vec::new();
     let mut pending_calls = HashSet::new();
+    let mut seen_call_ids = HashSet::new();
     for (index, message) in messages.iter().enumerate() {
         if ChatMessage::should_skip_internal_pruning_marker(messages, index) {
             continue;
@@ -329,6 +348,17 @@ fn request_body(
                     let calls: Vec<ToolCall> =
                         serde_json::from_value(envelope["tool_calls"].clone())
                             .map_err(|_| protocol_error("Invalid ChatGPT tool-call history"))?;
+                    for call in &calls {
+                        anyhow::ensure!(
+                            call.extra_content
+                                .as_ref()
+                                .is_some_and(
+                                    |extra| extra["chatgpt_plan"]["registration_provenance"]
+                                        == registration_provenance
+                                ),
+                            "ChatGPT tool-call history has missing or different registration provenance; start a fresh compatible history"
+                        );
+                    }
                     let replay = envelope
                         .get("reasoning_content")
                         .and_then(Value::as_str)
@@ -342,6 +372,10 @@ fn request_body(
                             replay["provider"] == "chatgpt-plan"
                                 && replay["registration"] == registration,
                             "ChatGPT reasoning history belongs to a different registration"
+                        );
+                        anyhow::ensure!(
+                            replay["registration_provenance"] == registration_provenance,
+                            "ChatGPT reasoning history belongs to a different registration provenance"
                         );
                         let items = replay["items"]
                             .as_array()
@@ -377,9 +411,10 @@ fn request_body(
                         if item["type"] == "function_call" {
                             let call = function_call(&item)?;
                             anyhow::ensure!(
-                                pending_calls.insert(call.id),
+                                seen_call_ids.insert(call.id.clone()),
                                 "Duplicate ChatGPT tool-call history ID"
                             );
+                            pending_calls.insert(call.id);
                         }
                         input.push(item);
                     }
@@ -424,7 +459,7 @@ fn request_body(
         body["tools"] = json!([{"type":"namespace","name":"zeroclaw","tools":functions}]);
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
-    Ok(body)
+    Ok((body, seen_call_ids))
 }
 
 fn parse_raw_function(value: &Value) -> Result<ToolSpec> {
@@ -578,7 +613,13 @@ impl PlanSse {
         }
         Ok(())
     }
-    fn finish(&self, tools: &[ToolSpec], registration: &str) -> Result<ChatResponse> {
+    fn finish(
+        &self,
+        tools: &[ToolSpec],
+        registration: &str,
+        registration_provenance: &str,
+        history_call_ids: &HashSet<String>,
+    ) -> Result<ChatResponse> {
         anyhow::ensure!(
             self.completed,
             "ChatGPT plan stream ended before response.completed"
@@ -589,7 +630,7 @@ impl PlanSse {
             .iter()
             .filter(|item| item["type"] == "function_call")
             .map(|item| {
-                let call = function_call(item)?;
+                let mut call = function_call(item)?;
                 anyhow::ensure!(
                     tools.iter().any(|tool| tool.name == call.name),
                     "ChatGPT response called an unoffered tool"
@@ -597,6 +638,15 @@ impl PlanSse {
                 anyhow::ensure!(
                     ids.insert(call.id.clone()),
                     "Duplicate ChatGPT function call ID"
+                );
+                anyhow::ensure!(
+                    !history_call_ids.contains(&call.id),
+                    "ChatGPT function call ID collides with supplied history"
+                );
+                // Native history and retained snapshots already preserve this
+                // per-call metadata even when opaque reasoning is stripped.
+                call.extra_content = Some(
+                    json!({"chatgpt_plan":{"registration_provenance":registration_provenance}}),
                 );
                 Ok(call)
             })
@@ -608,7 +658,7 @@ impl PlanSse {
         let reasoning_content = if tool_calls.is_empty() {
             None
         } else {
-            Some(serde_json::to_string(&json!({"provider":"chatgpt-plan","registration":registration,"items":self.output}))
+            Some(serde_json::to_string(&json!({"provider":"chatgpt-plan","registration":registration,"registration_provenance":registration_provenance,"items":self.output}))
                 .context("Unable to retain ChatGPT function-call history")?)
         };
         Ok(ChatResponse {

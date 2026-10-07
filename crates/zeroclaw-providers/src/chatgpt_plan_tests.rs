@@ -2,6 +2,16 @@ use super::*;
 use zeroclaw_config::schema::{ChatGptPlanAuthConfig, ModelProviderConfig};
 
 async fn tool_fixture_profile(root: &std::path::Path) {
+    tool_fixture_identity(
+        root,
+        "oaiapp_fixture",
+        "subject-fixture",
+        "synthetic-tool-access",
+    )
+    .await;
+}
+
+async fn tool_fixture_identity(root: &std::path::Path, client: &str, subject: &str, access: &str) {
     use crate::auth::profiles::{
         AuthProfile, AuthProfilesStore, ChatGptPlanRegistration, TokenSet,
     };
@@ -9,7 +19,7 @@ async fn tool_fixture_profile(root: &std::path::Path) {
         "chatgpt-plan",
         "subscriber",
         TokenSet {
-            access_token: "synthetic-tool-access".into(),
+            access_token: access.into(),
             refresh_token: Some("synthetic-tool-refresh".into()),
             id_token: None,
             expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
@@ -18,8 +28,8 @@ async fn tool_fixture_profile(root: &std::path::Path) {
         },
     );
     profile.plan_registration = Some(ChatGptPlanRegistration {
-        client_id: "oaiapp_fixture".into(),
-        subject: "subject-fixture".into(),
+        client_id: client.into(),
+        subject: subject.into(),
         earliest_refresh_at: None,
         refresh_started_at: None,
     });
@@ -27,6 +37,528 @@ async fn tool_fixture_profile(root: &std::path::Path) {
         .upsert_profile(profile, false)
         .await
         .unwrap();
+}
+
+struct ReplayFixture {
+    base: String,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ReplayFixture {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+async fn replay_fixture(
+    gate: Option<std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+) -> ReplayFixture {
+    use axum::{Json, Router, routing::post};
+    use std::sync::{Arc, Mutex};
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new().route("/responses", post({
+        let requests = requests.clone();
+        move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+            let requests = requests.clone();
+            let gate = gate.clone();
+            async move {
+                let model = body["model"].as_str().unwrap();
+                requests.lock().unwrap().push((headers["authorization"].to_str().unwrap().into(), body.clone()));
+                if model == "first" && let Some(gate) = gate {
+                    gate.0.notify_one();
+                    gate.1.notified().await;
+                }
+                let output = match model {
+                    "first" | "second" | "collision" => {
+                        let id = if model == "second" { "call_second" } else { "call_first" };
+                        json!([
+                            {"type":"reasoning","id":format!("rs_{model}"),"summary":[],"encrypted_content":"opaque-fixture"},
+                            {"type":"function_call","namespace":"zeroclaw","name":"shell","call_id":id,"arguments":json!({"command":model}).to_string(),"status":"completed"}
+                        ])
+                    }
+                    _ => json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"REPLAY COMPLETE"}]}]),
+                };
+                ([("content-type","text/event-stream")], format!("data: {}\n\n", json!({"type":"response.completed","response":{"status":"completed","output":output}})))
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = ::zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    ReplayFixture {
+        base,
+        requests,
+        server,
+    }
+}
+
+fn replay_provider(root: &std::path::Path) -> ChatGptPlanProvider {
+    let config = ModelProviderConfig {
+        kind: Some("chatgpt-plan".into()),
+        chatgpt_plan_auth: Some(ChatGptPlanAuthConfig {
+            registration: "chatgpt-plan:subscriber".into(),
+        }),
+        ..Default::default()
+    };
+    let opts = crate::ModelProviderRuntimeOptions {
+        zeroclaw_dir: Some(root.into()),
+        ..Default::default()
+    };
+    ChatGptPlanProvider::new("subscriber", &config, None, None, &opts).unwrap()
+}
+
+fn append_replay_round(history: &mut Vec<ChatMessage>, response: &ChatResponse) {
+    history.push(ChatMessage::assistant(json!({"content":response.text,"tool_calls":response.tool_calls,"reasoning_content":response.reasoning_content}).to_string()));
+    for call in &response.tool_calls {
+        history.push(ChatMessage::tool(
+            json!({"tool_call_id":call.id,"content":"private fixture result"}).to_string(),
+        ));
+    }
+}
+
+fn strip_replay_reasoning(history: &mut [ChatMessage], strip_calls: bool) {
+    for message in history
+        .iter_mut()
+        .filter(|message| message.role == "assistant")
+    {
+        let mut envelope: Value = serde_json::from_str(&message.content).unwrap();
+        envelope
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_content");
+        if strip_calls {
+            for call in envelope["tool_calls"].as_array_mut().unwrap() {
+                call.as_object_mut().unwrap().remove("extra_content");
+            }
+        }
+        message.content = envelope.to_string();
+    }
+}
+
+#[tokio::test]
+async fn function_tools_replay_provenance_binds_client_and_subject_across_stores() {
+    Box::pin(async {
+        use zeroclaw_api::tool::ToolSpec;
+        let fixture = replay_fixture(None).await;
+        let root = tempfile::tempdir().unwrap();
+        tool_fixture_profile(root.path()).await;
+        crate::plan_test_transport::scope(&fixture.base, async {
+            let tools = [ToolSpec::new("shell", "fixture", json!({"type":"object"}))];
+            let mut history = vec![ChatMessage::user("fixture")];
+            let first = replay_provider(root.path())
+                .chat(
+                    ChatRequest {
+                        messages: &history,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "first",
+                    None,
+                )
+                .await
+                .unwrap();
+            let metadata =
+                json!({"reasoning":first.reasoning_content,"calls":first.tool_calls}).to_string();
+            assert!(!metadata.contains("oaiapp_fixture"));
+            assert!(!metadata.contains("subject-fixture"));
+            append_replay_round(&mut history, &first);
+            for (client, subject) in [
+                ("oaiapp_other", "subject-fixture"),
+                ("oaiapp_fixture", "subject-other"),
+            ] {
+                let foreign = tempfile::tempdir().unwrap();
+                tool_fixture_identity(foreign.path(), client, subject, "synthetic-foreign-access")
+                    .await;
+                for strip_reasoning in [false, true] {
+                    let mut replay = history.clone();
+                    if strip_reasoning {
+                        strip_replay_reasoning(&mut replay, false);
+                    }
+                    let result = replay_provider(foreign.path())
+                        .chat(
+                            ChatRequest {
+                                messages: &replay,
+                                tools: Some(&tools),
+                                thinking: None,
+                            },
+                            "done",
+                            None,
+                        )
+                        .await;
+                    assert!(
+                        result.is_err(),
+                        "foreign same-label history must fail before inference"
+                    );
+                    assert!(result.unwrap_err().to_string().contains("registration"));
+                    assert_eq!(
+                        fixture.requests.lock().unwrap().len(),
+                        1,
+                        "foreign plaintext results must never egress"
+                    );
+                }
+            }
+            let mut unstamped = history.clone();
+            strip_replay_reasoning(&mut unstamped, true);
+            let result = replay_provider(root.path())
+                .chat(
+                    ChatRequest {
+                        messages: &unstamped,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "done",
+                    None,
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "history missing all provenance must fail closed"
+            );
+            assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+            let same = tempfile::tempdir().unwrap();
+            tool_fixture_identity(
+                same.path(),
+                "oaiapp_fixture",
+                "subject-fixture",
+                "synthetic-same-registration-access",
+            )
+            .await;
+            strip_replay_reasoning(&mut history, false);
+            let response = replay_provider(same.path())
+                .chat(
+                    ChatRequest {
+                        messages: &history,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "done",
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.text.as_deref(), Some("REPLAY COMPLETE"));
+            let requests = fixture.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1].0, "Bearer synthetic-same-registration-access");
+            assert!(
+                requests[1].1["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["output"] == "private fixture result")
+            );
+        })
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn function_tools_replay_stamp_uses_the_actual_request_credential_snapshot() {
+    Box::pin(async {
+        use crate::auth::profiles::AuthProfilesStore;
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+        use zeroclaw_api::tool::ToolSpec;
+        let gate = Arc::new((Notify::new(), Notify::new()));
+        let fixture = replay_fixture(Some(gate.clone())).await;
+        let root = tempfile::tempdir().unwrap();
+        tool_fixture_profile(root.path()).await;
+        crate::plan_test_transport::scope(&fixture.base, async {
+            let provider = replay_provider(root.path());
+            let tools = [ToolSpec::new("shell", "fixture", json!({"type":"object"}))];
+            let mut history = vec![ChatMessage::user("fixture")];
+            let inference = provider.chat(
+                ChatRequest {
+                    messages: &history,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "first",
+                None,
+            );
+            let replacement = async {
+                gate.0.notified().await;
+                let store = AuthProfilesStore::new(root.path(), true);
+                assert!(
+                    store
+                        .remove_profile("chatgpt-plan:subscriber")
+                        .await
+                        .unwrap()
+                );
+                tool_fixture_identity(
+                    root.path(),
+                    "oaiapp_replacement",
+                    "subject-replacement",
+                    "synthetic-replacement-access",
+                )
+                .await;
+                gate.1.notify_one();
+            };
+            let (first, ()) = tokio::join!(inference, replacement);
+            let first = first.unwrap();
+            append_replay_round(&mut history, &first);
+            let result = provider
+                .chat(
+                    ChatRequest {
+                        messages: &history,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "done",
+                    None,
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "replacement identity must not claim the old bearer response"
+            );
+            assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+            let store = AuthProfilesStore::new(root.path(), true);
+            assert!(
+                store
+                    .remove_profile("chatgpt-plan:subscriber")
+                    .await
+                    .unwrap()
+            );
+            tool_fixture_identity(
+                root.path(),
+                "oaiapp_fixture",
+                "subject-fixture",
+                "synthetic-reauthorized-access",
+            )
+            .await;
+            let result = provider
+                .chat(
+                    ChatRequest {
+                        messages: &history,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "done",
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.text.as_deref(), Some("REPLAY COMPLETE"));
+            let requests = fixture.requests.lock().unwrap();
+            assert_eq!(requests[0].0, "Bearer synthetic-tool-access");
+            assert_eq!(requests[1].0, "Bearer synthetic-reauthorized-access");
+        })
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn function_tools_reasoning_and_call_provenance_are_independently_required() {
+    Box::pin(async {
+        use zeroclaw_api::tool::ToolSpec;
+        let fixture = replay_fixture(None).await;
+        let root = tempfile::tempdir().unwrap();
+        tool_fixture_profile(root.path()).await;
+        crate::plan_test_transport::scope(&fixture.base, async {
+            let provider = replay_provider(root.path());
+            let tools = [ToolSpec::new("shell", "fixture", json!({"type":"object"}))];
+            let mut history = vec![ChatMessage::user("fixture")];
+            let first = provider.chat(ChatRequest {messages:&history,tools:Some(&tools),thinking:None}, "first", None).await.unwrap();
+            append_replay_round(&mut history, &first);
+            for tamper_reasoning in [true, false] {
+                let mut replay = history.clone();
+                let mut envelope: Value = serde_json::from_str(&replay[1].content).unwrap();
+                if tamper_reasoning {
+                    let mut reasoning: Value = serde_json::from_str(envelope["reasoning_content"].as_str().unwrap()).unwrap();
+                    reasoning["registration_provenance"] = "different-fixture-provenance".into();
+                    envelope["reasoning_content"] = reasoning.to_string().into();
+                } else {
+                    envelope["tool_calls"][0]["extra_content"] = json!({"chatgpt_plan":{"registration_provenance":"different-fixture-provenance"}});
+                }
+                replay[1].content = envelope.to_string();
+                let result = provider.chat(ChatRequest {messages:&replay,tools:Some(&tools),thinking:None}, "done", None).await;
+                assert!(result.is_err(), "reasoning and call provenance must each match the canonical credential");
+                assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+            }
+            let response = provider.chat(ChatRequest {messages:&history,tools:Some(&tools),thinking:None}, "done", None).await.unwrap();
+            assert_eq!(response.text.as_deref(), Some("REPLAY COMPLETE"));
+        }).await;
+    }).await;
+}
+
+#[tokio::test]
+async fn function_tools_request_history_ids_never_repeat_across_completed_rounds() {
+    Box::pin(async {
+        use zeroclaw_api::tool::ToolSpec;
+        let fixture = replay_fixture(None).await;
+        let root = tempfile::tempdir().unwrap();
+        tool_fixture_profile(root.path()).await;
+        crate::plan_test_transport::scope(&fixture.base, async {
+            let provider = replay_provider(root.path());
+            let tools = [ToolSpec::new("shell", "fixture", json!({"type":"object"}))];
+            let mut history = vec![ChatMessage::user("fixture")];
+            let first = provider
+                .chat(
+                    ChatRequest {
+                        messages: &history,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "first",
+                    None,
+                )
+                .await
+                .unwrap();
+            append_replay_round(&mut history, &first);
+            let mut repeated = history.clone();
+            append_replay_round(&mut repeated, &first);
+            let result = provider
+                .chat(
+                    ChatRequest {
+                        messages: &repeated,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "done",
+                    None,
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "a completed round must not release its call ID for reuse"
+            );
+            assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+            history.push(history.last().unwrap().clone());
+            let result = provider
+                .chat(
+                    ChatRequest {
+                        messages: &history,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "done",
+                    None,
+                )
+                .await;
+            assert!(result.is_err(), "a result may be supplied only once");
+            assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+        })
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn function_tools_multi_round_unique_history_remains_supported() {
+    Box::pin(async {
+        use zeroclaw_api::tool::ToolSpec;
+        let fixture = replay_fixture(None).await;
+        let root = tempfile::tempdir().unwrap();
+        tool_fixture_profile(root.path()).await;
+        crate::plan_test_transport::scope(&fixture.base, async {
+            let provider = replay_provider(root.path());
+            let tools = [ToolSpec::new("shell", "fixture", json!({"type":"object"}))];
+            let mut history = vec![ChatMessage::user("fixture")];
+            for model in ["first", "second"] {
+                let response = provider
+                    .chat(
+                        ChatRequest {
+                            messages: &history,
+                            tools: Some(&tools),
+                            thinking: None,
+                        },
+                        model,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                append_replay_round(&mut history, &response);
+            }
+            let response = provider
+                .chat(
+                    ChatRequest {
+                        messages: &history,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "done",
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.text.as_deref(), Some("REPLAY COMPLETE"));
+            let requests = fixture.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            let input = requests[2].1["input"].as_array().unwrap();
+            for id in ["call_first", "call_second"] {
+                assert_eq!(
+                    input
+                        .iter()
+                        .filter(|item| item["type"] == "function_call" && item["call_id"] == id)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    input
+                        .iter()
+                        .filter(
+                            |item| item["type"] == "function_call_output" && item["call_id"] == id
+                        )
+                        .count(),
+                    1
+                );
+            }
+        })
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn function_tools_terminal_call_cannot_reuse_a_historical_id() {
+    Box::pin(async {
+        use zeroclaw_api::tool::ToolSpec;
+        let fixture = replay_fixture(None).await;
+        let root = tempfile::tempdir().unwrap();
+        tool_fixture_profile(root.path()).await;
+        crate::plan_test_transport::scope(&fixture.base, async {
+            let provider = replay_provider(root.path());
+            let tools = [ToolSpec::new("shell", "fixture", json!({"type":"object"}))];
+            let mut history = vec![ChatMessage::user("fixture")];
+            let first = provider
+                .chat(
+                    ChatRequest {
+                        messages: &history,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "first",
+                    None,
+                )
+                .await
+                .unwrap();
+            append_replay_round(&mut history, &first);
+            let result = provider
+                .chat(
+                    ChatRequest {
+                        messages: &history,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "collision",
+                    None,
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "historical call IDs must be rejected before calls reach the runtime"
+            );
+            assert_eq!(fixture.requests.lock().unwrap().len(), 2);
+        })
+        .await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -294,7 +826,11 @@ async fn function_tools_request_admission_never_sends_invalid_history_or_schemas
         let provider=ChatGptPlanProvider::new("subscriber",&config,None,None,&opts).unwrap();
         let call=json!({"id":"call_fixture","name":"shell","arguments":"{}"});
         let item=json!({"type":"function_call","namespace":"zeroclaw","call_id":"call_fixture","name":"shell","arguments":"{}"});
-        let assistant=|registration:&str,call:Value,items:Value| ChatMessage::assistant(json!({"content":null,"tool_calls":[call],"reasoning_content":json!({"provider":"chatgpt-plan","registration":registration,"items":items}).to_string()}).to_string());
+        let provenance=provider.auth.resolve_chatgpt_plan_credential("chatgpt-plan:subscriber").await.unwrap().registration_provenance;
+        let assistant=|registration:&str,mut call:Value,items:Value| {
+            call["extra_content"]=json!({"chatgpt_plan":{"registration_provenance":provenance}});
+            ChatMessage::assistant(json!({"content":null,"tool_calls":[call],"reasoning_content":json!({"provider":"chatgpt-plan","registration":registration,"registration_provenance":provenance,"items":items}).to_string()}).to_string())
+        };
         let result=|| ChatMessage::tool(json!({"tool_call_id":"call_fixture","content":"fixture result"}).to_string());
         let histories=vec![
             ("different registration",vec![ChatMessage::user("fixture"),assistant("chatgpt-plan:other",call.clone(),json!([item.clone()])),result()]),
@@ -354,8 +890,10 @@ fn preview_request_is_text_only_and_has_only_supported_fields() {
         "model-fixture",
         None,
         "chatgpt-plan:subscriber",
+        "fixture-provenance",
     )
-    .unwrap();
+    .unwrap()
+    .0;
     assert_eq!(request["store"], false);
     assert_eq!(request["stream"], true);
     assert_eq!(request["instructions"], "instructions");
@@ -375,7 +913,8 @@ fn preview_request_is_text_only_and_has_only_supported_fields() {
             &[],
             "model-fixture",
             None,
-            "chatgpt-plan:subscriber"
+            "chatgpt-plan:subscriber",
+            "fixture-provenance"
         )
         .is_err()
     );
@@ -385,7 +924,8 @@ fn preview_request_is_text_only_and_has_only_supported_fields() {
             &[],
             "model-fixture",
             Some(0.5),
-            "chatgpt-plan:subscriber"
+            "chatgpt-plan:subscriber",
+            "fixture-provenance"
         )
         .is_err()
     );
@@ -396,7 +936,15 @@ fn sse_requires_completed_and_rejects_incomplete_done_and_late_errors() {
     let mut sse = PlanSse::default();
     sse.event("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}")
         .unwrap();
-    assert!(sse.finish(&[], "chatgpt-plan:subscriber").is_err());
+    assert!(
+        sse.finish(
+            &[],
+            "chatgpt-plan:subscriber",
+            "fixture-provenance",
+            &HashSet::new()
+        )
+        .is_err()
+    );
     for terminal in [
         "data: [DONE]",
         "data: {\"type\":\"response.incomplete\"}",
@@ -413,10 +961,15 @@ fn sse_requires_completed_and_rejects_incomplete_done_and_late_errors() {
     let mut sse = PlanSse::default();
     sse.event("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output_text\":\"READY\"}}").unwrap();
     assert_eq!(
-        sse.finish(&[], "chatgpt-plan:subscriber")
-            .unwrap()
-            .text
-            .as_deref(),
+        sse.finish(
+            &[],
+            "chatgpt-plan:subscriber",
+            "fixture-provenance",
+            &HashSet::new()
+        )
+        .unwrap()
+        .text
+        .as_deref(),
         Some("READY")
     );
     assert!(sse.event("data: {\"type\":\"response.failed\"}").is_err());
