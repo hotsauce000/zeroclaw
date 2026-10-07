@@ -40978,7 +40978,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 .expect("effort agent must resolve"),
         );
         ctx.prompt_config = Arc::new(config.clone());
-        ctx.live_config = Arc::new(RwLock::new(config));
         ctx.model_routes = Arc::new(routes);
         ctx.model_provider_ref = Arc::new("custom.local".into());
         ctx.model = Arc::new("local-model".into());
