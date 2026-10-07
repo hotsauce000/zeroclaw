@@ -5128,8 +5128,22 @@ async fn handle_runtime_command_for_delivery(
             if model.is_empty() {
                 channel_runtime_cli_string("channel-runtime-model-empty")
             } else if model.eq_ignore_ascii_case("auto") {
-                current = default_route_selection_from_snapshot(&defaults_snapshot);
-                set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                #[cfg(feature = "channel-telegram")]
+                let picker_applied =
+                    crate::model_picker_delivery::apply_if_not_revoked(delivery_message_id, || {
+                        current = default_route_selection_from_snapshot(&defaults_snapshot);
+                        set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                    });
+                #[cfg(not(feature = "channel-telegram"))]
+                {
+                    current = default_route_selection_from_snapshot(&defaults_snapshot);
+                    set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                }
+                #[cfg(feature = "channel-telegram")]
+                if !picker_applied {
+                    return true;
+                }
+
                 channel_runtime_cli_string_with_args(
                     "channel-runtime-model-switched",
                     &[
@@ -27261,6 +27275,7 @@ BTC is currently around $65,000 based on latest tool output."#
     struct ModelCaptureModelProvider {
         call_count: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
+        attempt_allowlists: std::sync::Mutex<Vec<(bool, bool)>>,
     }
 
     #[async_trait::async_trait]
@@ -27286,6 +27301,13 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(model.to_string());
+            self.attempt_allowlists
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((
+                    zeroclaw_providers::reliable::provider_ref_allowed_for_turn("custom.local"),
+                    zeroclaw_providers::reliable::provider_ref_allowed_for_turn("custom.cloud"),
+                ));
             Ok("ok".to_string())
         }
     }
@@ -40894,6 +40916,138 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    fn effort_routing_channel_context(
+        zeroclaw_dir: &std::path::Path,
+    ) -> (
+        Arc<ChannelRuntimeContext>,
+        Arc<ModelCaptureModelProvider>,
+        Arc<dyn Channel>,
+    ) {
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
+
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let mut ctx = channel_runtime_context_with_peer_groups(zeroclaw_dir, groups);
+        let channel: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+        ctx.channels_by_name = Arc::new(HashMap::from([(
+            channel.name().to_string(),
+            Arc::clone(&channel),
+        )]));
+
+        let routes = vec![
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "custom.local".into(),
+                model: "local-model".into(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            },
+        ];
+        let mut config = ctx.prompt_config.as_ref().clone();
+        config.model_routes = routes.clone();
+        config.runtime_profiles.insert(
+            "effort".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                effort_routing: Some(EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: CloudEscalationPolicy::Auto,
+                }),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "agentX".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            },
+        );
+        ctx.agent_cfg = Arc::new(
+            config
+                .resolved_agent_config("agentX")
+                .expect("effort agent must resolve"),
+        );
+        ctx.prompt_config = Arc::new(config.clone());
+        ctx.live_config = Arc::new(RwLock::new(config));
+        ctx.model_routes = Arc::new(routes);
+        ctx.model_provider_ref = Arc::new("custom.local".into());
+        ctx.model = Arc::new("local-model".into());
+
+        let provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        ctx.model_provider = Arc::clone(&provider);
+        ctx.provider_cache = Arc::new(Mutex::new(HashMap::from([
+            ("custom.local".into(), Arc::clone(&provider)),
+            ("custom.cloud".into(), provider),
+        ])));
+
+        (Arc::new(ctx), provider_impl, channel)
+    }
+
+    #[tokio::test]
+    async fn scoped_model_auto_resets_restore_effort_routing_for_real_channel_turn() {
+        for (scope_flag, scope) in [
+            ("--user", OverrideScope::User),
+            ("--agent", OverrideScope::Agent),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, provider, channel) = effort_routing_channel_context(tmp.path());
+            let mut command = scope_test_msg("alice", "chan-1", None);
+            command.id = format!("set-{scope_flag}");
+            command.content = format!("/model {scope_flag} cloud");
+            assert!(handle_runtime_command_if_needed(ctx.as_ref(), &command, Some(&channel)).await);
+            assert!(
+                ctx.scope_overrides
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&scope_override_key(scope, &command, "agentX"))
+            );
+
+            command.id = format!("reset-{scope_flag}");
+            command.content = format!("/model {scope_flag} auto");
+            assert!(handle_runtime_command_if_needed(ctx.as_ref(), &command, Some(&channel)).await);
+            assert!(
+                !ctx.scope_overrides
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&scope_override_key(scope, &command, "agentX"))
+            );
+
+            let mut turn = scope_test_msg("alice", "chan-1", None);
+            turn.id = format!("turn-{scope_flag}");
+            turn.content = "hi".into();
+            process_channel_message(Arc::clone(&ctx), turn, CancellationToken::new()).await;
+
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                provider
+                    .models
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &["local-model".to_string()]
+            );
+            assert_eq!(
+                provider
+                    .attempt_allowlists
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &[(true, false)]
+            );
+        }
+    }
+
     #[test]
     fn effort_policy_excludes_cloud_reply_intent_classifier() {
         let allowed = HashSet::from(["custom.local".to_string()]);
@@ -42948,7 +43102,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[cfg(feature = "channel-telegram")]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn runtime_command_late_revoked_model_picker_selection_does_not_mutate_route() {
+    async fn runtime_command_late_revoked_model_picker_auto_does_not_mutate_route() {
         // Serialize on the crate-wide registry test lock: the picker
         // delivery-ack registry is process-global (see
         // `model_picker_delivery::registry_test_lock`).
@@ -42973,11 +43127,20 @@ BTC is currently around $65,000 based on latest tool output."#
             reply_target: "chat-42".into(),
             channel: "telegram".into(),
             channel_alias: Some("main".into()),
-            content: "/model fast".into(),
+            content: "/model auto".into(),
             ..Default::default()
         };
         let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+        let manual = ChannelRouteSelection {
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            automatic: false,
+            api_key: None,
+        };
+        set_route_selection(&ctx, &sender_key, manual.clone(), &snapshot);
 
         // Past the early gate still registered (the gate leaves
         // non-revoked entries in place); the ack timeout then fires before
@@ -42992,10 +43155,9 @@ BTC is currently around $65,000 based on latest tool output."#
             handled,
             "revoked selection must be reported handled so it is not re-dispatched to the agent"
         );
-        assert!(
-            ctx.route_overrides.lock().unwrap().is_empty(),
-            "late-revoked selection must not write a route override"
-        );
+        let retained = get_route_selection(&ctx, &msg, &sender_key, &snapshot);
+        assert_eq!(retained, manual);
+        assert!(!retained.automatic);
         assert!(
             channel_impl.sent_messages.lock().await.is_empty(),
             "late-revoked selection must not produce a switch response"

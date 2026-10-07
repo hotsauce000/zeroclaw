@@ -6921,6 +6921,167 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct EffortRoutingProbe {
+        model: String,
+        local_allowed: bool,
+        cloud_allowed: bool,
+    }
+
+    struct EffortRoutingProbeProvider {
+        observations: Arc<Mutex<Vec<EffortRoutingProbe>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for EffortRoutingProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("done".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.observations.lock().push(EffortRoutingProbe {
+                model: model.to_string(),
+                local_allowed: zeroclaw_providers::reliable::provider_ref_allowed_for_turn(
+                    "custom.local",
+                ),
+                cloud_allowed: zeroclaw_providers::reliable::provider_ref_allowed_for_turn(
+                    "custom.cloud",
+                ),
+            });
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EffortRoutingProbeProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "EffortRoutingProbeProvider"
+        }
+    }
+
+    fn effort_routing_test_agent(
+        cloud_escalation: zeroclaw_config::scattered_types::CloudEscalationPolicy,
+        routes: Vec<zeroclaw_config::schema::ModelRouteConfig>,
+    ) -> (Agent, Arc<Mutex<Vec<EffortRoutingProbe>>>) {
+        let policy = zeroclaw_config::scattered_types::EffortRoutingConfig {
+            local_hint: "local".into(),
+            cloud_hint: "cloud".into(),
+            cloud_escalation,
+        };
+        let mut config = zeroclaw_config::schema::Config {
+            model_routes: routes.clone(),
+            ..Default::default()
+        };
+        config.runtime_profiles.insert(
+            "effort".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                effort_routing: Some(policy),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "effort-agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            },
+        );
+        let agent_config = config
+            .resolved_agent_config("effort-agent")
+            .expect("effort agent must resolve");
+        let resolver_routes = routes
+            .iter()
+            .map(|route| {
+                (
+                    route.hint.clone(),
+                    zeroclaw_providers::router::Route {
+                        provider_name: route.model_provider.clone(),
+                        model: route.model.clone(),
+                    },
+                )
+            })
+            .collect();
+        let route_resolver = Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+            resolver_routes,
+            "custom.local".into(),
+            "base-model".into(),
+        ));
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..Default::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let config = Arc::new(config);
+        let agent = Agent::builder()
+            .model_provider(Box::new(EffortRoutingProbeProvider {
+                observations: Arc::clone(&observations),
+            }))
+            .model_provider_name("custom.local".into())
+            .model_name("base-model".into())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                Vec::new(),
+            ))
+            .memory(memory)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("effort-agent".into())
+            .config(agent_config)
+            .model_route_resolver(route_resolver)
+            .provider_switch_config(ProviderSwitchConfig {
+                config: Some(config),
+                live_config: None,
+                live: None,
+            })
+            .build()
+            .expect("effort routing test agent must build");
+        (agent, observations)
+    }
+
+    fn effort_routing_test_routes() -> Vec<zeroclaw_config::schema::ModelRouteConfig> {
+        vec![
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "custom.local".into(),
+                model: "local-model".into(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            },
+        ]
+    }
+
     struct TranscriptCaptureModelProvider {
         alias: String,
         responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
@@ -9258,6 +9419,104 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn agent_turn_entry_points_apply_effort_route_and_attempt_boundary() {
+        use zeroclaw_config::scattered_types::CloudEscalationPolicy;
+
+        let (mut simple_agent, simple_observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Auto, effort_routing_test_routes());
+        assert_eq!(simple_agent.turn("hi").await.unwrap(), "done");
+        assert_eq!(
+            simple_observations.lock().as_slice(),
+            &[EffortRoutingProbe {
+                model: "hint:local".into(),
+                local_allowed: true,
+                cloud_allowed: false,
+            }]
+        );
+
+        let (mut complex_agent, complex_observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Auto, effort_routing_test_routes());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(128);
+        assert_eq!(
+            complex_agent
+                .turn_streamed(
+                    "Please analyze and compare these architecture tradeoffs.",
+                    event_tx,
+                    None,
+                )
+                .await
+                .unwrap()
+                .0,
+            "done"
+        );
+        assert_eq!(
+            complex_observations.lock().as_slice(),
+            &[EffortRoutingProbe {
+                model: "hint:cloud".into(),
+                local_allowed: true,
+                cloud_allowed: true,
+            }]
+        );
+
+        let (mut local_only_agent, local_only_observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Never, effort_routing_test_routes());
+        assert_eq!(
+            local_only_agent
+                .turn("Please analyze and compare these architecture tradeoffs.")
+                .await
+                .unwrap(),
+            "done"
+        );
+        assert_eq!(
+            local_only_observations.lock().as_slice(),
+            &[EffortRoutingProbe {
+                model: "hint:local".into(),
+                local_allowed: true,
+                cloud_allowed: false,
+            }]
+        );
+
+        let (mut manual_agent, manual_observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Auto, effort_routing_test_routes());
+        manual_agent.set_model_name("operator-model".into());
+        manual_agent.disable_automatic_model_routing();
+        assert_eq!(manual_agent.turn("hi").await.unwrap(), "done");
+        assert_eq!(
+            manual_observations.lock().as_slice(),
+            &[EffortRoutingProbe {
+                model: "operator-model".into(),
+                local_allowed: true,
+                cloud_allowed: true,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_effort_routing_missing_hint_fails_before_provider_dispatch() {
+        use zeroclaw_config::scattered_types::CloudEscalationPolicy;
+
+        let routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "local".into(),
+            model_provider: "custom.local".into(),
+            model: "local-model".into(),
+            api_key: None,
+        }];
+        let (mut agent, observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Auto, routes);
+
+        let error = agent
+            .turn("hi")
+            .await
+            .expect_err("a missing cloud hint must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("local/cloud hints are missing or ambiguous")
+        );
+        assert!(observations.lock().is_empty());
     }
 
     #[tokio::test]
