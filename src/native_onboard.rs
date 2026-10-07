@@ -786,10 +786,6 @@ pub(crate) async fn run(root: Option<&str>, request: Request) -> Result<()> {
     let mut owned = OwnedRoot::acquire(Path::new(root), &request).map_err(|_| root_error())?;
     let result = Box::pin(run_owned(&mut owned)).await;
     if let Err(failure) = result {
-        #[cfg(test)]
-        if failure.downcast_ref::<CliFailure>().is_none() {
-            eprintln!("synthetic bootstrap internal failure: {failure:#}");
-        }
         // Preserve auth and any canonical config commit. Recovery never removes
         // credentials/files or overwrites an already committed config.
         let stage = failure
@@ -879,15 +875,9 @@ async fn run_owned(owned: &mut OwnedRoot) -> Result<()> {
                     );
                     verify_configuration(&effective, owned, &provider)
                 };
-                check().map_err(|failure| {
-                    #[cfg(test)]
-                    eprintln!("synthetic staged-policy failure: {failure:#}");
-                    "native onboarding policy/billing validation failed".into()
-                })
+                check().map_err(|_| "native onboarding policy/billing validation failed".into())
             })
-            .map_err(|failures| {
-                #[cfg(test)]
-                eprintln!("synthetic Quickstart staging errors: {failures:?}");
+            .map_err(|_| {
                 error(
                     "cli-native-onboard-config-failed",
                     "Native onboarding configuration was rejected; owned auth was retained.",
