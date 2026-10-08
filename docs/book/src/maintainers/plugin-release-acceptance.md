@@ -98,7 +98,7 @@ throughout.
 | Grant restored | Put `*.discord.gg` back, without a restart | The bot reconnects; note how long it took | |
 | Denied sender | Send from an account outside the peer group | A `plugin_channel_sender_denied` record and no reply | |
 | Missing platform permission | Remove the bot's **Send Messages** permission in one channel and message it there | A send failure in the log, the daemon still running, no reconnect loop | |
-| Invalid token | Set a wrong token, restart | The plugin reports the rejected token and backs off; no reconnect loop in the log over five minutes | |
+| Invalid token | Set a syntactically valid invalid or revoked token through the masked `config set` prompt, then restart | The plugin reports Discord's authentication refusal and backs off; no reconnect loop in the log over five minutes. A malformed token rejected locally by `configure()` does not exercise platform authentication or backoff | |
 | Trust policy holds | Set `plugins.security.signature_mode` to `strict` without trusting the package's publisher key, restart | The daemon skips the package and logs the signature refusal; `plugin.acceptance` does not start. Restore the previous mode | |
 
 ## Redact before posting
