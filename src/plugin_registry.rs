@@ -867,6 +867,78 @@ capabilities = ["tool"]
         );
     }
 
+    /// The read bound also ends a stall that begins after the body has
+    /// started: a server that sends the headers and the first piece of the
+    /// archive and then stops, without closing the connection, fails the
+    /// download once the bound passes, not when the server gives up.
+    #[tokio::test]
+    async fn a_download_that_stalls_mid_body_fails_at_the_read_bound() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const READ_BOUND: Duration = Duration::from_millis(300);
+        const HOLD: Duration = Duration::from_millis(1500);
+
+        let archive = sample_archive();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let entry = PluginRegistryEntry {
+            name: "sample".to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            author: None,
+            capabilities: vec!["tool".to_string()],
+            url: format!("http://{address}{SAMPLE_ARCHIVE_PATH}"),
+            sha256: Some(hex::encode(Sha256::digest(&archive))),
+        };
+        let client = RegistryClient::new(RegistryTimeouts {
+            read: READ_BOUND,
+            ..RegistryTimeouts::default()
+        })
+        .unwrap();
+
+        // A server that announces the whole archive, delivers its first
+        // half, then holds the connection open and silent past the bound.
+        let stall = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let mut head = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "the client closed before sending its request");
+                head.extend_from_slice(&buffer[..read]);
+            }
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                archive.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket
+                .write_all(&archive[..archive.len() / 2])
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(HOLD).await;
+        };
+        // Timed on its own: the join also waits out the server's hold.
+        let download = async {
+            let started = std::time::Instant::now();
+            let downloaded = client.download_entry(&entry).await;
+            (downloaded, started.elapsed())
+        };
+
+        let ((downloaded, elapsed), ()) = tokio::join!(download, stall);
+
+        let Err(err) = downloaded else {
+            panic!("a download that stalls after its first piece must fail");
+        };
+        assert!(is_timeout(&err), "expected a timeout, got {err:#}");
+        assert!(
+            elapsed >= READ_BOUND && elapsed < HOLD,
+            "the read bound ended the stall before the server did: {elapsed:?}"
+        );
+    }
+
     fn sample_archive() -> Vec<u8> {
         zip_with_entry("sample/manifest.toml", SAMPLE_MANIFEST)
     }
