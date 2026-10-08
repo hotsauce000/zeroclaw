@@ -12543,6 +12543,9 @@ struct RosterEdit {
     config: Config,
     before: config_publication::AuthSnapshot,
     on_disk: Vec<u8>,
+    /// The entry name whose presence in the running daemon's roster was
+    /// checked, and whether config.toml has it, so `save` can check again.
+    daemon_premise: Option<(String, bool)>,
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -12570,6 +12573,7 @@ impl RosterEdit {
             config: config.clone(),
             before: config_publication::AuthSnapshot::capture(config)?,
             on_disk,
+            daemon_premise: None,
         })
     }
 
@@ -12577,17 +12581,39 @@ impl RosterEdit {
     /// the command decides from config.toml whether `name` exists
     /// (`in_file`), but the daemon applies the edit to the roster it holds,
     /// which differs from the file while a hand edit or an edit reported
-    /// pending waits for a reload. Asked before any password is typed. With
-    /// no daemon running, or one that cannot be asked, there is nothing to
-    /// compare, and the commit reports what became of the edit.
-    async fn refuse_if_the_daemon_disagrees(&self, name: &str, in_file: bool) -> Result<()> {
+    /// pending waits for a reload. Asked before any password is typed, and
+    /// again by `save` just before the commit, since another writer can
+    /// change the daemon's roster while the prompt is open. With no daemon
+    /// running, or one that cannot be asked, there is nothing to compare, and
+    /// the commit reports what became of the edit.
+    async fn refuse_if_the_daemon_disagrees(&mut self, name: &str, in_file: bool) -> Result<()> {
+        self.daemon_premise = Some((name.to_owned(), in_file));
+        Box::pin(self.check_daemon_premise(false)).await
+    }
+
+    /// `again` is set for the check just before the commit: a disagreement
+    /// then means another writer changed the daemon's roster while this
+    /// command ran.
+    async fn check_daemon_premise(&self, again: bool) -> Result<()> {
+        let Some((name, in_file)) = &self.daemon_premise else {
+            return Ok(());
+        };
         let Some(live) = Box::pin(config_publication::live_map_keys(&self.config, "users")).await
         else {
             return Ok(());
         };
         let live_has_it = live.iter().any(|key| key == name);
-        if live_has_it == in_file {
+        if live_has_it == *in_file {
             return Ok(());
+        }
+        if again {
+            bail!(ta(
+                "cli-user-live-entry-changed",
+                &[("name", name)],
+                format!(
+                    "The running daemon's roster changed for users.{name} while this command ran, so nothing was written. Run the command again."
+                ),
+            ));
         }
         if live_has_it {
             bail!(ta(
@@ -12607,13 +12633,15 @@ impl RosterEdit {
         ))
     }
 
-    /// Check the edited roster, then commit it as `write` through the daemon
+    /// Check the edited roster, and the daemon's roster again against what
+    /// the edit assumed of it, then commit it as `write` through the daemon
     /// serving this configuration, when one runs and takes it. Otherwise
     /// refuse if the file changed since the edit began, and write only the
     /// changed paths. Prints `done`, then how the running daemon took the
     /// edit, if one runs.
     async fn save(mut self, write: RosterWrite, done: &str, sets_password: bool) -> Result<()> {
         check_roster(&self.config)?;
+        Box::pin(self.check_daemon_premise(true)).await?;
         let publication = match &write {
             RosterWrite::Set(writes) => {
                 Box::pin(config_publication::commit_set_many(
@@ -15678,6 +15706,130 @@ mod tests {
             std::fs::read_to_string(&path).expect("read config"),
             changed,
             "the concurrent change survives"
+        );
+    }
+
+    /// Serve `config`'s endpoint with the daemon's own RPC listener, in this
+    /// process, until the returned guard drops, and record this process as
+    /// `config`'s running daemon. The directory sits under /tmp because
+    /// macOS caps a unix socket path at 104 bytes.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    async fn serve_roster_daemon(config: &Config) -> tokio_util::sync::DropGuard {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(16, queue));
+        let ctx =
+            zeroclaw_runtime::rpc::context::RpcContext::for_live_test(config.clone(), sessions);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+        let readiness = zeroclaw_runtime::daemon::SocketReadinessReporter::new(move || {
+            let _ = ready_tx.send(true);
+        });
+        let listener_cancel = cancel.clone();
+        zeroclaw_spawn::spawn!(async move {
+            zeroclaw_runtime::rpc::local::run_local_listener(
+                ctx,
+                listener_cancel,
+                Arc::new(AtomicUsize::new(0)),
+                Some(readiness),
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ready_rx.wait_for(|ready| *ready),
+        )
+        .await
+        .expect("the listener binds within 5s")
+        .expect("the listener binds its endpoint");
+        let heartbeat = zeroclaw_runtime::daemon::state_file_path(config);
+        std::fs::create_dir_all(heartbeat.parent().expect("the state file has a directory"))
+            .expect("the state directory is writable");
+        let state = serde_json::json!({
+            "pid": std::process::id(),
+            "written_at": chrono::Utc::now().to_rfc3339(),
+        });
+        std::fs::write(heartbeat, state.to_string()).expect("the state file is writable");
+        cancel.drop_guard()
+    }
+
+    /// The daemon's roster is checked before the password prompt, and
+    /// another writer can add the same name while the prompt is open. `save`
+    /// checks again, so an `add` refuses instead of merging into that entry.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[tokio::test]
+    async fn roster_edit_refuses_an_entry_the_daemon_gained_while_it_was_open() {
+        let dir = tempfile::Builder::new()
+            .prefix("zc")
+            .tempdir_in("/tmp")
+            .expect("a scratch directory under /tmp");
+        let mut config = Config {
+            data_dir: dir.path().to_path_buf(),
+            config_path: dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.permission_profiles.insert(
+            "operator".into(),
+            zeroclaw_config::schema::PermissionProfileConfig::default(),
+        );
+        std::fs::write(
+            &config.config_path,
+            format!(
+                "schema_version = {}\n",
+                zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .expect("write config");
+        let _daemon = serve_roster_daemon(&config).await;
+
+        let mut edit = RosterEdit::begin(&config).expect("begin an edit");
+        Box::pin(edit.refuse_if_the_daemon_disagrees("bob", false))
+            .await
+            .expect("the daemon holds no bob yet");
+
+        // While the prompt is open, another writer adds bob through the daemon.
+        let own = std::process::id();
+        crate::daemon_rpc::call(
+            &config,
+            own,
+            "config/set-many",
+            serde_json::json!({ "sets": [
+                { "prop": "users.bob.uid", "value": "4242" },
+                { "prop": "users.bob.permission_profiles", "value": "[\"operator\"]" },
+            ]}),
+        )
+        .await
+        .expect("the daemon takes the other writer's edit");
+
+        zeroclaw_config::alias_refs::create_map_key_checked(&mut edit.config, "users", "bob")
+            .expect("the file has no bob");
+        let entry = roster_entry(&mut edit.config, "bob").expect("staged");
+        entry.uid = Some(4343);
+        entry.permission_profiles = vec!["operator".into()];
+        let writes = entry_writes(entry, "bob").expect("writes");
+        let refused = Box::pin(edit.save(RosterWrite::Set(writes), "done", false)).await;
+        let message = refused
+            .expect_err("an add that would merge into the daemon's new bob must fail")
+            .to_string();
+        assert!(message.contains("users.bob"), "{message}");
+
+        let live = crate::daemon_rpc::call(
+            &config,
+            own,
+            "config/get",
+            serde_json::json!({ "prop": "users.bob.uid" }),
+        )
+        .await
+        .expect("the daemon still holds bob");
+        assert!(
+            live["value"]
+                .as_str()
+                .is_some_and(|uid| uid.contains("4242")),
+            "the daemon's bob must be the other writer's, untouched: {live}"
         );
     }
 

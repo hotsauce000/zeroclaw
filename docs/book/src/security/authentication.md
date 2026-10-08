@@ -375,10 +375,12 @@ The command decides from `config.toml` whether the entry exists, but the
 daemon applies the edit to the roster it holds, and the two differ while a
 hand edit or an edit reported pending waits for a reload. So before it asks
 for a password, the command compares the two: `add` of a name the daemon
-still holds, and `passwd` or `disable-password` of an entry the daemon has
-not loaded, are refused until the daemon is restarted. `remove` of an entry
-the daemon never loaded leaves the daemon nothing to delete, so the command
-removes it from the file itself.
+holds, and `passwd` or `disable-password` of an entry the daemon has not
+loaded, are refused until the daemon is restarted. It compares again just
+before it commits, and refuses, to be run again, an edit whose entry another
+writer added or removed through the daemon while the prompt was open.
+`remove` of an entry the daemon never loaded leaves the daemon nothing to
+delete, so the command removes it from the file itself.
 
 Each command checks the edited roster, permission profiles, and OIDC
 entries as one authorization policy before it asks for a password and again
